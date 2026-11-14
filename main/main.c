@@ -32,6 +32,8 @@
 
 #include "bsp_shim.h"       /* bsp_display_set_backlight()（旧工程 bsp_display_* 的替代） */
 #include "net.h"
+#include "web.h"           /* 网页配置后台（配网 / 网页 OTA），WiFi 连上后起 */
+#include "app_settings.h"  /* NVS 配置：WiFi / HA / MQTT / 设置页口令 */
 #include "ha_client.h"
 #include "layout.h"
 #include "bg_image.h"
@@ -558,6 +560,9 @@ void app_main(void)
     ESP_LOGI(TAG, "PSRAM %u KB / 内部 RAM %u KB",
              (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+
+    /* 最先读 NVS 配置：后面 net_wifi_start / net_mqtt_start / 网页都要用 */
+    app_settings_init();
     backlight_init();
     lcd_init();
     lvgl_init();
@@ -599,6 +604,15 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
+    /* 配置页（80 端口）：一次启动后一直在跑，断线重连不需要重启它 */
+    web_start();
+    if (net_wifi_connected()) {
+        ESP_LOGI(TAG, "配置页: http://%s/ （手机浏览器打开，可改 WiFi / HA / 网页升级）",
+                 net_ip_string());
+    } else {
+        ESP_LOGW(TAG, "WiFi 未连接，配置页等有 IP 后再访问（主循环会持续重试）");
+    }
+
     /* 上一次 MQTT 下发的布局（存在 NVS 里）：开机先按它建界面 */
     layout_t *lay = calloc(1, sizeof(layout_t));
     const bool has_layout = (lay != NULL) &&
@@ -633,6 +647,11 @@ void app_main(void)
     while (1) {
         uint32_t d = lv_timer_handler();
         net_mqtt_tick();          /* 连上后立刻发布 meta 并订阅，不等心跳 */
+
+        /* 配置页：断线重连 / 启动时失败的话在这里补起（已在跑就是空操作） */
+        if (!web_running() && net_wifi_connected()) {
+            web_start();
+        }
 
         /* cfg / cmd 每轮都处理，避免排队时被后来的覆盖 */
         {

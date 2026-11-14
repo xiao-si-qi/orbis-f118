@@ -1,4 +1,4 @@
-﻿#include <string.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
@@ -14,7 +14,7 @@
 
 #include "net.h"
 #include "ota.h"
-#include "secrets.h"
+#include "app_settings.h"
 
 #ifndef APP_FW_VERSION
 #define APP_FW_VERSION "0.1.0"
@@ -48,7 +48,10 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_up = false;
         ESP_LOGW(TAG, "WiFi 断开，重连中…");
-        esp_wifi_connect();
+        /* 没有凭据时别死循环重连（会在事件回调里刷日志、白烧 CPU） */
+        if (app_settings_has_wifi()) {
+            esp_wifi_connect();
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
         s_wifi_up = true;
@@ -62,11 +65,13 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     const esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)data;
     switch ((esp_mqtt_event_id_t)id) {
-    case MQTT_EVENT_CONNECTED:
+    case MQTT_EVENT_CONNECTED: {
         s_mqtt_up = true;
         s_need_meta = true;    /* 发布放到主循环，回调里不要调用 publish */
-        ESP_LOGI(TAG, "MQTT 已连接 %s:%d", APP_SECRET_MQTT_HOST, APP_SECRET_MQTT_PORT);
+        const app_settings_t *sc = app_settings_get();
+        ESP_LOGI(TAG, "MQTT 已连接 %s:%d", sc->mqtt_host, sc->mqtt_port);
         break;
+    }
 
     case MQTT_EVENT_DISCONNECTED:
         s_mqtt_up = false;
@@ -123,13 +128,22 @@ esp_err_t net_wifi_start(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
 
+    /* 凭据由我们自己存 NVS（app_settings），别让 WiFi 驱动再往 NVS 里写一份，
+       省下宝贵的 NVS 空间（只 20KB，还要放布局 JSON）。必须在 set_config 之前设。 */
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
     wifi_config_t wc = {0};
-    strncpy((char *)wc.sta.ssid, APP_SECRET_WIFI_SSID, sizeof(wc.sta.ssid) - 1);
-    strncpy((char *)wc.sta.password, APP_SECRET_WIFI_PASSWORD, sizeof(wc.sta.password) - 1);
+    /* 凭据以 app_settings 为准（NVS 里存过就用存的，第一次开机是 secrets.h 的值） */
+    const app_settings_t *sc = app_settings_get();
+    if (sc->wifi_ssid[0] == '\0') {
+        ESP_LOGW(TAG, "没有 Wi-Fi 凭据（NVS 和 secrets.h 都为空），先起 Web 配置页等用户填");
+    }
+    strncpy((char *)wc.sta.ssid, sc->wifi_ssid, sizeof(wc.sta.ssid) - 1);
+    strncpy((char *)wc.sta.password, sc->wifi_pass, sizeof(wc.sta.password) - 1);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "WiFi 启动，SSID=%s", APP_SECRET_WIFI_SSID);
+    ESP_LOGI(TAG, "WiFi 启动，SSID=%s", sc->wifi_ssid);
     return ESP_OK;
 }
 
@@ -145,16 +159,25 @@ int net_wifi_rssi(void)
 
 esp_err_t net_mqtt_start(void)
 {
-    snprintf(s_dev_id, sizeof(s_dev_id), "%s",
-             APP_SECRET_DEVICE_ID[0] ? APP_SECRET_DEVICE_ID : "orbis-f118");
+    const app_settings_t *sc = app_settings_get();
+
+    /* 设备 id 先定下来：即使不连 MQTT，ota.c / 日志也要用它拼主题和路径 */
+    snprintf(s_dev_id, sizeof(s_dev_id), "%s", sc->device_id[0] ? sc->device_id : "orbis-f118");
+
+    if (sc->mqtt_host[0] == '\0') {
+        ESP_LOGW(TAG, "MQTT 服务器未配置（配网页里可填），跳过 MQTT");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     snprintf(s_will_topic, sizeof(s_will_topic), "switchyard/%s/availability", s_dev_id);
 
-    char uri[96];
-    snprintf(uri, sizeof(uri), "mqtt://%s:%d", APP_SECRET_MQTT_HOST, APP_SECRET_MQTT_PORT);
+    /* uri 必须是静态的：esp_mqtt_client_init 之后这里还要用 */
+    static char uri[96];
+    snprintf(uri, sizeof(uri), "mqtt://%s:%d", sc->mqtt_host, sc->mqtt_port > 0 ? sc->mqtt_port : 1883);
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = uri,
-        .credentials.username = APP_SECRET_MQTT_USER,
-        .credentials.authentication.password = APP_SECRET_MQTT_PASS,
+        .credentials.username = sc->mqtt_user,
+        .credentials.authentication.password = sc->mqtt_pass,
         .session.keepalive = 30,
         .session.last_will.topic = s_will_topic,
         .session.last_will.msg = "offline",
