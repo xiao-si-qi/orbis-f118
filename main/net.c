@@ -1,4 +1,4 @@
-#include <string.h>
+﻿#include <string.h>
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -8,9 +8,15 @@
 #include "esp_log.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
+#include "esp_system.h"
+#include "freertos/task.h"
 
 #include "net.h"
 #include "secrets.h"
+
+#ifndef APP_FW_VERSION
+#define APP_FW_VERSION "0.1.0"
+#endif
 
 static const char *TAG = "net";
 
@@ -18,8 +24,10 @@ static const char *TAG = "net";
 static EventGroupHandle_t s_eg;
 static bool s_wifi_up;
 static bool s_mqtt_up;
+static bool s_need_meta;
 static esp_mqtt_client_handle_t s_mqtt;
 static char s_dev_id[48];
+static char s_will_topic[96];
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -43,9 +51,9 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     switch ((esp_mqtt_event_id_t)id) {
     case MQTT_EVENT_CONNECTED:
         s_mqtt_up = true;
+        s_need_meta = true;    /* 真正的发布放到主循环，避免在回调里调用 publish */
         ESP_LOGI(TAG, "MQTT 已连接 %s:%d", APP_SECRET_MQTT_HOST, APP_SECRET_MQTT_PORT);
-        break;
-    case MQTT_EVENT_DISCONNECTED:
+        break;    case MQTT_EVENT_DISCONNECTED:
         s_mqtt_up = false;
         ESP_LOGW(TAG, "MQTT 断开");
         break;
@@ -106,12 +114,54 @@ esp_err_t net_mqtt_start(void)
         .credentials.username = APP_SECRET_MQTT_USER,
         .credentials.authentication.password = APP_SECRET_MQTT_PASS,
         .session.keepalive = 30,
+        .session.last_will.topic = s_will_topic,
+        .session.last_will.msg = "offline",
+        .session.last_will.msg_len = 7,
+        .session.last_will.retain = 1,
+        .session.last_will.qos = 1,
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event, NULL);
     ESP_ERROR_CHECK(esp_mqtt_client_start(s_mqtt));
     ESP_LOGI(TAG, "MQTT 启动: %s (设备 id '%s')", uri, s_dev_id);
     return ESP_OK;
+}
+
+void net_mqtt_tick(void)
+{
+    if (!s_mqtt_up || !s_need_meta) return;
+    s_need_meta = false;
+
+    char t[96], payload[384];
+    snprintf(t, sizeof(t), "switchyard/%s/availability", s_dev_id);
+    int r1 = esp_mqtt_client_publish(s_mqtt, t, "online", 0, 1, 1);
+
+    snprintf(t, sizeof(t), "switchyard/%s/meta", s_dev_id);
+    snprintf(payload, sizeof(payload),
+             "{\"type\":\"screen\",\"name\":\"ESP32-S31 旋钮屏\",\"fw\":\"" APP_FW_VERSION "\","
+             "\"caps\":[\"fw\",\"rssi\",\"uptime\",\"online\",\"log\",\"reboot\"],"
+             "\"display\":{\"w\":360,\"h\":360,\"formats\":[\"jpeg\"],\"fit\":[\"cover\",\"contain\"]}}");
+    int r2 = esp_mqtt_client_publish(s_mqtt, t, payload, 0, 1, 1);
+
+    snprintf(t, sizeof(t), "switchyard/%s/cmd", s_dev_id);
+    esp_mqtt_client_subscribe(s_mqtt, t, 1);
+    snprintf(t, sizeof(t), "switchyard/%s/cfg", s_dev_id);
+    esp_mqtt_client_subscribe(s_mqtt, t, 1);
+
+    ESP_LOGI(TAG, "meta 发布结果: availability=%d meta=%d", r1, r2);
+}
+
+void net_mqtt_publish_state(void)
+{
+    if (!s_mqtt_up) return;
+    char t[96], payload[256];
+    snprintf(t, sizeof(t), "switchyard/%s/state", s_dev_id);
+    snprintf(payload, sizeof(payload),
+             "{\"uptime\":%lu,\"rssi\":%d,\"fw\":\"" APP_FW_VERSION "\",\"online\":true,\"heap\":%u}",
+             (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ),
+             net_wifi_rssi(),
+             (unsigned)(esp_get_free_heap_size() / 1024));
+    esp_mqtt_client_publish(s_mqtt, t, payload, 0, 1, 1);
 }
 
 bool net_mqtt_connected(void) { return s_mqtt_up; }

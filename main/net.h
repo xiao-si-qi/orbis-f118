@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "esp_err.h"
 #include <stdbool.h>
@@ -18,6 +18,12 @@ int net_wifi_rssi(void);
 
 /** 启动 MQTT（连 switchyard） */
 esp_err_t net_mqtt_start(void);
+
+/** 连接后的 meta/订阅（主循环调用） */
+void net_mqtt_tick(void);
+
+/** 发布 state（保留消息），由主循环定期调用 */
+void net_mqtt_publish_state(void);
 
 /** MQTT 是否已连接 */
 bool net_mqtt_connected(void);

@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,7 +14,10 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "lvgl.h"
+
+LV_FONT_DECLARE(lv_font_cjk16);
 #include "net.h"
+
 
 static const char *TAG = "orbis-f118";
 
@@ -235,80 +238,240 @@ static void touch_init(void)
     ESP_LOGI(TAG, "触摸初始化完成 (CST816S @0x15)");
 }
 
-static lv_obj_t *s_tap_label;
-static lv_obj_t *s_net_label;
-static int s_tap_count = 0;
+#include "ha_client.h"
 
-static void tap_cb(lv_event_t *e)
+/* ---------------- 电池 ADC（GPIO55，15k/10k 分压）---------------- */
+#include "esp_adc/adc_oneshot.h"
+static volatile int s_bat_mv;
+
+static void battery_task(void *arg)
 {
-    s_tap_count++;
-    if (s_tap_label) {
-        lv_label_set_text_fmt(s_tap_label, "taps: %d", s_tap_count);
+    adc_unit_t unit; adc_channel_t chan;
+    if (adc_oneshot_io_to_channel(55, &unit, &chan) != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO55 不是 ADC 引脚");
+        vTaskDelete(NULL); return;
     }
-    ESP_LOGI("orbis-f118", "按钮被点击，第 %d 次", s_tap_count);
+    adc_oneshot_unit_init_cfg_t uic = { .unit_id = unit };
+    adc_oneshot_unit_handle_t au = NULL;
+    if (adc_oneshot_new_unit(&uic, &au) != ESP_OK) { vTaskDelete(NULL); return; }
+
+    adc_oneshot_chan_cfg_t cc = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
+    esp_err_t e = adc_oneshot_config_channel(au, chan, &cc);
+    if (e != ESP_OK) { cc.atten = ADC_ATTEN_DB_6;  e = adc_oneshot_config_channel(au, chan, &cc); }
+    if (e != ESP_OK) { cc.atten = ADC_ATTEN_DB_2_5; e = adc_oneshot_config_channel(au, chan, &cc); }
+    if (e != ESP_OK) { cc.atten = ADC_ATTEN_DB_0;   e = adc_oneshot_config_channel(au, chan, &cc); }
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "电池 ADC 配置失败: %s", esp_err_to_name(e));
+        vTaskDelete(NULL); return;
+    }
+    ESP_LOGI(TAG, "电池 ADC 就绪 (unit=%d chan=%d)", (int)unit, (int)chan);
+
+    while (1) {
+        int raw = 0, sum = 0, n = 0;
+        for (int i = 0; i < 8; i++) {
+            if (adc_oneshot_read(au, chan, &raw) == ESP_OK) { sum += raw; n++; }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (n > 0) {
+            const float pin_v = (float)(sum / n) * 3.3f / 4095.0f;
+            s_bat_mv = (int)(pin_v * 2.5f * 1000.0f);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 }
 
-static lv_obj_t *s_enc_label;
-static int s_enc_value = 50;
+/* ---------------- 卡片界面 ---------------- */
+
+typedef struct {
+    const char *entity;
+    const char *name;
+    lv_obj_t *card;
+    lv_obj_t *value;
+    bool toggle;
+} card_t;
+
+static const char *EID_LIGHT   = "light.xiaomi_cn_752752842_ceil05_s_2_light";
+static const char *EID_POWER   = "sensor.zong_gong_lu";
+static const char *EID_WATER   = "sensor.wm_001_temp";
+static const char *EID_WEATHER = "weather.he_feng_tian_qi";
+
+static card_t s_cards[] = {
+    { "light.xiaomi_cn_752752842_ceil05_s_2_light", "客厅主灯", NULL, NULL, true  },
+    { "sensor.zong_gong_lu",                        "总功率",   NULL, NULL, false },
+    { "sensor.wm_001_temp",                         "水温",     NULL, NULL, false },
+    { "weather.he_feng_tian_qi",                    "天气",     NULL, NULL, false },
+};
+#define CARD_COUNT (int)(sizeof(s_cards) / sizeof(s_cards[0]))
+
+static void card_clicked_cb(lv_event_t *e)
+{
+    card_t *c = (card_t *)lv_event_get_user_data(e);
+    if (c == NULL) return;
+    haptic_click();
+    if (c->toggle) {
+        const char *svc = "toggle";
+        const ha_entity_t *ent = ha_client_find(c->entity);
+        if (ent != NULL && ent->on) svc = "turn_off";
+        else if (ent != NULL && !ent->on) svc = "turn_on";
+        ESP_LOGI(TAG, "点击 %s -> %s", c->entity, svc);
+        ha_client_action(c->entity, svc);
+    } else {
+        ESP_LOGI(TAG, "点击 %s（仅显示）", c->entity);
+    }
+}
+
+static lv_obj_t *make_card(lv_obj_t *scr, int x, int y, const char *name, card_t *ctx)
+{
+    lv_obj_t *card = lv_obj_create(scr);
+    lv_obj_set_size(card, 150, 100);
+    lv_obj_set_pos(card, x, y);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x141418), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(card, card_clicked_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *lab = lv_label_create(card);
+    lv_label_set_text(lab, name);
+    lv_obj_set_style_text_font(lab, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(lab, lv_color_hex(0x8E8E93), 0);
+    lv_obj_align(lab, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *val = lv_label_create(card);
+    lv_label_set_text(val, "--");
+    lv_obj_set_style_text_font(val, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(val, lv_color_white(), 0);
+    lv_obj_align(val, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    return val;
+}
+
+static void update_cards(void)
+{
+    for (int i = 0; i < CARD_COUNT; i++) {
+        card_t *c = &s_cards[i];
+        const ha_entity_t *e = ha_client_find(c->entity);
+        if (c->value == NULL) continue;
+        if (e == NULL || !e->fresh) {
+            lv_label_set_text(c->value, "--");
+        } else if (e->unit[0]) {
+            lv_label_set_text_fmt(c->value, "%s %s", e->state, e->unit);
+        } else {
+            lv_label_set_text(c->value, e->state);
+        }
+        if (c->card) {
+            lv_obj_set_style_bg_color(c->card,
+                (e && e->on) ? lv_color_hex(0x1F2A44) : lv_color_hex(0x141418), 0);
+        }
+    }
+}
+
+static lv_obj_t *s_bat_label;
+static lv_obj_t *s_rssi_bars[4];
+static lv_obj_t *s_ha_dot;
+
+static void update_statusbar(void)
+{
+    if (s_bat_label) {
+        const int mv = s_bat_mv;
+        if (mv > 2500) {
+            int pct = (mv - 3200) * 100 / (4200 - 3200);
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            lv_label_set_text_fmt(s_bat_label, "%d.%01dV %d%%", mv / 1000, (mv % 1000) / 100, pct);
+            lv_obj_set_style_text_color(s_bat_label,
+                pct > 30 ? lv_color_hex(0x30D158) : lv_color_hex(0xFF453A), 0);
+        } else {
+            lv_label_set_text(s_bat_label, "no bat");
+        }
+    }
+    int level = 0;
+    if (net_wifi_connected()) {
+        const int r = net_wifi_rssi();
+        level = (r >= -55) ? 4 : (r >= -67) ? 3 : (r >= -78) ? 2 : 1;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (s_rssi_bars[i]) {
+            lv_obj_set_style_bg_color(s_rssi_bars[i],
+                (i < level) ? lv_color_hex(0x30D158) : lv_color_hex(0x3A3A3C), 0);
+        }
+    }
+    if (s_ha_dot) {
+        lv_obj_set_style_bg_color(s_ha_dot,
+            ha_client_online() ? lv_color_hex(0x30D158) : lv_color_hex(0xFF453A), 0);
+    }
+}
+
+static void ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    update_cards();
+}
 
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
+    (void)indev;
     const int8_t diff = encoder_read_diff();
     if (diff != 0) {
-        s_enc_value += diff * 5;
-        if (s_enc_value < 0) s_enc_value = 0;
-        if (s_enc_value > 100) s_enc_value = 100;
-        if (s_enc_label) lv_label_set_text_fmt(s_enc_label, "value: %d", s_enc_value);
-        ESP_LOGI(TAG, "旋钮: value=%d", s_enc_value);
         haptic_click();
-        data->enc_diff = diff;
-    } else {
-        data->enc_diff = 0;
     }
+    data->enc_diff = diff;
     data->state = LV_INDEV_STATE_RELEASED;
 }
 
-static void build_test_ui(void)
+static void build_cards_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "Orbis on F118");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 50);
+    /* ---- 顶部状态栏：HA 点 / WiFi 信号格 / 电池 ---- */
+    lv_obj_t *bar = lv_obj_create(scr);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, 230, 24);
+    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 46);
+    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *sub = lv_label_create(scr);
-    lv_label_set_text(sub, "ESP32-S31 / LVGL 9.6.0");
-    lv_obj_set_style_text_color(sub, lv_color_hex(0x8E8E93), 0);
-    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 92);
+    s_ha_dot = lv_obj_create(bar);
+    lv_obj_remove_style_all(s_ha_dot);
+    lv_obj_set_size(s_ha_dot, 10, 10);
+    lv_obj_set_style_radius(s_ha_dot, 5, 0);
+    lv_obj_set_style_bg_color(s_ha_dot, lv_color_hex(0x8E8E93), 0);
+    lv_obj_set_style_bg_opa(s_ha_dot, LV_OPA_COVER, 0);
+    lv_obj_align(s_ha_dot, LV_ALIGN_LEFT_MID, 0, 0);
 
-    lv_obj_t *btn = lv_button_create(scr);
-    lv_obj_set_size(btn, 170, 64);
-    lv_obj_align(btn, LV_ALIGN_CENTER, 0, 10);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x0A84FF), 0);
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, "TAP ME");
-    lv_obj_center(lbl);
+    lv_obj_t *ha_lab = lv_label_create(bar);
+    lv_label_set_text(ha_lab, "HA");
+    lv_obj_set_style_text_font(ha_lab, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ha_lab, lv_color_hex(0x8E8E93), 0);
+    lv_obj_align(ha_lab, LV_ALIGN_LEFT_MID, 15, 0);
 
-    s_net_label = lv_label_create(scr);
-    lv_label_set_text(s_net_label, "WiFi --  MQTT --");
-    lv_obj_set_style_text_color(s_net_label, lv_color_hex(0x64D2FF), 0);
-    lv_obj_align(s_net_label, LV_ALIGN_TOP_MID, 0, 130);
+    for (int i = 0; i < 4; i++) {
+        s_rssi_bars[i] = lv_obj_create(bar);
+        lv_obj_remove_style_all(s_rssi_bars[i]);
+        lv_obj_set_size(s_rssi_bars[i], 5, 6 + i * 4);
+        lv_obj_set_style_bg_color(s_rssi_bars[i], lv_color_hex(0x3A3A3C), 0);
+        lv_obj_set_style_bg_opa(s_rssi_bars[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(s_rssi_bars[i], 1, 0);
+        lv_obj_align(s_rssi_bars[i], LV_ALIGN_LEFT_MID, 108 + i * 8, 4);
+    }
 
-    s_enc_label = lv_label_create(scr);
-    lv_label_set_text_fmt(s_enc_label, "value: %d", s_enc_value);
-    lv_obj_set_style_text_font(s_enc_label, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(s_enc_label, lv_color_hex(0xFFD60A), 0);
-    lv_obj_align(s_enc_label, LV_ALIGN_BOTTOM_MID, 0, -110);
+    s_bat_label = lv_label_create(bar);
+    lv_label_set_text(s_bat_label, "---");
+    lv_obj_set_style_text_font(s_bat_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_bat_label, lv_color_hex(0x8E8E93), 0);
+    lv_obj_align(s_bat_label, LV_ALIGN_RIGHT_MID, 0, 0);
 
-    s_tap_label = lv_label_create(scr);
-    lv_label_set_text(s_tap_label, "taps: 0");
-    lv_obj_set_style_text_color(s_tap_label, lv_color_hex(0x30D158), 0);
-    lv_obj_align(s_tap_label, LV_ALIGN_BOTTOM_MID, 0, -70);
-
-    lv_obj_add_event_cb(btn, tap_cb, LV_EVENT_CLICKED, NULL);
+    const int x0 = 22, y0 = 84, gap = 14;
+    for (int i = 0; i < CARD_COUNT; i++) {
+        const int col = i % 2, row = i / 2;
+        s_cards[i].value = make_card(scr, x0 + col * (150 + gap), y0 + row * (100 + gap),
+                                     s_cards[i].name, &s_cards[i]);
+        s_cards[i].card = lv_obj_get_parent(s_cards[i].value);
+    }
+    update_cards();
+    lv_timer_create(ui_timer_cb, 500, NULL);
 }
 void app_main(void)
 {
@@ -325,9 +488,22 @@ void app_main(void)
     lv_indev_t *enc = lv_indev_create();
     lv_indev_set_type(enc, LV_INDEV_TYPE_ENCODER);
     lv_indev_set_read_cb(enc, encoder_read_cb);
+    xTaskCreate(battery_task, "bat", 4096, NULL, 3, NULL);
     net_wifi_start();
     net_mqtt_start();
-    build_test_ui();
+    build_cards_ui();
+
+    /* 等 WiFi 连上再初始化 HA */
+    for (int i = 0; i < 60 && !net_wifi_connected(); i++) vTaskDelay(pdMS_TO_TICKS(500));
+    if (net_wifi_connected()) {
+        ha_client_init();
+        for (int i = 0; i < CARD_COUNT; i++) ha_client_register(s_cards[i].entity, s_cards[i].name);
+        ha_client_fetch_all();
+        ha_client_start_poll();
+        ESP_LOGI(TAG, "HA 已启动，注册 %d 个实体", CARD_COUNT);
+    } else {
+        ESP_LOGW(TAG, "WiFi 未连接，跳过 HA 初始化");
+    }
     ESP_LOGI(TAG, "进入 LVGL 主循环");
 
     uint32_t last_beat = 0;
@@ -336,12 +512,9 @@ void app_main(void)
         if (esp_timer_get_time() / 1000000ULL != last_beat) {
             last_beat = (uint32_t)(esp_timer_get_time() / 1000000ULL);
             if (last_beat % 5 == 0) {
+                net_mqtt_tick();
+                net_mqtt_publish_state();
                 ESP_LOGI(TAG, "网络: wifi=%d rssi=%d mqtt=%d", net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
-                if (s_net_label) {
-                    lv_label_set_text_fmt(s_net_label, "WiFi %s  MQTT %s",
-                                          net_wifi_connected() ? "OK" : "--",
-                                          net_mqtt_connected() ? "OK" : "--");
-                }
                 ESP_LOGI(TAG, "心跳 %u s，内部 RAM %u KB，PSRAM %u KB",
                          last_beat,
                          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),

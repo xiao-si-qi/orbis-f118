@@ -1,0 +1,12 @@
+menu "Orbis panel"
+
+    config APP_POLL_INTERVAL_S
+        int "Home Assistant poll interval (seconds)"
+        range 2 120
+        default 5
+        help
+            How often each entity state is refreshed through the REST API.
+            The entity list comes from the layout pushed over MQTT
+            (orbis/<id>/cfg), not from a file on the device.
+
+endmenu
