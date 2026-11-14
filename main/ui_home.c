@@ -28,6 +28,8 @@
 #include "ota.h"
 #include "bg_image.h"
 #include "ui_home.h"
+#include "voice_audio.h"    /* 语音页的「音频自检」按钮 */
+#include "xiaozhi_client.h" /* 小智服务端状态文字 */
 
 /* 旧工程用的是 lv_font_noto_18_cjk（LVGL 9.2 专用）；新工程只有 lv_font_cjk16
    （16px / 4bpp，GB2312 + ASCII，自带 montserrat_20 兜底）。 */
@@ -194,10 +196,9 @@ static bool is_status_page(int page)
     return s_layout_valid && page == s_json_pages;
 }
 
-/* 新板没有小智语音模块（xiaozhi_client / voice_audio 未移植），不再生成语音页：
-   即使布局里下发 voice_enabled，页数也按"没有这一页"算。
-   以后要恢复：把这里改成 1，并移植 xiaozhi_client.c / voice_audio.c。 */
-#define UI_VOICE_PAGE 0
+/* 小智语音页：只有布局里 voice.enabled=true（见 layout.c 的 voice 段）时才会建这一页。
+   服务端地址同样来自布局，由 main.c 的 apply_cfg() 交给 xiaozhi_client_configure()。 */
+#define UI_VOICE_PAGE 1
 
 static bool is_voice_page(int page)
 {
@@ -730,8 +731,44 @@ static void build_status_page(lv_obj_t *scr)
 }
 
 static lv_obj_t *s_voice_lines[3];
+static lv_obj_t *s_voice_test_btn;
+static lv_obj_t *s_voice_test_label;
+
+/* 自检任务跑在独立任务里（录音 1.5s + 回放，不能阻塞 LVGL）。
+   约定和 net.c 一样：任务只写静态变量，LVGL 线程在 refresh_voice_page() 里读。 */
+static volatile int s_voice_test_state;   /* 0=空闲 1=请求中 2=完成 3=失败 */
+static int s_voice_test_hold;             /* 结果在页面上保留的轮数 */
+static int s_voice_test_peak;
+static int s_voice_test_rms;
 
 #if UI_VOICE_PAGE
+static void voice_test_task(void *arg)
+{
+    (void)arg;
+    int peak = 0, rms = 0;
+    const int rc = voice_audio_selftest(&peak, &rms);
+    s_voice_test_peak = peak;
+    s_voice_test_rms = rms;
+    s_voice_test_state = (rc == 0) ? 2 : 3;
+    vTaskDelete(NULL);
+}
+
+static void voice_test_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_voice_test_state == 1) {
+        return;                 /* 已经在跑了 */
+    }
+    s_voice_test_state = 1;
+    s_voice_test_hold = 0;
+    lv_label_set_text(s_voice_test_label, "录音中…");
+    /* 音频只占一路 I2S + 少量 PSRAM，任务栈给 6 KB 足够 */
+    if (xTaskCreate(voice_test_task, "audio_test", 6144, NULL, 4, NULL) != pdPASS) {
+        s_voice_test_state = 3;
+        ESP_LOGW(TAG, "音频自检任务创建失败");
+    }
+}
+
 static void build_voice_page(lv_obj_t *scr)
 {
     lv_obj_t *page = lv_obj_create(scr);
@@ -763,15 +800,23 @@ static void build_voice_page(lv_obj_t *scr)
         lv_obj_align(s_voice_lines[i], LV_ALIGN_TOP_MID, 0, 108 + i * 40);
     }
 
+    /* 「音频自检」按钮：录 1.5s → 日志/按钮上出峰值与 RMS → 回放（走线路输出） */
+    s_voice_test_btn = lv_button_create(page);
+    lv_obj_set_size(s_voice_test_btn, 180, 40);
+    lv_obj_align(s_voice_test_btn, LV_ALIGN_TOP_MID, 0, 250);
+    lv_obj_set_style_bg_color(s_voice_test_btn, COLOR_ACCENT, 0);
+    lv_obj_set_style_radius(s_voice_test_btn, 14, 0);
+    lv_obj_add_event_cb(s_voice_test_btn, voice_test_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    s_voice_test_label = lv_label_create(s_voice_test_btn);
+    lv_label_set_text(s_voice_test_label, "音频自检");
+    lv_obj_set_style_text_font(s_voice_test_label, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_voice_test_label, COLOR_TEXT, 0);
+    lv_obj_center(s_voice_test_label);
+
     s_pages[s_json_pages + 1] = page;
 }
 #endif /* UI_VOICE_PAGE */
-
-/* TODO(port): 新工程没有 xiaozhi_client，语音页状态先用固定文案顶替。 */
-static const char *voice_status_text(void)
-{
-    return "语音模块未移植";
-}
 
 /** 刷新语音页文字（配置变化或连接状态变化时调用）。 */
 static void refresh_voice_page(void)
@@ -786,7 +831,31 @@ static void refresh_voice_page(void)
     snprintf(pretty, sizeof(pretty), "%s", ep[0] ? ep : "未配置服务端地址");
     lv_label_set_text(s_voice_lines[1], pretty);
 
-    lv_label_set_text(s_voice_lines[2], voice_status_text());
+    /* 第三行：自检结果优先（保留约 5 秒），其次是服务端状态文字 */
+    char status[96];
+    const int st = s_voice_test_state;
+    if (st == 1) {
+        snprintf(status, sizeof(status), "音频自检：录音中…");
+    } else if (st == 2 || st == 3) {
+        if (s_voice_test_hold == 0) {
+            s_voice_test_hold = 10;          /* 500ms/轮 → 约 5 秒 */
+        }
+        if (st == 2) {
+            snprintf(status, sizeof(status), "峰值 %d / RMS %d", s_voice_test_peak, s_voice_test_rms);
+        } else {
+            snprintf(status, sizeof(status), "音频自检失败（看日志）");
+        }
+        if (s_voice_test_hold == 1) {        /* 最后一轮：把状态和按钮文案复位 */
+            if (s_voice_test_label != NULL) {
+                lv_label_set_text(s_voice_test_label, "音频自检");
+            }
+            s_voice_test_state = 0;
+        }
+        s_voice_test_hold--;
+    } else {
+        snprintf(status, sizeof(status), "%s", xiaozhi_client_status_text());
+    }
+    lv_label_set_text(s_voice_lines[2], status);
 }
 
 static void refresh_status_page(void)
@@ -1996,6 +2065,8 @@ static void build_ui(void)
     memset(s_page_tiles, 0, sizeof(s_page_tiles));
     memset(s_sys_lines, 0, sizeof(s_sys_lines));
     memset(s_voice_lines, 0, sizeof(s_voice_lines));
+    s_voice_test_btn = NULL;
+    s_voice_test_label = NULL;
 
     s_json_pages = s_layout.page_count;
     s_page_count = s_json_pages + 1; /* 加 System 页 */

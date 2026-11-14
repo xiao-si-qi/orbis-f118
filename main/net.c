@@ -182,7 +182,7 @@ void net_mqtt_tick(void)
     snprintf(payload, sizeof(payload),
              "{\"type\":\"screen\","
              "\"caps\":[\"fw\",\"rssi\",\"uptime\",\"online\",\"layout\",\"ota\",\"reboot\","
-             "\"brightness\",\"log\",\"background\"],"
+             "\"brightness\",\"log\",\"background\",\"voice\"],"
              "\"display\":{\"w\":360,\"h\":360,\"formats\":[\"jpeg\"],\"fit\":[\"cover\",\"contain\"]},"
              "\"fw\":\"" APP_FW_VERSION "\","
              "\"name\":\"ESP32-S31 旋钮屏\","

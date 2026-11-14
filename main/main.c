@@ -38,6 +38,8 @@
 #include "ui_home.h"
 #include "log_buffer.h"
 #include "ota.h"
+#include "voice_audio.h"      /* 音频自检（MQTT 的 audio_test 命令 / 语音页按钮） */
+#include "xiaozhi_client.h"   /* 小智 AI（布局里的 voice 段驱动） */
 #include "cJSON.h"
 
 static const char *TAG = "orbis-f118";
@@ -321,6 +323,7 @@ static void battery_task(void *arg)
 
 static lv_group_t *s_group;          /* 编码器用的按键组（ui_home 未使用，留空表） */
 static volatile bool s_log_on;       /* 串口日志是否同时推 MQTT */
+static volatile bool s_audio_test_busy;  /* 音频自检任务是否在跑 */
 static int64_t s_last_diag_us;       /* 错误摘要限流（60s） */
 
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
@@ -377,10 +380,35 @@ static void apply_cfg(const char *json)
 
     layout_save_nvs(json);
     register_layout_entities(lay);
+
+    /* 小智语音：开关和服务端地址都来自布局的 voice 段（switchyard 下发），
+       这是唯一正式来源；MQTT 的 {"cmd":"voice"} 只是调试覆盖。 */
+    xiaozhi_client_configure(lay->voice_enabled, lay->voice_endpoint);
+    ESP_LOGI(TAG, "小智语音：%s%s%s", lay->voice_enabled ? "启用" : "未启用",
+             lay->voice_enabled ? "，endpoint=" : "",
+             lay->voice_enabled ? lay->voice_endpoint : "");
+
     const int pages = lay->page_count;
     ui_home_apply(lay);
     free(lay);
     ESP_LOGI(TAG, "cfg 已应用：共 %d 页", pages);
+}
+
+/** MQTT 的 {"cmd":"audio_test"}：录 1.5s → 日志里出峰值/RMS → 回放。
+    必须放独立任务：整段要 3 秒多，绝不能在 LVGL 主循环里同步跑。 */
+static void audio_test_task(void *arg)
+{
+    (void)arg;
+    s_audio_test_busy = true;
+    int peak = 0, rms = 0;
+    const int rc = voice_audio_selftest(&peak, &rms);
+    if (rc == 0) {
+        ESP_LOGI(TAG, "音频自检完成：峰值 %d，均方 %d（已回放，线路输出插耳机可听）", peak, rms);
+    } else {
+        ESP_LOGE(TAG, "音频自检失败（录音或播放通路有问题，看上面日志）");
+    }
+    s_audio_test_busy = false;
+    vTaskDelete(NULL);
 }
 
 static void apply_cmd(const char *json)
@@ -410,6 +438,27 @@ static void apply_cmd(const char *json)
 
     } else if (strcmp(cmd, "state") == 0) {
         net_mqtt_publish_state();
+
+    } else if (strcmp(cmd, "audio_test") == 0) {
+        /* 调试：{cmd:"audio_test"} 录 1.5 秒 → 打印峰值/均方 → 回放。独立任务，别卡 LVGL。 */
+        if (s_audio_test_busy) {
+            ESP_LOGW(TAG, "音频自检已在跑，忽略本次命令");
+        } else if (xTaskCreate(audio_test_task, "audio_test", 6144, NULL, 4, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "音频自检任务创建失败");
+        } else {
+            ESP_LOGI(TAG, "音频自检已启动（录 1500ms → 峰值/RMS → 回放）");
+        }
+
+    } else if (strcmp(cmd, "voice") == 0) {
+        /* 调试覆盖：{cmd:"voice",enabled:true,endpoint:"https://..."}
+           正常配置走布局的 voice 段（apply_cfg），这里只用于临时验证服务端地址。 */
+        const cJSON *jen = cJSON_GetObjectItemCaseSensitive(root, "enabled");
+        const cJSON *jep = cJSON_GetObjectItemCaseSensitive(root, "endpoint");
+        const bool en = cJSON_IsBool(jen) ? cJSON_IsTrue(jen)
+                                         : (cJSON_IsNumber(jen) ? (jen->valueint != 0) : true);
+        const char *ep = cJSON_IsString(jep) ? jep->valuestring : NULL;
+        xiaozhi_client_configure(en, ep);
+        ESP_LOGI(TAG, "小智（调试覆盖）：enabled=%d endpoint=%s", (int)en, ep ? ep : "-");
 
     } else if (strcmp(cmd, "log") == 0) {
         /* 按需抓日志：先把环形缓冲里的最近 40 行发一次，之后按 s_log_on 继续推 */
@@ -534,7 +583,10 @@ void app_main(void)
                             (layout_load_nvs(lay) == ESP_OK) && lay->page_count > 0;
     if (has_layout) {
         register_layout_entities(lay);
-        ESP_LOGI(TAG, "已从 NVS 恢复布局：%d 页", lay->page_count);
+        /* 开机就按上次下发的布局恢复小智语音（没启用则什么都不做） */
+        xiaozhi_client_configure(lay->voice_enabled, lay->voice_endpoint);
+        ESP_LOGI(TAG, "已从 NVS 恢复布局：%d 页（语音 %s）", lay->page_count,
+                 lay->voice_enabled ? "启用" : "未启用");
     } else {
         ESP_LOGW(TAG, "还没有布局，等 switchyard/%s/cfg", net_device_id());
     }
