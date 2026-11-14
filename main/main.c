@@ -44,6 +44,9 @@
 
 static const char *TAG = "orbis-f118";
 
+/* 官方小智服务端（OTA 发现地址）：voice_test 默认用它试整条语音链路 */
+#define XZ_OFFICIAL_ENDPOINT "https://api.tenclass.net/xiaozhi/ota/"
+
 /* ---- 引脚（实测确认）---- */
 #define PIN_SCLK 12
 #define PIN_D0   14
@@ -448,6 +451,20 @@ static void apply_cmd(const char *json)
         } else {
             ESP_LOGI(TAG, "音频自检已启动（录 1500ms → 峰值/RMS → 回放）");
         }
+
+    } else if (strcmp(cmd, "voice_test") == 0) {
+        /* 一条命令验证整条语音链路（人不在设备边，全靠 MQTT 日志看结果）：
+           开日志上报 → 启用官方服务端 → 等 hello → 自动 listen start → 说话 → 听回复。
+           可选 {"cmd":"voice_test","endpoint":"https://..."} 换自建服务端。 */
+        const cJSON *jep = cJSON_GetObjectItemCaseSensitive(root, "endpoint");
+        const char *ep = (cJSON_IsString(jep) && jep->valuestring[0] != '\0')
+                             ? jep->valuestring : XZ_OFFICIAL_ENDPOINT;
+        s_log_on = true;                    /* 后面所有日志同步发到 MQTT log 主题 */
+        ESP_LOGI(TAG, "voice_test 1/4：日志上报已开启，启用小智语音 endpoint=%s", ep);
+        xiaozhi_client_configure(true, ep);
+        ESP_LOGI(TAG, "voice_test 2/4：等 OTA 发现 → WebSocket hello（约 3-10 秒；失败会打 发现失败/连接出错）");
+        ESP_LOGI(TAG, "voice_test 3/4：收到 hello 后自动发 listen start，请对着麦克风说话 3-5 秒");
+        ESP_LOGI(TAG, "voice_test 4/4：状态文字 已连接→正在聆听→正在说话→播放回复；每秒一条 上行/下行 摘要");
 
     } else if (strcmp(cmd, "voice") == 0) {
         /* 调试覆盖：{cmd:"voice",enabled:true,endpoint:"https://..."}
