@@ -24,6 +24,7 @@ static const char *TAG = "net";
 static EventGroupHandle_t s_eg;
 static bool s_wifi_up;
 static bool s_mqtt_up;
+static char s_ip_str[16];
 static bool s_need_meta;
 static esp_mqtt_client_handle_t s_mqtt;
 static char s_dev_id[48];
@@ -41,7 +42,8 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
         s_wifi_up = true;
         xEventGroupSetBits(s_eg, WIFI_CONNECTED_BIT);
-        ESP_LOGI(TAG, "WiFi 已连接: " IPSTR, IP2STR(&ev->ip_info.ip));
+        snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&ev->ip_info.ip));
+        ESP_LOGI(TAG, "WiFi 已连接: %s", s_ip_str);
     }
 }
 
@@ -95,6 +97,7 @@ esp_err_t net_wifi_start(void)
 }
 
 bool net_wifi_connected(void) { return s_wifi_up; }
+const char *net_ip_string(void) { return s_ip_str[0] ? s_ip_str : "--"; }
 
 int net_wifi_rssi(void)
 {

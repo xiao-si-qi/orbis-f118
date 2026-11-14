@@ -13,6 +13,9 @@ esp_err_t net_wifi_start(void);
 /** WiFi 是否已连接 */
 bool net_wifi_connected(void);
 
+/** 当前 IP 字符串 */
+const char *net_ip_string(void);
+
 /** 当前 RSSI（未连接返回 0） */
 int net_wifi_rssi(void);
 

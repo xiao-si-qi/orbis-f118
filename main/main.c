@@ -1,4 +1,4 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +19,7 @@ LV_FONT_DECLARE(lv_font_cjk16);
 #include "net.h"
 #include "detail.h"
 #include "bg_image.h"
+#include "settings.h"
 
 
 static const char *TAG = "orbis-f118";
@@ -292,6 +293,10 @@ typedef struct {
     bool toggle;
 } card_t;
 
+static lv_obj_t *s_page_main;
+static lv_obj_t *s_page_set;
+static int s_cur_page;
+
 static const char *EID_LIGHT   = "light.xiaomi_cn_752752842_ceil05_s_2_light";
 static const char *EID_POWER   = "sensor.zong_gong_lu";
 static const char *EID_WATER   = "sensor.wm_001_temp";
@@ -315,6 +320,25 @@ static void card_clicked_cb(lv_event_t *e)
     } else {
         ESP_LOGI(TAG, "点击 %s（仅显示）", c->entity);
     }
+}
+
+static void show_page(int idx)
+{
+    if (idx < 0) idx = 0;
+    if (idx > 1) idx = 1;
+    s_cur_page = idx;
+    if (s_page_main) idx == 0 ? lv_obj_remove_flag(s_page_main, LV_OBJ_FLAG_HIDDEN)
+                              : lv_obj_add_flag(s_page_main, LV_OBJ_FLAG_HIDDEN);
+    if (s_page_set)  idx == 1 ? lv_obj_remove_flag(s_page_set, LV_OBJ_FLAG_HIDDEN)
+                              : lv_obj_add_flag(s_page_set, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void gesture_cb(lv_event_t *e)
+{
+    const lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+    if (detail_is_open()) return;
+    if (dir == LV_DIR_LEFT) show_page(s_cur_page + 1);
+    else if (dir == LV_DIR_RIGHT) show_page(s_cur_page - 1);
 }
 
 static lv_obj_t *make_card(lv_obj_t *scr, int x, int y, const char *name, card_t *ctx)
@@ -408,6 +432,7 @@ static void ui_timer_cb(lv_timer_t *t)
     update_cards();
     update_statusbar();
     detail_refresh();
+    if (s_cur_page == 1) settings_refresh();
 }
 
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
@@ -492,7 +517,27 @@ void app_main(void)
     net_wifi_start();
     net_mqtt_start();
     bg_image_init();
+
+    /* 两个页面容器：0=卡片页，1=参数页 */
+    s_page_main = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(s_page_main);
+    lv_obj_set_size(s_page_main, 360, 360);
+    lv_obj_set_pos(s_page_main, 0, 0);
+    lv_obj_remove_flag(s_page_main, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_page_main, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(s_page_main, gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    s_page_set = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(s_page_set);
+    lv_obj_set_size(s_page_set, 360, 360);
+    lv_obj_set_pos(s_page_set, 0, 0);
+    lv_obj_remove_flag(s_page_set, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_page_set, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(s_page_set, gesture_cb, LV_EVENT_GESTURE, NULL);
+
     build_cards_ui();
+    settings_build(s_page_set);
+    show_page(0);
     bg_image_bind(lv_screen_active());
     {
         static const char *bg_json =
