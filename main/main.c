@@ -1,5 +1,6 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -287,8 +288,8 @@ static void battery_task(void *arg)
 /* ---------------- 卡片界面 ---------------- */
 
 typedef struct {
-    const char *entity;
-    const char *name;
+    char entity[96];
+    char name[64];
     lv_obj_t *card;
     lv_obj_t *value;
     bool toggle;
@@ -309,7 +310,7 @@ static card_t s_cards[] = {
     { "sensor.wm_001_temp",                         "水温",     NULL, NULL, false },
     { "weather.he_feng_tian_qi",                    "天气",     NULL, NULL, false },
 };
-#define CARD_COUNT (int)(sizeof(s_cards) / sizeof(s_cards[0]))
+static int s_card_count = 4;
 
 static void card_clicked_cb(lv_event_t *e)
 {
@@ -374,7 +375,7 @@ static lv_obj_t *make_card(lv_obj_t *scr, int x, int y, const char *name, card_t
 
 static void update_cards(void)
 {
-    for (int i = 0; i < CARD_COUNT; i++) {
+    for (int i = 0; i < s_card_count; i++) {
         card_t *c = &s_cards[i];
         const ha_entity_t *e = ha_client_find(c->entity);
         if (c->value == NULL) continue;
@@ -450,6 +451,51 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     data->state = LV_INDEV_STATE_RELEASED;
 }
 
+#include "layout.h"
+
+static void build_cards_ui(void);
+
+static void apply_cfg(const char *json)
+{
+    bg_image_apply_json(json);
+
+    /* layout_t 约 11 KB，必须放堆上：app_main 的栈只有 3.5 KB */
+    layout_t *lay = calloc(1, sizeof(layout_t));
+    if (lay == NULL) {
+        ESP_LOGE(TAG, "布局内存不足");
+        return;
+    }
+    const esp_err_t perr = layout_parse(json, lay);
+    if (perr != ESP_OK || lay->page_count <= 0) {
+        ESP_LOGW(TAG, "cfg 里没有可用布局 (%s)", esp_err_to_name(perr));
+        free(lay);
+        return;
+    }
+
+    const layout_page_t *pg = &lay->pages[0];
+    int n = pg->tile_count;
+    if (n > 4) n = 4;
+    if (n <= 0) { free(lay); return; }
+
+    /* 清空旧卡片 */
+    lv_obj_clean(s_page_main);
+
+    for (int i = 0; i < n; i++) {
+        snprintf(s_cards[i].entity, sizeof(s_cards[i].entity), "%s", pg->tiles[i].entity);
+        snprintf(s_cards[i].name, sizeof(s_cards[i].name), "%s", pg->tiles[i].label[0] ? pg->tiles[i].label : "实体");
+        s_cards[i].toggle = (pg->tiles[i].type == TILE_TOGGLE);
+        s_cards[i].value = NULL;
+        s_cards[i].card = NULL;
+    }
+    s_card_count = n;
+
+    for (int i = 0; i < n; i++) {
+        ha_client_register(s_cards[i].entity, s_cards[i].name);
+    }
+    build_cards_ui();
+    ESP_LOGI(TAG, "cfg 已应用：%d 张卡片", n);
+}
+
 static void build_cards_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -493,7 +539,7 @@ static void build_cards_ui(void)
     lv_obj_align(s_bat_label, LV_ALIGN_RIGHT_MID, -2, 0);
 
     const int x0 = 22, y0 = 84, gap = 14;
-    for (int i = 0; i < CARD_COUNT; i++) {
+    for (int i = 0; i < s_card_count; i++) {
         const int col = i % 2, row = i / 2;
         s_cards[i].value = make_card(scr, x0 + col * (150 + gap), y0 + row * (100 + gap),
                                      s_cards[i].name, &s_cards[i]);
@@ -558,10 +604,10 @@ void app_main(void)
     for (int i = 0; i < 60 && !net_wifi_connected(); i++) vTaskDelay(pdMS_TO_TICKS(500));
     if (net_wifi_connected()) {
         ha_client_init();
-        for (int i = 0; i < CARD_COUNT; i++) ha_client_register(s_cards[i].entity, s_cards[i].name);
+        for (int i = 0; i < s_card_count; i++) ha_client_register(s_cards[i].entity, s_cards[i].name);
         ha_client_fetch_all();
         ha_client_start_poll();
-        ESP_LOGI(TAG, "HA 已启动，注册 %d 个实体", CARD_COUNT);
+        ESP_LOGI(TAG, "HA 已启动，注册 %d 个实体", s_card_count);
     } else {
         ESP_LOGW(TAG, "WiFi 未连接，跳过 HA 初始化");
     }
@@ -574,6 +620,10 @@ void app_main(void)
             last_beat = (uint32_t)(esp_timer_get_time() / 1000000ULL);
             if (last_beat % 5 == 0) {
                 net_mqtt_tick();
+                {
+                    static char cfg_json[4096];
+                    if (net_take_cfg(cfg_json, sizeof(cfg_json))) apply_cfg(cfg_json);
+                }
                 net_mqtt_publish_state();
                 ESP_LOGI(TAG, "电池: %d mV | 网络: wifi=%d rssi=%d mqtt=%d", s_bat_mv, net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
                 ESP_LOGI(TAG, "心跳 %u s，内部 RAM %u KB，PSRAM %u KB",

@@ -2,6 +2,7 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,11 +23,14 @@ int net_wifi_rssi(void);
 /** 启动 MQTT（连 switchyard） */
 esp_err_t net_mqtt_start(void);
 
-/** 连接后的 meta/订阅（主循环调用） */
+/** 连接后发布 meta / 订阅主题（主循环调用） */
 void net_mqtt_tick(void);
 
 /** 发布 state（保留消息），由主循环定期调用 */
 void net_mqtt_publish_state(void);
+
+/** 取出收到的 cfg 负载（主循环调用） */
+bool net_take_cfg(char *out, size_t len);
 
 /** MQTT 是否已连接 */
 bool net_mqtt_connected(void);

@@ -1,15 +1,16 @@
-﻿#include <string.h>
+#include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
-#include "esp_system.h"
-#include "freertos/task.h"
 
 #include "net.h"
 #include "secrets.h"
@@ -21,6 +22,7 @@
 static const char *TAG = "net";
 
 #define WIFI_CONNECTED_BIT BIT0
+
 static EventGroupHandle_t s_eg;
 static bool s_wifi_up;
 static bool s_mqtt_up;
@@ -29,6 +31,10 @@ static bool s_need_meta;
 static esp_mqtt_client_handle_t s_mqtt;
 static char s_dev_id[48];
 static char s_will_topic[96];
+
+/* 收到的 cfg（由主循环取走） */
+static char s_cfg_buf[4096];
+static volatile bool s_cfg_pending;
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -53,12 +59,25 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     switch ((esp_mqtt_event_id_t)id) {
     case MQTT_EVENT_CONNECTED:
         s_mqtt_up = true;
-        s_need_meta = true;    /* 真正的发布放到主循环，避免在回调里调用 publish */
+        s_need_meta = true;    /* 发布放到主循环，回调里不要调用 publish */
         ESP_LOGI(TAG, "MQTT 已连接 %s:%d", APP_SECRET_MQTT_HOST, APP_SECRET_MQTT_PORT);
-        break;    case MQTT_EVENT_DISCONNECTED:
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
         s_mqtt_up = false;
         ESP_LOGW(TAG, "MQTT 断开");
         break;
+
+    case MQTT_EVENT_DATA:
+        if (e->data_len > 0 && e->data_len < (int)sizeof(s_cfg_buf) &&
+            strstr(e->topic, "/cfg") != NULL) {
+            memcpy(s_cfg_buf, e->data, (size_t)e->data_len);
+            s_cfg_buf[e->data_len] = 0;
+            s_cfg_pending = true;
+            ESP_LOGI(TAG, "收到 cfg（%d 字节）", e->data_len);
+        }
+        break;
+
     default:
         break;
     }
@@ -68,7 +87,6 @@ esp_err_t net_wifi_start(void)
 {
     s_eg = xEventGroupCreate();
 
-    /* WiFi 驱动依赖 NVS，必须先初始化，否则 esp_wifi_init 会 abort 并进入重启循环 */
     esp_err_t nerr = nvs_flash_init();
     if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "NVS 需要擦除，重新初始化");
@@ -108,7 +126,9 @@ int net_wifi_rssi(void)
 
 esp_err_t net_mqtt_start(void)
 {
-    snprintf(s_dev_id, sizeof(s_dev_id), "%s", APP_SECRET_DEVICE_ID[0] ? APP_SECRET_DEVICE_ID : "orbis-f118");
+    snprintf(s_dev_id, sizeof(s_dev_id), "%s",
+             APP_SECRET_DEVICE_ID[0] ? APP_SECRET_DEVICE_ID : "orbis-f118");
+    snprintf(s_will_topic, sizeof(s_will_topic), "switchyard/%s/availability", s_dev_id);
 
     char uri[96];
     snprintf(uri, sizeof(uri), "mqtt://%s:%d", APP_SECRET_MQTT_HOST, APP_SECRET_MQTT_PORT);
@@ -165,6 +185,14 @@ void net_mqtt_publish_state(void)
              net_wifi_rssi(),
              (unsigned)(esp_get_free_heap_size() / 1024));
     esp_mqtt_client_publish(s_mqtt, t, payload, 0, 1, 1);
+}
+
+bool net_take_cfg(char *out, size_t len)
+{
+    if (!s_cfg_pending) return false;
+    s_cfg_pending = false;
+    snprintf(out, len, "%s", s_cfg_buf);
+    return true;
 }
 
 bool net_mqtt_connected(void) { return s_mqtt_up; }
