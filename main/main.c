@@ -14,6 +14,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "lvgl.h"
+#include "net.h"
 
 static const char *TAG = "orbis-f118";
 
@@ -162,10 +163,10 @@ static void encoder_task(void *arg)
     while (1) {
         const int cur = (gpio_get_level(7) << 1) | gpio_get_level(6);
         if (cur != last) {
-            if (cur == 0x2) {          /* A=0 B=1 顺时针一格 */
-                s_enc_acc += 1;
-            } else if (cur == 0x1) {   /* A=1 B=0 逆时针一格 */
+            if (cur == 0x2) {          /* A=0 B=1：顺时针（实测应减小） */
                 s_enc_acc -= 1;
+            } else if (cur == 0x1) {   /* A=1 B=0：逆时针（实测应增大） */
+                s_enc_acc += 1;
             }
             last = cur;
         }
@@ -235,6 +236,7 @@ static void touch_init(void)
 }
 
 static lv_obj_t *s_tap_label;
+static lv_obj_t *s_net_label;
 static int s_tap_count = 0;
 
 static void tap_cb(lv_event_t *e)
@@ -290,6 +292,11 @@ static void build_test_ui(void)
     lv_label_set_text(lbl, "TAP ME");
     lv_obj_center(lbl);
 
+    s_net_label = lv_label_create(scr);
+    lv_label_set_text(s_net_label, "WiFi --  MQTT --");
+    lv_obj_set_style_text_color(s_net_label, lv_color_hex(0x64D2FF), 0);
+    lv_obj_align(s_net_label, LV_ALIGN_TOP_MID, 0, 130);
+
     s_enc_label = lv_label_create(scr);
     lv_label_set_text_fmt(s_enc_label, "value: %d", s_enc_value);
     lv_obj_set_style_text_font(s_enc_label, &lv_font_montserrat_28, 0);
@@ -318,6 +325,8 @@ void app_main(void)
     lv_indev_t *enc = lv_indev_create();
     lv_indev_set_type(enc, LV_INDEV_TYPE_ENCODER);
     lv_indev_set_read_cb(enc, encoder_read_cb);
+    net_wifi_start();
+    net_mqtt_start();
     build_test_ui();
     ESP_LOGI(TAG, "进入 LVGL 主循环");
 
@@ -327,6 +336,12 @@ void app_main(void)
         if (esp_timer_get_time() / 1000000ULL != last_beat) {
             last_beat = (uint32_t)(esp_timer_get_time() / 1000000ULL);
             if (last_beat % 5 == 0) {
+                ESP_LOGI(TAG, "网络: wifi=%d rssi=%d mqtt=%d", net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
+                if (s_net_label) {
+                    lv_label_set_text_fmt(s_net_label, "WiFi %s  MQTT %s",
+                                          net_wifi_connected() ? "OK" : "--",
+                                          net_mqtt_connected() ? "OK" : "--");
+                }
                 ESP_LOGI(TAG, "心跳 %u s，内部 RAM %u KB，PSRAM %u KB",
                          last_beat,
                          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
