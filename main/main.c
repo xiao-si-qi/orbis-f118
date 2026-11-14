@@ -1,4 +1,4 @@
-/*
+﻿/*
  * orbis-f118 · 360×360 圆屏（ESP32-S31 / JC3636F118）
  *
  * 硬件初始化沿用原来的写法（背光 / LCD / LVGL / 触摸 / 编码器 / 触觉 / 电池 / 网络）。
@@ -28,10 +28,13 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "lvgl.h"
 
 #include "bsp_shim.h"       /* bsp_display_set_backlight()（旧工程 bsp_display_* 的替代） */
 #include "net.h"
+#include "battery.h"
 #include "web.h"           /* 网页配置后台（配网 / 网页 OTA），WiFi 连上后起 */
 #include "app_settings.h"  /* NVS 配置：WiFi / HA / MQTT / 设置页口令 */
 #include "ha_client.h"
@@ -285,7 +288,8 @@ static void touch_init(void)
 }
 
 /* ---------------- 电池 ADC（GPIO55，15k/10k 分压）---------------- */
-static volatile int s_bat_mv;
+static volatile int s_bat_raw = -1;      /* 电池 ADC 原始值（未标定） */
+static volatile int s_bat_raw_max;
 
 static void battery_task(void *arg)
 {
@@ -299,30 +303,45 @@ static void battery_task(void *arg)
     adc_oneshot_unit_handle_t au = NULL;
     if (adc_oneshot_new_unit(&uic, &au) != ESP_OK) { vTaskDelete(NULL); return; }
 
-    adc_oneshot_chan_cfg_t cc = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
+    /* ESP32-S31 的 ADC 与常见 S3 不同：
+       - SOC_ADC_ATTEN_NUM = 1，只有一档衰减，设置其它档位会返回 invalid attenuation
+       - 位宽最高 17 位
+       - 没有可用的校准方案（ADC_CALI_SCHEME_*_SUPPORTED 未定义）
+       因此没有可靠的 raw → mV 公式，先把原始值打出来，等实测标定后再换算。 */
+    adc_oneshot_chan_cfg_t cc = { .atten = ADC_ATTEN_DB_0, .bitwidth = ADC_BITWIDTH_DEFAULT };
     esp_err_t e = adc_oneshot_config_channel(au, chan, &cc);
-    if (e != ESP_OK) { cc.atten = ADC_ATTEN_DB_6;  e = adc_oneshot_config_channel(au, chan, &cc); }
-    if (e != ESP_OK) { cc.atten = ADC_ATTEN_DB_2_5; e = adc_oneshot_config_channel(au, chan, &cc); }
-    if (e != ESP_OK) { cc.atten = ADC_ATTEN_DB_0;   e = adc_oneshot_config_channel(au, chan, &cc); }
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "电池 ADC 配置失败: %s", esp_err_to_name(e));
         vTaskDelete(NULL); return;
     }
-    ESP_LOGI(TAG, "电池 ADC 就绪 (unit=%d chan=%d)", (int)unit, (int)chan);
+    ESP_LOGI(TAG, "电池 ADC 就绪 (unit=%d chan=%d, 单档衰减, 无校准方案，仅上报原始值)",
+             (int)unit, (int)chan);
 
     while (1) {
-        int raw = 0, sum = 0, n = 0;
+        int raw = 0, sum = 0, n = 0, raw_min = 999999, raw_max = 0;
         for (int i = 0; i < 8; i++) {
-            if (adc_oneshot_read(au, chan, &raw) == ESP_OK) { sum += raw; n++; }
+            if (adc_oneshot_read(au, chan, &raw) == ESP_OK) {
+                sum += raw; n++;
+                if (raw < raw_min) raw_min = raw;
+                if (raw > raw_max) raw_max = raw;
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
         if (n > 0) {
-            const float pin_v = (float)(sum / n) * 3.3f / 4095.0f;
-            s_bat_mv = (int)(pin_v * 2.5f * 1000.0f);
+            s_bat_raw = sum / n;
+            s_bat_raw_max = raw_max;
+            static int tick;
+            if (++tick % 15 == 0) {
+                ESP_LOGI(TAG, "电池原始值: avg=%d min=%d max=%d（分压 15K/10K）",
+                         s_bat_raw, raw_min, raw_max);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
+
+int battery_raw_value(void) { return s_bat_raw; }
+int battery_raw_peak(void) { return s_bat_raw_max; }
 
 /* ---------------- 界面：ui_home（从 orbis-panel 移植） ---------------- */
 
@@ -675,7 +694,7 @@ void app_main(void)
             last_beat = (uint32_t)(esp_timer_get_time() / 1000000ULL);
             if (last_beat % 5 == 0) {
                 net_mqtt_publish_state();
-                ESP_LOGI(TAG, "电池: %d mV | 网络: wifi=%d rssi=%d mqtt=%d", s_bat_mv, net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
+                ESP_LOGI(TAG, "电池原始值: %d | 网络: wifi=%d rssi=%d mqtt=%d", s_bat_raw, net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
                 ESP_LOGI(TAG, "心跳 %u s，内部 RAM %u KB，PSRAM %u KB",
                          last_beat,
                          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 家庭控制屏界面：JSON 布局驱动 + 一个固件内置的「System」页。
  *
  * 页 0..N-1 来自 HA 的 /local/orbis/layout.json（每页最多 4 个 tile）；
@@ -26,6 +26,7 @@
 #include "layout.h"
 #include "net.h"            /* net_wifi_connected / net_wifi_rssi / net_ip_string / net_mqtt_connected */
 #include "ota.h"
+#include "battery.h"
 #include "bg_image.h"
 #include "ui_home.h"
 #include "voice_audio.h"    /* 语音页的「音频自检」按钮 */
@@ -100,7 +101,7 @@ static lv_obj_t *s_hint;
 static lv_timer_t *s_refresh_timer;
 
 /* System 页的控件 */
-static lv_obj_t *s_sys_lines[5];
+static lv_obj_t *s_sys_lines[6];
 static lv_obj_t *s_ota_btn;
 static lv_obj_t *s_ota_btn_label;
 static lv_obj_t *s_ota_bar;
@@ -697,7 +698,7 @@ static void build_status_page(lv_obj_t *scr)
     lv_obj_t *info_card = lv_obj_create(page);
     lv_obj_remove_style_all(info_card);
     lv_obj_set_pos(info_card, 32, 88);
-    lv_obj_set_size(info_card, 296, 132);
+    lv_obj_set_size(info_card, 296, 156);
     lv_obj_set_style_bg_color(info_card, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(info_card, (lv_opa_t)(bg_image_card_opa_pct() * 255 / 100), 0);
     lv_obj_set_style_radius(info_card, 22, 0);
@@ -705,7 +706,7 @@ static void build_status_page(lv_obj_t *scr)
     lv_obj_set_style_border_color(info_card, COLOR_BORDER, 0);
     lv_obj_remove_flag(info_card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         s_sys_lines[i] = lv_label_create(page);
         lv_label_set_text(s_sys_lines[i], "--");
         lv_obj_set_style_text_font(s_sys_lines[i], &lv_font_cjk16, 0);
@@ -715,7 +716,7 @@ static void build_status_page(lv_obj_t *scr)
 
     s_ota_btn = lv_button_create(page);
     lv_obj_set_size(s_ota_btn, 200, 44);
-    lv_obj_align(s_ota_btn, LV_ALIGN_TOP_MID, 0, 228);
+    lv_obj_align(s_ota_btn, LV_ALIGN_TOP_MID, 0, 252);
     lv_obj_set_style_bg_color(s_ota_btn, COLOR_ACCENT, 0);
     lv_obj_set_style_radius(s_ota_btn, 14, 0);
     lv_obj_add_event_cb(s_ota_btn, ota_button_cb, LV_EVENT_CLICKED, NULL);
@@ -728,7 +729,7 @@ static void build_status_page(lv_obj_t *scr)
 
     s_ota_bar = lv_bar_create(page);
     lv_obj_set_size(s_ota_bar, 220, 10);
-    lv_obj_align(s_ota_bar, LV_ALIGN_TOP_MID, 0, 286);
+    lv_obj_align(s_ota_bar, LV_ALIGN_TOP_MID, 0, 308);
     lv_bar_set_range(s_ota_bar, 0, 100);
     lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
 
@@ -738,7 +739,7 @@ static void build_status_page(lv_obj_t *scr)
     lv_obj_set_style_text_color(s_ota_status, COLOR_MUTED, 0);
     lv_obj_set_width(s_ota_status, 300);
     lv_obj_set_style_text_align(s_ota_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_ota_status, LV_ALIGN_TOP_MID, 0, 302);
+    lv_obj_align(s_ota_status, LV_ALIGN_TOP_MID, 0, 322);
 
     s_pages[s_json_pages] = page;
 }
@@ -895,6 +896,17 @@ static void refresh_status_page(void)
 
     snprintf(buf, sizeof(buf), "内存  %d KB", (int)(esp_get_free_heap_size() / 1024));
     lv_label_set_text(s_sys_lines[4], buf);
+
+    /* 电池：ESP32-S31 只有单档衰减且无校准方案，先显示原始值（未标定） */
+    {
+        const int raw = battery_raw_value();
+        if (raw >= 0) {
+            snprintf(buf, sizeof(buf), "电池  raw %d", raw);
+        } else {
+            snprintf(buf, sizeof(buf), "电池  --");
+        }
+        lv_label_set_text(s_sys_lines[5], buf);
+    }
 
     if (ota_busy()) {
         lv_obj_remove_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
