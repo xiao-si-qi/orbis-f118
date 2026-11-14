@@ -1,0 +1,3 @@
+﻿idf_component_register(SRCS "main.c"
+                       INCLUDE_DIRS "."
+                       REQUIRES lvgl st77916 esp_lcd esp_driver_spi esp_driver_gpio esp_driver_i2c esp_driver_ledc esp_timer heap)
