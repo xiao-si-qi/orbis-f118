@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 
@@ -17,7 +18,7 @@
 #include "app_settings.h"
 
 #ifndef APP_FW_VERSION
-#define APP_FW_VERSION "0.1.0"
+#define APP_FW_VERSION (esp_app_get_description()->version)
 #endif
 
 static const char *TAG = "net";
@@ -235,9 +236,9 @@ void net_mqtt_tick(void)
              "\"caps\":[\"fw\",\"rssi\",\"uptime\",\"online\",\"layout\",\"ota\",\"reboot\","
              "\"brightness\",\"log\",\"background\",\"voice\"],"
              "\"display\":{\"w\":360,\"h\":360,\"formats\":[\"jpeg\"],\"fit\":[\"cover\",\"contain\"]},"
-             "\"fw\":\"" APP_FW_VERSION "\","
+             "\"fw\":\"%s\","
              "\"name\":\"ESP32-S31 旋钮屏\","
-             "\"model\":\"JC3636F118\"}");
+             "\"model\":\"JC3636F118\"}", APP_FW_VERSION);
     int r2 = esp_mqtt_client_publish(s_mqtt, t, payload, 0, 1, 1);
 
     snprintf(t, sizeof(t), "switchyard/%s/cmd", s_dev_id);
@@ -255,11 +256,12 @@ void net_mqtt_publish_state(void)
     char t[96], payload[256];
     snprintf(t, sizeof(t), "switchyard/%s/state", s_dev_id);
     snprintf(payload, sizeof(payload),
-             "{\"uptime\":%lu,\"rssi\":%d,\"fw\":\"" APP_FW_VERSION "\",\"online\":true,\"heap\":%u,\"ota\":%d}",
+             "{\"uptime\":%lu,\"rssi\":%d,\"fw\":\"%s\",\"online\":true,\"heap\":%u,\"ota\":%d,\"ip\":\"%s\"}",
              (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ),
              net_wifi_rssi(),
-             (unsigned)(esp_get_free_heap_size() / 1024), ota_percent());
-    esp_mqtt_client_publish(s_mqtt, t, payload, 0, 1, 1);
+             APP_FW_VERSION,
+             (unsigned)(esp_get_free_heap_size() / 1024), ota_percent(),
+             net_ip_string());
 }
 
 bool net_take_cfg(char *out, size_t len)

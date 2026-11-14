@@ -12,7 +12,9 @@
  *
  * 图片由 switchyard 转好（建议 360×360），设备下载后解码成 RGB565 直接贴图，
  * 不需要在设备上做缩放/裁剪（尺寸不符时用 LVGL 的缩放兜底）。
- * 缓冲放 PSRAM，一帧 360×360×2 ≈ 259 KB。
+ * 解码优先走芯片的硬件 JPEG 解码器（esp_driver_jpeg），引擎创建失败、单张图解不出来
+ * 或图太大超出 PSRAM 预算时自动回退 esp_jpeg（tjpgd 软件解码）。
+ * 缓冲放 PSRAM，一帧 360×360×2 ≈ 259 KB（硬件按 MCU 补齐后 368×368×2 ≈ 265 KB）。
  */
 #ifndef BG_IMAGE_H
 #define BG_IMAGE_H

@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/event_groups.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
@@ -29,14 +30,18 @@
 #include "cJSON.h"
 #include "app_settings.h"
 #include "ha_client.h"
+#include "ha_ws.h"
 
 static const char *TAG = "ha";
 
 #define HA_HTTP_TIMEOUT_MS  10000
 #define HA_BODY_MAX  (4 * 1024)
+#define HA_POLL_WAKE_BIT BIT0
+#define HA_POLL_SLOW_INTERVAL_S 60
 
 static esp_http_client_handle_t s_client;
 static SemaphoreHandle_t s_lock;
+static SemaphoreHandle_t s_table_lock;   /* entity 表写入互斥（轮询任务 vs WS 任务） */
 static char s_base[APP_HA_URL_MAX];
 static char s_token[APP_HA_TOKEN_MAX];
 static char *s_buf;
@@ -44,6 +49,9 @@ static size_t s_buf_len;
 
 static ha_entity_t s_entities[HA_MAX_ENTITIES];
 static volatile bool s_online;
+static volatile ha_client_poll_mode_t s_poll_mode;
+static EventGroupHandle_t s_poll_ev;
+static TaskHandle_t s_poll_task;
 static int s_fail_count;
 static int s_count;
 
@@ -106,12 +114,59 @@ static void set_auth_header(void)
     esp_http_client_set_header(s_client, "Accept", "application/json");
 }
 
+/** 调用者必须已持有 s_lock：关掉长连接并释放客户端（连同 TLS/socket 内存）。 */
+static void release_http_locked(void)
+{
+    if (s_client == NULL) {
+        return;
+    }
+    /* IDF 只有 cleanup()，没有 destroy()；先 close 再 cleanup，句柄立刻置 NULL，
+       绝不能对同一个句柄 cleanup 两次（undefined）。 */
+    esp_http_client_close(s_client);
+    esp_http_client_cleanup(s_client);
+    s_client = NULL;
+}
+
+void ha_client_release_http(void)
+{
+    if (s_lock == NULL) {
+        return;
+    }
+    /* 轮询/历史请求可能正握着锁跑一次 HTTPS（最长 10 秒）：等它结束再释放，
+       宁可晚一点起 WebSocket，也不让两条 TLS 同时抢内部 RAM。 */
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "释放 HTTP 客户端超时（有请求在跑），本次跳过");
+        return;
+    }
+    const bool had = (s_client != NULL);
+    release_http_locked();
+    xSemaphoreGive(s_lock);
+    if (had) {
+        ESP_LOGI(TAG, "已释放常驻 HTTP/TLS 客户端，内部 RAM %d KB",
+                 (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    }
+}
+
+bool ha_client_http_alive(void)
+{
+    if (s_lock == NULL) {
+        return false;
+    }
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return true;       /* 有请求在跑，先按"还在"处理 */
+    }
+    const bool alive = (s_client != NULL);
+    xSemaphoreGive(s_lock);
+    return alive;
+}
+
 static int http_get(const char *url)
 {
+    xSemaphoreTake(s_lock, portMAX_DELAY);
     if (client_create() != ESP_OK) {
+        xSemaphoreGive(s_lock);
         return -1;
     }
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     set_auth_header();
     esp_http_client_set_method(s_client, HTTP_METHOD_GET);
     esp_http_client_set_url(s_client, url);
@@ -144,9 +199,6 @@ static int http_get(const char *url)
 static int http_post_service_ext(const char *domain, const char *service, const char *entity_id,
                                  const char *attrs_json)
 {
-    if (client_create() != ESP_OK) {
-        return -1;
-    }
     char url[APP_HA_URL_MAX + 64];
     snprintf(url, sizeof(url), "%s/api/services/%s/%s", s_base, domain, service);
     char body[320];
@@ -161,6 +213,10 @@ static int http_post_service_ext(const char *domain, const char *service, const 
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (client_create() != ESP_OK) {
+        xSemaphoreGive(s_lock);
+        return -1;
+    }
     set_auth_header();
     esp_http_client_set_header(s_client, "Content-Type", "application/json");
     esp_http_client_set_method(s_client, HTTP_METHOD_POST);
@@ -426,23 +482,28 @@ esp_err_t ha_client_init(void)
         if (s_lock == NULL) {
             return ESP_ERR_NO_MEM;
         }
+        s_poll_mode = HA_POLL_NORMAL;
+    }
+    if (s_table_lock == NULL) {
+        s_table_lock = xSemaphoreCreateMutex();
+        if (s_table_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
     }
     ESP_LOGI(TAG, "HA client ready: %s", s_base);
-    return client_create();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const esp_err_t err = client_create();
+    xSemaphoreGive(s_lock);
+    return err;
 }
 
 /* ------------------------------------------------------------------------- */
 /* 全量刷新                                                                    */
 /* ------------------------------------------------------------------------- */
 
-static void parse_entity_object(ha_entity_t *e, const char *obj_start, const char *obj_end)
+/** 把 attributes（name/unit/灯/空调字段）合并进实体；state 本身由调用者处理。 */
+static void apply_attributes(ha_entity_t *e, const char *obj_start, const char *obj_end)
 {
-    char state[24] = {0};
-    if (json_str_in(obj_start, obj_end, "state", state, sizeof(state))) {
-        str_copy(e->state, sizeof(e->state), state);
-        e->on = (strcmp(state, "on") == 0);
-        e->fresh = true;
-    }
     if (e->name[0] == '\0') {
         char fn[48] = {0};
         if (json_str_in(obj_start, obj_end, "friendly_name", fn, sizeof(fn))) {
@@ -519,6 +580,17 @@ static void parse_entity_object(ha_entity_t *e, const char *obj_start, const cha
     }
 }
 
+static void parse_entity_object(ha_entity_t *e, const char *obj_start, const char *obj_end)
+{
+    char state[24] = {0};
+    if (json_str_in(obj_start, obj_end, "state", state, sizeof(state))) {
+        str_copy(e->state, sizeof(e->state), state);
+        e->on = (strcmp(state, "on") == 0);
+        e->fresh = true;
+    }
+    apply_attributes(e, obj_start, obj_end);
+}
+
 esp_err_t ha_client_fetch_all(void)
 {
     /* 只取关注的那几个实体：/api/states 在实体多的 HA 上可能有近 1MB，
@@ -533,7 +605,7 @@ esp_err_t ha_client_fetch_all(void)
     return (s_count == 0 || ok > 0) ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t ha_client_refresh_at(int idx)
+static esp_err_t refresh_one(int idx)
 {
     if (idx < 0 || idx >= s_count) {
         return ESP_ERR_INVALID_ARG;
@@ -546,13 +618,90 @@ esp_err_t ha_client_refresh_at(int idx)
         e->fresh = false;
         return ESP_FAIL;
     }
+    /* 轮询任务和 WS 任务都可能写表：解析这一段用表锁串起来（很短，纯 CPU）。 */
+    if (s_table_lock) {
+        xSemaphoreTake(s_table_lock, portMAX_DELAY);
+    }
     parse_entity_object(e, s_buf, NULL);
+    if (s_table_lock) {
+        xSemaphoreGive(s_table_lock);
+    }
     return ESP_OK;
+}
+
+esp_err_t ha_client_refresh_at(int idx)
+{
+    if (idx < 0 || idx >= s_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* WS 已认证时状态由事件推送，界面上"操作后补一次 REST"就没有意义了：
+       直接返回，省掉一次 TCP/TLS 往返（wss 场景下还会多占一份 TLS 内存）。 */
+    if (ha_ws_connected()) {
+        return ESP_OK;
+    }
+    return refresh_one(idx);
+}
+
+bool ha_client_apply_state(const char *entity_id, const char *state, const char *attrs_json)
+{
+    if (entity_id == NULL || entity_id[0] == '\0' || state == NULL) {
+        return false;
+    }
+    ha_entity_t *e = NULL;
+    for (int i = 0; i < s_count; i++) {
+        if (strcmp(s_entities[i].entity_id, entity_id) == 0) {
+            e = &s_entities[i];
+            break;
+        }
+    }
+    if (e == NULL) {
+        return false;          /* 不在关注列表里，不占内存也不刷界面 */
+    }
+
+    if (s_table_lock) {
+        xSemaphoreTake(s_table_lock, portMAX_DELAY);
+    }
+    str_copy(e->state, sizeof(e->state), state);
+    e->on = (strcmp(state, "on") == 0);
+    e->fresh = true;
+    if (attrs_json != NULL && attrs_json[0] == '{') {
+        apply_attributes(e, attrs_json, NULL);
+    }
+    if (s_table_lock) {
+        xSemaphoreGive(s_table_lock);
+    }
+    return true;
 }
 
 /* ------------------------------------------------------------------------- */
 /* 动作                                                                       */
 /* ------------------------------------------------------------------------- */
+
+/** toggle/turn_on/turn_off 成功后先改本地状态，界面不必等下一帧事件/轮询。 */
+static void optimistic_update(const char *entity_id, const char *service)
+{
+    const ha_entity_t *e = ha_client_find(entity_id);
+    if (e == NULL) {
+        return;
+    }
+    if (s_table_lock) {
+        xSemaphoreTake(s_table_lock, portMAX_DELAY);
+    }
+    ha_entity_t *m = (ha_entity_t *)e;
+    if (strcmp(service, "toggle") == 0) {
+        m->on = !m->on;
+        str_copy(m->state, sizeof(m->state), m->on ? "on" : "off");
+    } else if (strcmp(service, "turn_on") == 0) {
+        m->on = true;
+        str_copy(m->state, sizeof(m->state), "on");
+    } else if (strcmp(service, "turn_off") == 0) {
+        m->on = false;
+        str_copy(m->state, sizeof(m->state), "off");
+    }
+    if (s_table_lock) {
+        xSemaphoreGive(s_table_lock);
+    }
+}
 
 esp_err_t ha_client_action_attrs(const char *entity_id, const char *service, const char *attrs_json)
 {
@@ -566,6 +715,18 @@ esp_err_t ha_client_action_attrs(const char *entity_id, const char *service, con
         return ESP_ERR_INVALID_ARG;
     }
     memcpy(domain, entity_id, dlen);
+
+    /* WebSocket 已认证：走快路径（一次 WS 文本帧，约 20-25ms 往返）。
+       发送失败时也不补 REST：无法确认服务端是否已经执行，补发会让 toggle 类命令执行两次。 */
+    if (ha_ws_connected()) {
+        if (ha_ws_call_service(domain, service, entity_id, attrs_json)) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "WS 发送失败：%s/%s %s %s（不补 REST，避免重复执行）",
+                 domain, service, entity_id, attrs_json ? attrs_json : "");
+        return ESP_FAIL;
+    }
+
     const int status = http_post_service_ext(domain, service, entity_id, attrs_json);
     ESP_LOGI(TAG, "%s/%s %s %s -> %d", domain, service, entity_id,
              attrs_json ? attrs_json : "", status);
@@ -585,24 +746,20 @@ esp_err_t ha_client_action(const char *entity_id, const char *service)
     }
     memcpy(domain, entity_id, dlen);
 
+    if (ha_ws_connected()) {
+        if (!ha_ws_call_service(domain, service, entity_id, NULL)) {
+            ESP_LOGW(TAG, "WS 发送失败：%s/%s %s（不补 REST，避免 toggle 执行两次）",
+                     domain, service, entity_id);
+            return ESP_FAIL;
+        }
+        optimistic_update(entity_id, service);
+        return ESP_OK;
+    }
+
     if (http_post_service(domain, service, entity_id) >= 300) {
         return ESP_FAIL;
     }
-
-    const ha_entity_t *e = ha_client_find(entity_id);
-    if (e) {
-        ha_entity_t *m = (ha_entity_t *)e;
-        if (strcmp(service, "toggle") == 0) {
-            m->on = !m->on;
-            str_copy(m->state, sizeof(m->state), m->on ? "on" : "off");
-        } else if (strcmp(service, "turn_on") == 0) {
-            m->on = true;
-            str_copy(m->state, sizeof(m->state), "on");
-        } else if (strcmp(service, "turn_off") == 0) {
-            m->on = false;
-            str_copy(m->state, sizeof(m->state), "off");
-        }
-    }
+    optimistic_update(entity_id, service);
     return ESP_OK;
 }
 
@@ -634,8 +791,8 @@ static esp_err_t hist_event(esp_http_client_event_t *ev)
     return ESP_OK;
 }
 
-esp_err_t ha_client_history(const char *entity_id, int hours, float *values, int max_points,
-                            int *out_count, float *out_min, float *out_max, float *out_avg)
+static esp_err_t history_impl(const char *entity_id, int hours, float *values, int max_points,
+                              int *out_count, float *out_min, float *out_max, float *out_avg)
 {
     if (entity_id == NULL || values == NULL || max_points <= 0) {
         return ESP_ERR_INVALID_ARG;
@@ -668,9 +825,12 @@ esp_err_t ha_client_history(const char *entity_id, int hours, float *values, int
 
     /* 复用常驻客户端（同一条 TLS 连接），只把响应写进 PSRAM 大缓冲：
        再开一条 TLS 会多占 16KB 内部 RAM，之前就是这里失败的 */
-    if (client_create() != ESP_OK) {
+    if (s_poll_mode == HA_POLL_PAUSED &&
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 50 * 1024) {
+        ESP_LOGW(TAG, "history: 内部 RAM 不足（%d KB），跳过折线图以保护 WS 连接",
+                 (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
         free(buf);
-        return ESP_FAIL;
+        return ESP_ERR_NO_MEM;
     }
     esp_err_t herr = ESP_FAIL;
     int hstatus = -1;
@@ -679,6 +839,11 @@ esp_err_t ha_client_history(const char *entity_id, int hours, float *values, int
             ESP_LOGW(TAG, "history: 等锁超时，放弃");
             free(buf);
             return ESP_ERR_TIMEOUT;
+        }
+        if (client_create() != ESP_OK) {
+            xSemaphoreGive(s_lock);
+            free(buf);
+            return ESP_FAIL;
         }
         set_auth_header();
         esp_http_client_set_method(s_client, HTTP_METHOD_GET);
@@ -769,9 +934,84 @@ esp_err_t ha_client_history(const char *entity_id, int hours, float *values, int
     return out_n > 0 ? ESP_OK : ESP_FAIL;
 }
 
+esp_err_t ha_client_history(const char *entity_id, int hours, float *values, int max_points,
+                            int *out_count, float *out_min, float *out_max, float *out_avg)
+{
+    const esp_err_t r = history_impl(entity_id, hours, values, max_points,
+                                     out_count, out_min, out_max, out_avg);
+    /* wss 已接管时，折线图是少见路径：用完立刻把 REST/TLS 内存还回去，
+       否则两条 TLS 会一起常驻，正是要避免的情况。 */
+    if (s_poll_mode == HA_POLL_PAUSED) {
+        ha_client_release_http();
+    }
+    return r;
+}
+
 bool ha_client_online(void)
 {
     return s_online;
+}
+
+void ha_client_set_online(bool online)
+{
+    s_online = online;
+    if (online) {
+        s_fail_count = 0;
+    }
+}
+
+bool ha_client_is_ready(void)
+{
+    return s_lock != NULL && s_base[0] != '\0';
+}
+
+ha_client_poll_mode_t ha_client_poll_mode(void)
+{
+    return s_poll_mode;
+}
+
+static void poll_wake(void)
+{
+    if (s_poll_ev != NULL) {
+        xEventGroupSetBits(s_poll_ev, HA_POLL_WAKE_BIT);
+    }
+}
+
+/** 轮询任务的可中断等待：模式变化（暂停/恢复）会立刻唤醒它。 */
+static void poll_delay(uint32_t ms)
+{
+    if (s_poll_ev == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(ms));
+        return;
+    }
+    xEventGroupWaitBits(s_poll_ev, HA_POLL_WAKE_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(ms));
+}
+
+void ha_client_set_poll_mode(ha_client_poll_mode_t mode)
+{
+    if (mode == s_poll_mode) {
+        return;
+    }
+    s_poll_mode = mode;
+
+    /* 每次真正切换只打一条：现场看日志就能确认是 WS 接管还是回落 REST。 */
+    switch (mode) {
+    case HA_POLL_PAUSED:
+        ha_client_release_http();
+        ESP_LOGI(TAG, "REST 轮询暂停：WebSocket 接管后只保留一条 TLS，"
+                      "内部可用 %d KB",
+                 (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+        break;
+    case HA_POLL_SLOW:
+        ESP_LOGI(TAG, "WS 已接管（ws 明文）：REST 轮询放慢到 %d 秒做一致性检查",
+                 HA_POLL_SLOW_INTERVAL_S);
+        break;
+    case HA_POLL_NORMAL:
+    default:
+        ESP_LOGI(TAG, "WS 不可用：恢复 REST 轮询（%d 秒）", CONFIG_APP_POLL_INTERVAL_S);
+        break;
+    }
+    poll_wake();
 }
 
 static void poll_task(void *arg)
@@ -779,6 +1019,12 @@ static void poll_task(void *arg)
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(1500));
     while (true) {
+        const ha_client_poll_mode_t mode = s_poll_mode;
+        if (mode == HA_POLL_PAUSED) {
+            /* WS 事件已经负责状态刷新：这里只等模式变化，不再发 HTTP。 */
+            poll_delay(HA_POLL_SLOW_INTERVAL_S * 1000);
+            continue;
+        }
         if (s_count == 0) {
             /* 还没收到布局，没有实体可刷：只探测 HA 是否可达 */
             char url[APP_HA_URL_MAX + 16];
@@ -786,17 +1032,32 @@ static void poll_task(void *arg)
             int st = http_get(url);
             ESP_LOGI(TAG, "HA probe -> %d (internal heap %d KB)", st,
                      (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
-            vTaskDelay(pdMS_TO_TICKS(30000));
+            poll_delay(30000);
             continue;
         }
         for (int i = 0; i < s_count; i++) {
-            ha_client_refresh_at(i);
+            /* 兜底轮询用 refresh_one：即使 WS 在线也要真的走一次 REST，
+               这样 ws:// 场景下 60 秒一致性检查才有意义。 */
+            if (s_poll_mode == HA_POLL_PAUSED) {
+                break;          /* 轮询途中被 WS 接管：立刻停手，别再建 TLS */
+            }
+            refresh_one(i);
         }
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_APP_POLL_INTERVAL_S * 1000));
+        poll_delay((mode == HA_POLL_SLOW ? HA_POLL_SLOW_INTERVAL_S
+                                         : CONFIG_APP_POLL_INTERVAL_S) * 1000);
     }
 }
 
 void ha_client_start_poll(void)
 {
-    xTaskCreate(poll_task, "ha_poll", 6144, NULL, 4, NULL);
+    if (s_poll_task != NULL) {
+        return;
+    }
+    if (s_poll_ev == NULL) {
+        s_poll_ev = xEventGroupCreate();
+    }
+    if (xTaskCreate(poll_task, "ha_poll", 6144, NULL, 4, &s_poll_task) != pdPASS) {
+        s_poll_task = NULL;
+        ESP_LOGE(TAG, "轮询任务创建失败");
+    }
 }

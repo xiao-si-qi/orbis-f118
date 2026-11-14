@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 家庭控制屏界面：JSON 布局驱动 + 固件内置的「System」页 + 「小智 AI」页。
  *
  * 页 0..N-1 来自 HA 的 /local/orbis/layout.json（每页最多 4 个 tile）；
@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>    /* strcasecmp：天气状态大小写不敏感匹配 */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -23,8 +24,9 @@
 #include "lvgl.h"
 
 #include "app_settings.h"
-#include "assistant_ui.h"   /* 小智助手页（最后一页）的内容 + 500ms 定时器里的 tick */
+#include "assistant_ui.h"   /* 小智助手页的内容 + 500ms 定时器里的 tick */
 #include "bsp_board.h"      /* 新板 shim（引脚表 + bsp_display_set_backlight） */
+#include "bt_link.h"        /* 蓝牙状态抽象层（本版是桩：未启用） */
 #include "ha_client.h"
 #include "layout.h"
 #include "net.h"            /* net_wifi_connected / net_wifi_rssi / net_ip_string / net_mqtt_connected */
@@ -60,7 +62,7 @@ static inline void ui_obj_set_flags(lv_obj_t *obj, lv_obj_flag_t f, bool en)
 #define lv_obj_add_flag(o, f)    ui_obj_set_flags((o), (f), true)
 #define lv_obj_remove_flag(o, f) ui_obj_set_flags((o), (f), false)
 
-#define MAX_PAGES (LAYOUT_MAX_PAGES + 2) /* JSON 页 + System 页 + 小智 AI 页 */
+#define MAX_PAGES (LAYOUT_MAX_PAGES + 3) /* JSON 页 + System 页 + 小智 AI 页 + 设置页 */
 
 #define CARD_W    140
 #define CARD_H    90
@@ -109,10 +111,32 @@ static lv_timer_t *s_refresh_timer;
 
 /* System 页的控件 */
 static lv_obj_t *s_sys_lines[6];
+static lv_obj_t *s_mem_bar;      /* 系统页内存占用百分比进度条 */
 static lv_obj_t *s_ota_btn;
 static lv_obj_t *s_ota_btn_label;
 static lv_obj_t *s_ota_bar;
 static lv_obj_t *s_ota_status;
+
+/* 顶部状态行的蓝牙图标 + 设置页（永远是最后一页） */
+static lv_obj_t *s_bt_icon;
+static int s_settings_page = -1;      /* 设置页在 s_pages[] 里的下标；-1 = 没建出来 */
+static lv_obj_t *s_set_page;          /* 设置页容器 */
+static lv_obj_t *s_set_bt_state;      /* 「蓝牙  未启用…」状态行 */
+static lv_obj_t *s_set_scan_btn;      /* 扫描按钮（协议栈没启用时置灰） */
+static lv_obj_t *s_set_scan_label;
+static lv_obj_t *s_set_conn_btn;      /* 连接/断开按钮（同上） */
+static lv_obj_t *s_set_conn_label;
+static lv_obj_t *s_set_empty;         /* 扫描结果区的空状态文字 */
+static lv_obj_t *s_set_phone_btn;     /* 音频输出：耳机孔 */
+static lv_obj_t *s_set_phone_label;
+static lv_obj_t *s_set_bt_btn;        /* 音频输出：蓝牙音箱 */
+static lv_obj_t *s_set_bt_label;
+static lv_obj_t *s_set_audio_hint;    /* 「蓝牙未启用，仍走耳机孔」提示 */
+static char s_set_state_shown[128];   /* 状态行当前文字（避免 500ms 重复重排） */
+static uint32_t s_set_hint_until;     /* 提示保留到什么时候（lv_tick） */
+static char s_set_sel_addr[20];       /* 选中的扫描结果 MAC（本版恒为空） */
+
+static void refresh_bt_ui(void);
 
 static int s_page;
 static bool s_press_on_slider;   /* 本次按压是否落在滑条上 */
@@ -166,13 +190,22 @@ static char s_detail_entity[96];
 #define DETAIL_KNOB_BR        0
 #define DETAIL_KNOB_CT        1
 #define DETAIL_CT_STEP_K      100      /* 色温每格 100K */
-#define DETAIL_KNOB_SEND_MS   200      /* 网络命令最快 200ms 一条（转得快时合并）*/
-#define DETAIL_KNOB_IDLE_MS   300      /* 停转这么久之后一定补发最后的值 */
+#define DETAIL_KNOB_SEND_MS   100      /* 转动时网络命令最快 100ms 一条（更快的格子合并）*/
+#define DETAIL_KNOB_IDLE_MS    80      /* 停转这么久就把最后的值补发出去 */
+#define DETAIL_KNOB_TICK_MS    50      /* 补发定时器周期：只在有脏值时运行 */
 static int s_detail_knob_target = DETAIL_KNOB_BR;
-static bool s_knob_dirty;              /* 有还没发出去的值 */
+static bool s_knob_dirty;              /* 有还没发出去的值（只在 LVGL 线程读写）*/
+static int s_knob_pending_target = DETAIL_KNOB_BR;  /* 最新待发值：多格只留最后一格 */
+static int s_knob_pending_value;
 static uint32_t s_knob_last_send;
 static uint32_t s_knob_last_change;
+static lv_timer_t *s_knob_timer;       /* 50ms 补发定时器：有脏值才跑，发完就停 */
+static bool s_knob_timer_active;
+/* worker 发完一条旋钮命令后清零；LVGL 线程据此决定"再等一等"还是"补最新值" */
+static volatile bool s_knob_inflight;
 static void detail_knob_flush(void);
+static void detail_knob_timer_park(void);
+static void detail_knob_timer_cb(lv_timer_t *t);
 /* 用户刚拖过滑条时，短时间内以本地值为准（HA 的轮询会慢半拍，灯关着时甚至没有 brightness） */
 static bool s_sw_override_on;
 static uint32_t s_sw_override_until;
@@ -193,6 +226,7 @@ typedef struct {
     char service[24];
     char attrs[64];      /* 非空则带参数调用（亮度/色温/空调） */
     int gen;             /* 折线图请求代际：过期结果直接丢掉 */
+    bool knob;           /* 旋钮命令：worker 走快路径，发完不各自等 300ms 刷新 */
 } cmd_t;
 
 /* ------------------------------------------------------------------------- */
@@ -225,6 +259,13 @@ static bool is_assistant_page(int page)
     return UI_ASSISTANT_PAGE && s_layout_valid && s_layout.voice_enabled && page == s_json_pages + 1;
 }
 
+/* 设置页：固件自己的最后一页（小智页后面），System 页上的「设置」按钮和
+   滑动/旋钮都能到。创建失败时 s_settings_page = -1，标题退回默认样式。 */
+static bool is_settings_page(int page)
+{
+    return s_settings_page >= 0 && page == s_settings_page;
+}
+
 static const char *page_title(int page)
 {
     if (is_status_page(page)) {
@@ -232,6 +273,9 @@ static const char *page_title(int page)
     }
     if (is_assistant_page(page)) {
         return "小智 AI";
+    }
+    if (is_settings_page(page)) {
+        return "设置";
     }
     return s_layout.pages[page].name;
 }
@@ -773,6 +817,20 @@ static void report_page_create_failed(const char *name, lv_obj_t *parent)
              (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct, (void *)parent);
 }
 
+/** System 页的「设置」按钮：跳到设置页（最后一页）。页面没建好就只记日志。 */
+static void settings_button_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_settings_page < 0 || s_settings_page >= s_page_count ||
+        s_pages[s_settings_page] == NULL) {
+        ESP_LOGW(TAG, "设置页还没建好，忽略");
+        return;
+    }
+    ESP_LOGI(TAG, "打开设置页：第 %d/%d 页", s_settings_page + 1, s_page_count);
+    show_page_dir(s_settings_page, 1);
+    refresh_bt_ui();           /* 进页立刻刷一次（不必等 500ms 定时器） */
+}
+
 static void build_status_page(lv_obj_t *scr)
 {
     lv_obj_t *page = lv_obj_create(scr);
@@ -808,9 +866,23 @@ static void build_status_page(lv_obj_t *scr)
         lv_obj_set_pos(s_sys_lines[i], 48, 102 + i * 24);
     }
 
+    /* 内存占用百分比进度条：放在「内存」行右侧，颜色随占用变化 */
+    s_mem_bar = lv_bar_create(page);
+    lv_obj_set_size(s_mem_bar, 118, 8);
+    lv_obj_set_pos(s_mem_bar, 172, 102 + 4 * 24 + 5);
+    lv_bar_set_range(s_mem_bar, 0, 100);
+    lv_obj_set_style_bg_color(s_mem_bar, lv_color_hex(0x3A3A3C), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_mem_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_mem_bar, 4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_mem_bar, COLOR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_mem_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_mem_bar, 4, LV_PART_INDICATOR);
+
+    /* 底部两个按钮并排：左「检查更新」、右「设置」。
+       圆屏 y=250..292 处可用宽度约 x=40..320，两个按钮合起来 54..296，安全。 */
     s_ota_btn = lv_button_create(page);
-    lv_obj_set_size(s_ota_btn, 200, 44);
-    lv_obj_align(s_ota_btn, LV_ALIGN_TOP_MID, 0, 252);
+    lv_obj_set_size(s_ota_btn, 128, 42);
+    lv_obj_align(s_ota_btn, LV_ALIGN_TOP_MID, -62, 250);
     lv_obj_set_style_bg_color(s_ota_btn, COLOR_ACCENT, 0);
     lv_obj_set_style_radius(s_ota_btn, 14, 0);
     lv_obj_add_event_cb(s_ota_btn, ota_button_cb, LV_EVENT_CLICKED, NULL);
@@ -820,6 +892,25 @@ static void build_status_page(lv_obj_t *scr)
     lv_obj_set_style_text_font(s_ota_btn_label, &lv_font_cjk16, 0);
     lv_obj_set_style_text_color(s_ota_btn_label, COLOR_TEXT, 0);
     lv_obj_center(s_ota_btn_label);
+
+    lv_obj_t *set_btn = lv_button_create(page);
+    if (set_btn != NULL) {
+        lv_obj_set_size(set_btn, 96, 42);
+        lv_obj_align(set_btn, LV_ALIGN_TOP_MID, 68, 250);
+        lv_obj_set_style_bg_color(set_btn, lv_color_hex(0x2C2C2E), 0);
+        lv_obj_set_style_radius(set_btn, 14, 0);
+        lv_obj_set_style_border_width(set_btn, 1, 0);
+        lv_obj_set_style_border_color(set_btn, COLOR_BORDER, 0);
+        lv_obj_add_event_cb(set_btn, settings_button_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *set_label = lv_label_create(set_btn);
+        lv_label_set_text(set_label, "设置");
+        lv_obj_set_style_text_font(set_label, &lv_font_cjk16, 0);
+        lv_obj_set_style_text_color(set_label, COLOR_TEXT, 0);
+        lv_obj_center(set_label);
+    } else {
+        ESP_LOGW(TAG, "System 页「设置」按钮创建失败（LVGL 池不够？）");
+    }
 
     s_ota_bar = lv_bar_create(page);
     lv_obj_set_size(s_ota_bar, 220, 10);
@@ -956,6 +1047,313 @@ static void build_assistant_page(lv_obj_t *scr)
 #endif /* UI_ASSISTANT_PAGE */
 
 /* ------------------------------------------------------------------------- */
+/* 设置页（最后一页）与蓝牙状态图标                                          */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * 顶部状态行的蓝牙图标：协议栈未启用/关闭 = 灰，扫描中/已连接 = 蓝。
+ * 颜色每 500ms 由 refresh_timer_cb -> refresh_bt_ui() 刷一次。
+ */
+static void refresh_bt_icon(void)
+{
+    if (s_bt_icon == NULL) {
+        return;
+    }
+    const bt_state_t st = bt_link_state();
+    const bool active = bt_link_is_enabled() && (st == BT_SCANNING || st == BT_CONNECTED);
+    lv_obj_set_style_text_color(s_bt_icon, active ? COLOR_ACCENT : COLOR_MUTED, 0);
+}
+
+/** 设置页标签：统一 CJK 字体；x<0 或 y<0 表示在父对象里居中。失败返回 NULL。 */
+static lv_obj_t *settings_label(lv_obj_t *parent, const char *text, int x, int y, int w,
+                                lv_color_t color)
+{
+    if (parent == NULL) {
+        return NULL;
+    }
+    lv_obj_t *lab = lv_label_create(parent);
+    if (lab == NULL) {
+        return NULL;
+    }
+    lv_label_set_text(lab, text);
+    lv_obj_set_style_text_font(lab, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(lab, color, 0);
+    if (w > 0) {
+        lv_obj_set_width(lab, w);
+    }
+    if (x < 0 || y < 0) {
+        lv_obj_center(lab);
+    } else {
+        lv_obj_set_pos(lab, x, y);
+    }
+    return lab;
+}
+
+/** 设置页卡片：与其它页一样的黑色半透明底 + 圆角描边。失败返回 NULL。 */
+static lv_obj_t *settings_card(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    if (parent == NULL) {
+        return NULL;
+    }
+    lv_obj_t *card = lv_obj_create(parent);
+    if (card == NULL) {
+        return NULL;
+    }
+    lv_obj_remove_style_all(card);
+    lv_obj_set_pos(card, x, y);
+    lv_obj_set_size(card, w, h);
+    lv_obj_set_style_bg_color(card, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(card, (lv_opa_t)(bg_image_card_opa_pct() * 255 / 100), 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, COLOR_BORDER, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    return card;
+}
+
+/** 扫描 / 连接按钮的可用态：可用=蓝底白字，禁用=深灰底灰字 + LV_STATE_DISABLED。 */
+static void settings_apply_btn_enabled(lv_obj_t *btn, lv_obj_t *label, bool en)
+{
+    if (btn == NULL) {
+        return;
+    }
+    lv_obj_set_state(btn, LV_STATE_DISABLED, !en);
+    lv_obj_set_style_bg_color(btn, en ? COLOR_ACCENT : lv_color_hex(0x2C2C2E), 0);
+    if (label != NULL) {
+        lv_obj_set_style_text_color(label, en ? COLOR_TEXT : COLOR_MUTED, 0);
+    }
+}
+
+/** 音频输出两个选项的高亮 + 「仍走耳机孔」提示的显隐。 */
+static void settings_apply_audio(void)
+{
+    const bool bt = bt_link_audio_to_bt();
+    const lv_color_t on_bg = COLOR_ACCENT;
+    const lv_color_t off_bg = lv_color_hex(0x2C2C2E);
+
+    if (s_set_phone_btn != NULL) {
+        lv_obj_set_style_bg_color(s_set_phone_btn, bt ? off_bg : on_bg, 0);
+    }
+    if (s_set_phone_label != NULL) {
+        lv_obj_set_style_text_color(s_set_phone_label, bt ? COLOR_MUTED : COLOR_TEXT, 0);
+    }
+    if (s_set_bt_btn != NULL) {
+        lv_obj_set_style_bg_color(s_set_bt_btn, bt ? on_bg : off_bg, 0);
+    }
+    if (s_set_bt_label != NULL) {
+        lv_obj_set_style_text_color(s_set_bt_label, bt ? COLOR_TEXT : COLOR_MUTED, 0);
+    }
+    if (s_set_audio_hint != NULL) {
+        if ((int32_t)(lv_tick_get() - s_set_hint_until) < 0) {
+            lv_obj_remove_flag(s_set_audio_hint, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_set_audio_hint, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void settings_scan_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!bt_link_is_enabled()) {
+        /* 按钮本来就置灰，这里再挡一道（触摸/旋钮都可能绕过样式） */
+        ESP_LOGI(TAG, "蓝牙未启用（蓝牙栈未编译），扫描不可用");
+        return;
+    }
+    if (!bt_link_scan_start()) {
+        ESP_LOGW(TAG, "蓝牙扫描启动失败");
+    }
+    refresh_bt_ui();
+}
+
+static void settings_conn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!bt_link_is_enabled()) {
+        ESP_LOGI(TAG, "蓝牙未启用（蓝牙栈未编译），连接不可用");
+        return;
+    }
+    if (bt_link_state() == BT_CONNECTED) {
+        bt_link_disconnect();
+        ESP_LOGI(TAG, "蓝牙：断开连接");
+    } else if (s_set_sel_addr[0] != '\0') {
+        if (!bt_link_connect(s_set_sel_addr)) {
+            ESP_LOGW(TAG, "蓝牙连接失败：%s", s_set_sel_addr);
+        }
+    } else {
+        ESP_LOGW(TAG, "蓝牙：还没有选中的音箱，先扫描");
+    }
+    refresh_bt_ui();
+}
+
+static void settings_audio_phone_cb(lv_event_t *e)
+{
+    (void)e;
+    bt_link_set_audio_to_bt(false);       /* 耳机孔：幂等，值没变不写 NVS */
+    s_set_hint_until = 0;
+    settings_apply_audio();
+}
+
+static void settings_audio_bt_cb(lv_event_t *e)
+{
+    (void)e;
+    bt_link_set_audio_to_bt(true);        /* 协议栈没启用时会被模块拒绝 */
+    if (!bt_link_audio_to_bt()) {
+        /* 选择不生效：有效输出仍是耳机孔，提示 5 秒 */
+        s_set_hint_until = lv_tick_get() + 5000;
+        ESP_LOGI(TAG, "设置页：蓝牙未启用，音频输出保持耳机孔");
+    } else {
+        s_set_hint_until = 0;
+    }
+    settings_apply_audio();
+}
+
+/**
+ * 蓝牙相关界面刷新（500ms 定时器 + 构建完成 + 进设置页时调用）。
+ * 所有控件都做 NULL 检查：页面/某个控件没建出来时只跳过对应部分。
+ */
+static void refresh_bt_ui(void)
+{
+    refresh_bt_icon();
+
+    if (s_set_page == NULL) {
+        return;
+    }
+
+    if (s_set_bt_state != NULL) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "蓝牙  %s", bt_link_state_text());
+        if (strcmp(buf, s_set_state_shown) != 0) {
+            snprintf(s_set_state_shown, sizeof(s_set_state_shown), "%s", buf);
+            lv_label_set_text(s_set_bt_state, buf);
+        }
+    }
+
+    /* 协议栈没启用（本版恒如此）：扫描/连接一律置灰 */
+    const bool on = bt_link_is_enabled();
+    settings_apply_btn_enabled(s_set_scan_btn, s_set_scan_label, on);
+    settings_apply_btn_enabled(s_set_conn_btn, s_set_conn_label, on);
+
+    const bool connected = (bt_link_state() == BT_CONNECTED);
+    if (s_set_conn_label != NULL) {
+        const char *text = connected ? "断开" : "连接";
+        if (strcmp(lv_label_get_text(s_set_conn_label), text) != 0) {
+            lv_label_set_text(s_set_conn_label, text);
+        }
+    }
+
+    if (s_set_empty != NULL) {
+        const char *text = on ? "点「扫描」搜索音箱" : "未启用，无法扫描";
+        if (strcmp(lv_label_get_text(s_set_empty), text) != 0) {
+            lv_label_set_text(s_set_empty, text);
+        }
+    }
+
+    settings_apply_audio();
+}
+
+/**
+ * 设置页：蓝牙（状态 / 扫描 / 结果 / 连接）+ 音频输出（耳机孔 / 蓝牙音箱）。
+ *
+ * 透明底，顶部状态行（WiFi / HA / 蓝牙图标）照常可见；内容限制在圆形安全区内：
+ * 两张卡片 y=72..282、x=36..324，16px 字体行高 21。
+ * 导航和别的页一样靠左右滑动 / 旋钮；System 页的「设置」按钮直接跳到这一页。
+ */
+static void build_settings_page(lv_obj_t *scr)
+{
+    lv_obj_t *page = lv_obj_create(scr);
+    if (page == NULL) {
+        report_page_create_failed("设置页", scr);
+        s_settings_page = -1;
+        return;
+    }
+    lv_obj_set_size(page, 360, 360);
+    lv_obj_set_pos(page, 0, 0);
+    lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(page, 0, 0);
+    lv_obj_set_style_pad_all(page, 0, 0);
+    lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_set_page = page;
+    s_pages[s_settings_page] = page;
+
+    lv_obj_t *bt_card = settings_card(page, 36, 72, 288, 118);
+    lv_obj_t *audio_card = settings_card(page, 36, 196, 288, 86);
+    if (bt_card == NULL || audio_card == NULL) {
+        ESP_LOGW(TAG, "设置页卡片创建失败，本页内容不完整（LVGL 池可能不够）");
+    }
+
+    /* ---- 卡片 1：蓝牙 ---- */
+    if (bt_card != NULL) {
+        s_set_bt_state = settings_label(bt_card, "蓝牙  未启用", 16, 8, 256, COLOR_TEXT);
+
+        s_set_scan_btn = lv_button_create(bt_card);
+        if (s_set_scan_btn != NULL) {
+            lv_obj_set_size(s_set_scan_btn, 96, 30);
+            lv_obj_set_pos(s_set_scan_btn, 16, 40);
+            lv_obj_set_style_radius(s_set_scan_btn, 10, 0);
+            lv_obj_set_style_shadow_width(s_set_scan_btn, 0, 0);
+            lv_obj_add_event_cb(s_set_scan_btn, settings_scan_cb, LV_EVENT_CLICKED, NULL);
+            s_set_scan_label = settings_label(s_set_scan_btn, "扫描", -1, -1, 0, COLOR_TEXT);
+        }
+
+        s_set_conn_btn = lv_button_create(bt_card);
+        if (s_set_conn_btn != NULL) {
+            lv_obj_set_size(s_set_conn_btn, 96, 30);
+            lv_obj_set_pos(s_set_conn_btn, 120, 40);
+            lv_obj_set_style_radius(s_set_conn_btn, 10, 0);
+            lv_obj_set_style_shadow_width(s_set_conn_btn, 0, 0);
+            lv_obj_add_event_cb(s_set_conn_btn, settings_conn_cb, LV_EVENT_CLICKED, NULL);
+            s_set_conn_label = settings_label(s_set_conn_btn, "连接", -1, -1, 0, COLOR_TEXT);
+        }
+
+        /* 扫描结果区：协议栈没启用时只有空状态文字（本版永远如此）。
+           下一轮：TODO(bt) 扫描到音箱后在这里建可点选的行，选中的 MAC 存 s_set_sel_addr。 */
+        lv_obj_t *list = settings_card(bt_card, 16, 78, 256, 28);
+        if (list != NULL) {
+            lv_obj_set_style_radius(list, 9, 0);
+            lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(list, lv_color_hex(0x151517), 0);
+            lv_obj_set_style_border_width(list, 0, 0);
+            s_set_empty = settings_label(list, "未启用，无法扫描", -1, -1, 0, COLOR_MUTED);
+        }
+    }
+
+    /* ---- 卡片 2：音频输出 ---- */
+    if (audio_card != NULL) {
+        settings_label(audio_card, "音频输出", 16, 4, 256, COLOR_TEXT);
+
+        s_set_phone_btn = lv_button_create(audio_card);
+        if (s_set_phone_btn != NULL) {
+            lv_obj_set_size(s_set_phone_btn, 92, 28);
+            lv_obj_set_pos(s_set_phone_btn, 16, 30);
+            lv_obj_set_style_radius(s_set_phone_btn, 14, 0);
+            lv_obj_set_style_shadow_width(s_set_phone_btn, 0, 0);
+            lv_obj_add_event_cb(s_set_phone_btn, settings_audio_phone_cb, LV_EVENT_CLICKED, NULL);
+            s_set_phone_label = settings_label(s_set_phone_btn, "耳机孔", -1, -1, 0, COLOR_TEXT);
+        }
+
+        s_set_bt_btn = lv_button_create(audio_card);
+        if (s_set_bt_btn != NULL) {
+            lv_obj_set_size(s_set_bt_btn, 108, 28);
+            lv_obj_set_pos(s_set_bt_btn, 116, 30);
+            lv_obj_set_style_radius(s_set_bt_btn, 14, 0);
+            lv_obj_set_style_shadow_width(s_set_bt_btn, 0, 0);
+            lv_obj_add_event_cb(s_set_bt_btn, settings_audio_bt_cb, LV_EVENT_CLICKED, NULL);
+            s_set_bt_label = settings_label(s_set_bt_btn, "蓝牙音箱", -1, -1, 0, COLOR_TEXT);
+        }
+
+        /* 只有「选了蓝牙音箱但协议栈没启用」时才出现，5 秒后自动隐藏 */
+        s_set_audio_hint = settings_label(audio_card, "蓝牙未启用，仍走耳机孔", 16, 60, 256,
+                                          lv_color_hex(0xFF9F0A));
+    }
+
+    /* 按真实状态刷一遍：协议栈没启用时扫描/连接就是灰的、音频高亮在耳机孔 */
+    s_set_state_shown[0] = '\0';
+    refresh_bt_ui();
+}
+
+/* ------------------------------------------------------------------------- */
 /* 小智页导航（MQTT assistant 命令用）                                        */
 /* ------------------------------------------------------------------------- */
 
@@ -1007,8 +1405,21 @@ static void refresh_status_page(void)
     snprintf(buf, sizeof(buf), "运行  %dh%02dm", (int)(up_s / 3600), (int)((up_s % 3600) / 60));
     lv_label_set_text(s_sys_lines[3], buf);
 
-    snprintf(buf, sizeof(buf), "内存  %d KB", (int)(esp_get_free_heap_size() / 1024));
-    lv_label_set_text(s_sys_lines[4], buf);
+    {
+        /* 内存占用百分比（内部 RAM 已用/总量）+ 进度条 */
+        const size_t mem_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+        const size_t mem_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const int used_pct = mem_total ? (int)((mem_total - mem_free) * 100 / mem_total) : 0;
+        snprintf(buf, sizeof(buf), "内存  %d%%（%d/%d KB）",
+                 used_pct, (int)((mem_total - mem_free) / 1024), (int)(mem_total / 1024));
+        lv_label_set_text(s_sys_lines[4], buf);
+        if (s_mem_bar) {
+            lv_bar_set_value(s_mem_bar, used_pct, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(s_mem_bar,
+                used_pct > 85 ? lv_color_hex(0xFF453A)
+                : (used_pct > 70 ? lv_color_hex(0xFFD60A) : COLOR_ACCENT), LV_PART_INDICATOR);
+        }
+    }
 
     /* 电池：ESP32-S31 只有单档衰减且无校准方案，先显示原始值（未标定） */
     {
@@ -1062,6 +1473,57 @@ static const lv_font_t *value_font_for(const char *text)
     return &lv_font_cjk16;
 }
 
+/**
+ * HA 的天气状态是英文机器码（sunny / partlycloudy / rainy…），卡片上要显示中文。
+ * 只对 weather.* 实体做映射；大小写不敏感、忽略首尾空白，未知状态原样返回
+ * （HA 以后新增的天气类型仍然能显示，只是还是英文，也不打日志）。
+ * 纯静态表 + 栈上小缓冲，不分配内存。
+ */
+static const char *weather_state_zh(const char *entity_id, const char *state)
+{
+    static const struct {
+        const char *ha;
+        const char *zh;
+    } map[] = {
+        {"clear-night", "晴（夜）"},
+        {"cloudy", "多云"},
+        {"exceptional", "异常天气"},
+        {"fog", "雾"},
+        {"hail", "冰雹"},
+        {"lightning", "闪电"},
+        {"lightning-rainy", "雷阵雨"},
+        {"partlycloudy", "局部多云"},
+        {"pouring", "暴雨"},
+        {"rainy", "雨"},
+        {"snowy", "雪"},
+        {"snowy-rainy", "雨夹雪"},
+        {"sunny", "晴"},
+        {"windy", "大风"},
+        {"windy-variant", "大风"},
+    };
+
+    if (entity_id == NULL || state == NULL || strncmp(entity_id, "weather.", 8) != 0) {
+        return state;
+    }
+    /* 去掉首尾空白（HA 正常不带，这里防御一下），拷进小缓冲后再 strcasecmp */
+    while (*state == ' ' || *state == '\t') {
+        state++;
+    }
+    char tok[24];
+    size_t n = 0;
+    while (state[n] != '\0' && state[n] != ' ' && state[n] != '\t' && n + 1 < sizeof(tok)) {
+        tok[n] = state[n];
+        n++;
+    }
+    tok[n] = '\0';
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (strcasecmp(tok, map[i].ha) == 0) {
+            return map[i].zh;
+        }
+    }
+    return state;
+}
+
 static void refresh_values(void)
 {
     for (int p = 0; p < s_json_pages; p++) {
@@ -1076,16 +1538,17 @@ static void refresh_values(void)
                 continue;
             }
             if (w->type == TILE_SENSOR) {
+                const char *state_txt = weather_state_zh(e->entity_id, e->state);
                 if (!e->fresh || strcmp(e->state, "unavailable") == 0) {
                     lv_label_set_text(w->value, "--");
                 } else if (e->unit[0]) {
                     char buf[64];
-                    snprintf(buf, sizeof(buf), "%s %s", e->state, e->unit);
+                    snprintf(buf, sizeof(buf), "%s %s", state_txt, e->unit);
                     lv_label_set_text(w->value, buf);
                     lv_obj_set_style_text_font(w->value, value_font_for(buf), 0);
                 } else {
-                    lv_label_set_text(w->value, e->state);
-                    lv_obj_set_style_text_font(w->value, value_font_for(e->state), 0);
+                    lv_label_set_text(w->value, state_txt);
+                    lv_obj_set_style_text_font(w->value, value_font_for(state_txt), 0);
                 }
                 continue;
             }
@@ -1144,7 +1607,7 @@ static void refresh_timer_cb(lv_timer_t *t)
 #if UI_ASSISTANT_PAGE
     refresh_selftest_label();      /* 小智页顶部「音频自检」按钮的文字/结果 */
 #endif
-    detail_knob_flush();           /* 旋钮停转后补发最后一条亮度/色温命令 */
+    /* 旋钮最后值不再挂在这个 500ms 定时器上：由 s_knob_timer（50ms）负责补发 */
     if (s_detail_visible) {
         detail_apply_entity();     /* 子页数值跟着轮询刷新 */
     }
@@ -1185,6 +1648,7 @@ static void refresh_timer_cb(lv_timer_t *t)
 
     refresh_values();
     refresh_status_page();
+    refresh_bt_ui();               /* 蓝牙图标颜色 + 设置页状态（本版恒「未启用」） */
 
     if (s_hint) {
         if (s_layout_valid) {
@@ -1268,6 +1732,30 @@ static void worker_task(void *arg)
             }
 
             ESP_LOGI(TAG, "%s %s %s", cmd.service, cmd.entity, cmd.attrs);
+            if (cmd.knob) {
+                /* 旋钮命令：POST 一回来就放开 in-flight，让 UI 能马上补最新值。
+                   连续转动的中间值不再各自等 300ms + 刷新实体，只有最后一条
+                   （队列空了）才等一下让 HA 落定，再刷新状态。 */
+                if (cmd.attrs[0] != '\0') {
+                    ha_client_action_attrs(cmd.entity, cmd.service, cmd.attrs);
+                } else {
+                    ha_client_action(cmd.entity, cmd.service);
+                }
+                s_knob_inflight = false;
+                for (int i = 0; i < 30; i++) {           /* 原 300ms，可被新命令打断 */
+                    if (uxQueueMessagesWaiting(s_cmd_q) > 0) {
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+                if (uxQueueMessagesWaiting(s_cmd_q) == 0) {
+                    const ha_entity_t *e = ha_client_find(cmd.entity);
+                    if (e) {
+                        ha_client_refresh_at((int)(e - ha_client_at(0)));
+                    }
+                }
+                continue;
+            }
             if (cmd.attrs[0] != '\0') {
                 ha_client_action_attrs(cmd.entity, cmd.service, cmd.attrs);
             } else {
@@ -1515,6 +2003,7 @@ static bool detail_knob_send(int target, int value)
     }
     cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
+    cmd.knob = true;                 /* worker 据此走快路径：不等 300ms 刷新 */
     snprintf(cmd.entity, sizeof(cmd.entity), "%s", s_detail_entity);
     snprintf(cmd.service, sizeof(cmd.service), "turn_on");
     if (target == DETAIL_KNOB_CT) {
@@ -1523,6 +2012,49 @@ static bool detail_knob_send(int target, int value)
         snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"brightness_pct\":%d}", value);
     }
     return xQueueSend(s_cmd_q, &cmd, 0) == pdTRUE;
+}
+
+/** 有脏值时唤醒 50ms 补发定时器（已经在跑就什么也不做）。*/
+static void detail_knob_timer_wake(void)
+{
+    if (s_knob_timer == NULL || s_knob_timer_active) {
+        return;
+    }
+    lv_timer_resume(s_knob_timer);
+    lv_timer_ready(s_knob_timer);    /* 先查一次，别白等一个周期 */
+    s_knob_timer_active = true;
+}
+
+/** 没有待发值了就停掉定时器：不跟着 500ms 刷新定时器空转。*/
+static void detail_knob_timer_park(void)
+{
+    if (s_knob_timer == NULL || !s_knob_timer_active) {
+        return;
+    }
+    lv_timer_pause(s_knob_timer);
+    s_knob_timer_active = false;
+}
+
+/**
+ * 把最新待发值排进命令队列。
+ * in-flight 时不排：队列里最多只有一条旋钮命令，这期间再转多少格都只保留
+ * s_knob_pending_* 里的最新值，中间值直接合并掉（不会积压一队过期亮度）。
+ */
+static bool detail_knob_queue_pending(void)
+{
+    if (!s_knob_dirty || !s_detail_visible || s_knob_inflight) {
+        return false;
+    }
+    /* 先置 in-flight 再入队：worker 可能在 xQueueSend 里就抢占并跑完，
+       若等发送返回后才置位，会把已经清掉的标志又置成 true，卡住后续补发。 */
+    s_knob_inflight = true;
+    if (!detail_knob_send(s_knob_pending_target, s_knob_pending_value)) {
+        s_knob_inflight = false;
+        return false;
+    }
+    s_knob_dirty = false;
+    s_knob_last_send = lv_tick_get();
+    return true;
 }
 
 /**
@@ -1585,44 +2117,79 @@ bool ui_home_detail_knob(int delta)
     lv_label_set_text(label, buf);
     detail_update_ambience();
 
-    /* 2) 网络命令限流：至少隔 200ms 发一条；停手后由 refresh 定时器补发最后值 */
+    /* 2) 网络命令：转动中最快 100ms 一条，多格只保留最新值（pending）。
+       停手后由 50ms 专用定时器补发最后一条，不再等 500ms 刷新定时器。 */
     const uint32_t now = lv_tick_get();
     s_knob_dirty = true;
+    s_knob_pending_target = target;
+    s_knob_pending_value = v;
     s_knob_last_change = now;
     if ((uint32_t)(now - s_knob_last_send) >= DETAIL_KNOB_SEND_MS) {
-        if (detail_knob_send(target, v)) {
-            s_knob_last_send = now;
-            s_knob_dirty = false;
-        }
+        detail_knob_queue_pending();   /* in-flight / 队列满：留着下次补 */
+    }
+    if (s_knob_dirty) {
+        detail_knob_timer_wake();
     }
     return true;
 }
 
-/** refresh 定时器里调用：停转一小会儿后把最后的值补发出去（限流窗口可能吞掉它）。*/
+/**
+ * 补发最后一条亮度/色温命令。只在 LVGL 线程调用，真正的网络请求仍在 worker 里。
+ * 只在"停转 >= 80ms"后发（转动中的节奏由旋钮事件自己按 100ms 限流），
+ * 这样每条最后值只会打一行日志，串口上能直接量延迟。
+ */
 static void detail_knob_flush(void)
 {
-    if (!s_knob_dirty || !s_detail_visible) {
+    if (!s_knob_dirty || !s_detail_visible || s_knob_inflight) {
         return;
     }
-    if ((uint32_t)(lv_tick_get() - s_knob_last_change) < DETAIL_KNOB_IDLE_MS) {
+    const uint32_t now = lv_tick_get();
+    const uint32_t idle_ms = (uint32_t)(now - s_knob_last_change);
+    if (idle_ms < DETAIL_KNOB_IDLE_MS) {
         return;
     }
+    if ((uint32_t)(now - s_knob_last_send) < DETAIL_KNOB_SEND_MS) {
+        return;                        /* 还差一点到 100ms 限流窗口：下个 tick 再发 */
+    }
+
+    /* 灯已经关了（或实体没了）：丢掉待发值，绝不能把它重新点亮 */
     const ha_entity_t *e = ha_client_find(s_detail_entity);
-    const int target = detail_knob_target_for(e);
-    if (target < 0) {
+    if (e == NULL || !detail_light_on(e)) {
         s_knob_dirty = false;
         return;
     }
-    lv_obj_t *slider = (target == DETAIL_KNOB_CT) ? s_detail_ct_slider : s_detail_br_slider;
-    if (slider == NULL) {
-        s_knob_dirty = false;
+    char name[48];
+    snprintf(name, sizeof(name), "%.47s", e->name[0] ? e->name : s_detail_entity);   /* 显式精度，避免 -Wformat-truncation */
+
+    const int target = s_knob_pending_target;
+    const int value = s_knob_pending_value;
+    if (!detail_knob_queue_pending()) {
+        return;                        /* 队列满：留着下一次 tick 再试 */
+    }
+    char vbuf[16];
+    if (target == DETAIL_KNOB_CT) {
+        snprintf(vbuf, sizeof(vbuf), "%dK", value);
+    } else {
+        snprintf(vbuf, sizeof(vbuf), "%d%%", value);
+    }
+    /* 一行一条，延迟 = 距离最后一次转动的毫秒数，便于串口上量 */
+    ESP_LOGI(TAG, "旋钮补发最后值 %s -> %s，延迟 %u ms", vbuf, name, (unsigned)idle_ms);
+}
+
+/** 50ms 专用定时器：有脏值才跑，补发完就自己停掉。*/
+static void detail_knob_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_knob_dirty || !s_detail_visible) {
+        detail_knob_timer_park();
         return;
     }
-    if (detail_knob_send(target, (int)lv_slider_get_value(slider))) {
-        s_knob_dirty = false;
-        s_knob_last_send = lv_tick_get();
-        ESP_LOGI(TAG, "旋钮补发最后值：%s = %d", target == DETAIL_KNOB_CT ? "色温" : "亮度",
-                 (int)lv_slider_get_value(slider));
+    if (s_knob_inflight) {
+        return;                        /* worker 正在发上一条；清标志后本定时器再补 */
+    }
+    detail_knob_flush();
+    if (!s_knob_dirty) {
+        detail_knob_timer_park();
     }
 }
 
@@ -1630,6 +2197,10 @@ static void detail_knob_flush(void)
 static void detail_slider_pressed_cb(lv_event_t *e)
 {
     lv_obj_t *slider = lv_event_get_target(e);
+    /* 手指按到滑条上：手指优先。丢掉还没补发的旋钮值，别让它在松手后
+       又补一条旋钮命令，盖掉手指刚选的值。 */
+    s_knob_dirty = false;
+    detail_knob_timer_park();
     if (slider == s_detail_ct_slider) {
         s_detail_knob_target = DETAIL_KNOB_CT;
     } else if (slider == s_detail_br_slider) {
@@ -1691,6 +2262,12 @@ static void detail_power_changed_cb(lv_event_t *e)
     /* 开关自身的视觉已经切换：记住它，别让轮询立刻拉回去 */
     s_sw_override_on = want_on;
     s_sw_override_until = lv_tick_get() + OVERRIDE_MS;
+
+    if (!want_on) {
+        /* 关灯：丢掉还没补发的旋钮值，别让它在关灯后又发一条 turn_on */
+        s_knob_dirty = false;
+        detail_knob_timer_park();
+    }
 
     if (s_detail_entity[0] == '\0' || s_cmd_q == NULL) {
         return;
@@ -1808,8 +2385,11 @@ void ui_home_open_detail(const char *entity_id)
     if (strcmp(entity_id, s_detail_entity) != 0) {
         /* 换了一只灯：旋钮回到"调亮度"（这是用户最常用的）*/
         s_detail_knob_target = DETAIL_KNOB_BR;
-        s_knob_dirty = false;
     }
+    /* 新页面从干净状态开始：上一页的待发值（关页时已补发过）不再带进来 */
+    s_knob_dirty = false;
+    s_knob_pending_target = DETAIL_KNOB_BR;
+    detail_knob_timer_park();
     snprintf(s_detail_entity, sizeof(s_detail_entity), "%s", entity_id);
     detail_apply_entity();
     s_detail_visible = true;
@@ -1890,6 +2470,29 @@ void ui_home_close_detail(void)
         return;
     }
     ESP_LOGI(TAG, "close detail");
+    /* 页面要关了：把还没补发的最后值发掉（灯已经关了就不发，不能把它重新点亮）*/
+    if (s_knob_dirty) {
+        const ha_entity_t *e = ha_client_find(s_detail_entity);
+        if (e != NULL && detail_light_on(e) && s_cmd_q != NULL) {
+            const uint32_t delay_ms = (uint32_t)(lv_tick_get() - s_knob_last_change);
+            s_knob_inflight = true;      /* 先置位再入队，理由同 queue_pending */
+            if (!detail_knob_send(s_knob_pending_target, s_knob_pending_value)) {
+                s_knob_inflight = false;
+            } else {
+                s_knob_last_send = lv_tick_get();
+                char vbuf[16];
+                if (s_knob_pending_target == DETAIL_KNOB_CT) {
+                    snprintf(vbuf, sizeof(vbuf), "%dK", s_knob_pending_value);
+                } else {
+                    snprintf(vbuf, sizeof(vbuf), "%d%%", s_knob_pending_value);
+                }
+                ESP_LOGI(TAG, "旋钮补发最后值 %s -> %s，关页前发出，延迟 %u ms", vbuf,
+                         e->name[0] ? e->name : s_detail_entity, (unsigned)delay_ms);
+            }
+        }
+        s_knob_dirty = false;
+    }
+    detail_knob_timer_park();
     s_detail_visible = false;
     lv_anim_t a;
     lv_anim_init(&a);
@@ -2389,13 +2992,35 @@ static void build_ui(void)
     s_selftest_label = NULL;
     s_selftest_shown[0] = '\0';
 
+    /* 设置页 / 蓝牙控件：重建后旧指针全部作废，先清空（refresh 里都看 NULL） */
+    s_settings_page = -1;
+    s_bt_icon = NULL;
+    s_set_page = NULL;
+    s_set_bt_state = NULL;
+    s_set_scan_btn = NULL;
+    s_set_scan_label = NULL;
+    s_set_conn_btn = NULL;
+    s_set_conn_label = NULL;
+    s_set_empty = NULL;
+    s_set_phone_btn = NULL;
+    s_set_phone_label = NULL;
+    s_set_bt_btn = NULL;
+    s_set_bt_label = NULL;
+    s_set_audio_hint = NULL;
+    s_set_state_shown[0] = '\0';
+    s_set_hint_until = 0;
+    s_set_sel_addr[0] = '\0';
+
     s_json_pages = s_layout.page_count;
     s_page_count = s_json_pages + 1; /* 加 System 页 */
 #if UI_ASSISTANT_PAGE
     if (s_layout_valid && s_layout.voice_enabled) {
-        s_page_count++;              /* 再加小智助手页（最后一页） */
+        s_page_count++;              /* 再加小智助手页 */
     }
 #endif
+    /* 设置页永远排在最后（小智页后面）：s_pages[s_page_count-1] */
+    s_settings_page = s_page_count;
+    s_page_count++;
     s_title = NULL;
     s_wifi_icon = NULL;
     s_wifi_label = NULL;
@@ -2434,6 +3059,16 @@ static void build_ui(void)
     lv_obj_set_style_text_font(ha_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(ha_lbl, 209, 56);
 
+    /* 蓝牙状态图标（WiFi 三道弧左边）：灰 = 未启用/关闭，蓝 = 扫描中/已连接。
+       montserrat_14 里带 LV_SYMBOL_BLUETOOTH（U+F293）；颜色由 refresh_timer_cb 刷。 */
+    s_bt_icon = lv_label_create(scr);
+    if (s_bt_icon != NULL) {
+        lv_label_set_text(s_bt_icon, LV_SYMBOL_BLUETOOTH);
+        lv_obj_set_style_text_font(s_bt_icon, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(s_bt_icon, COLOR_MUTED, 0);
+        lv_obj_set_pos(s_bt_icon, 94, 51);
+    }
+
     /* JSON 页 */
     for (int p = 0; p < s_json_pages; p++) {
         lv_obj_t *page = lv_obj_create(scr);
@@ -2469,9 +3104,10 @@ static void build_ui(void)
     build_status_page(scr);
 #if UI_ASSISTANT_PAGE
     if (s_layout_valid && s_layout.voice_enabled) {
-        build_assistant_page(scr);          /* 最后一页：白底小智页 */
+        build_assistant_page(scr);          /* 小智页（白底） */
     }
 #endif
+    build_settings_page(scr);               /* 最后一页：设置（蓝牙 + 音频输出） */
 
     /* 翻页圆点 */
     if (s_page_count > 1) {
@@ -2505,11 +3141,25 @@ static void build_ui(void)
     show_page(0);
     refresh_values();
     refresh_status_page();
+    refresh_bt_ui();                 /* 蓝牙图标 + 设置页首帧（本版恒「未启用」） */
 
     if (s_refresh_timer) {
         lv_timer_delete(s_refresh_timer);
     }
     s_refresh_timer = lv_timer_create(refresh_timer_cb, 500, NULL);
+
+    /* 旋钮补发专用定时器：创建后先暂停，只有 s_knob_dirty 时才唤醒 */
+    if (s_knob_timer) {
+        lv_timer_delete(s_knob_timer);
+        s_knob_timer = NULL;
+    }
+    s_knob_timer = lv_timer_create(detail_knob_timer_cb, DETAIL_KNOB_TICK_MS, NULL);
+    s_knob_timer_active = false;
+    if (s_knob_timer) {
+        lv_timer_pause(s_knob_timer);
+    }
+    s_knob_dirty = false;
+    s_knob_pending_target = DETAIL_KNOB_BR;
 
     lv_obj_add_event_cb(scr, gesture_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSED, NULL);
@@ -2533,7 +3183,7 @@ static void build_ui(void)
             built++;
         }
     }
-    ESP_LOGI(TAG, "UI built: %d page(s) + system（小智页：%s），共 %d 页",
+    ESP_LOGI(TAG, "UI built: %d page(s) + system + 设置（小智页：%s），共 %d 页",
              s_json_pages, is_assistant_page(s_json_pages + 1) ? "有" : "无", s_page_count);
     if (built != s_page_count) {
         ESP_LOGE(TAG, "页面没建全：只有 %d/%d 页有效，缺失的页在翻页时会跳过（原因见上面的报错）",

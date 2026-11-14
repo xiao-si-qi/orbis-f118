@@ -1,4 +1,4 @@
-﻿/*
+/*
  * orbis-f118 · 360×360 圆屏（ESP32-S31 / JC3636F118）
  *
  * 硬件初始化沿用原来的写法（背光 / LCD / LVGL / 触摸 / 编码器 / 触觉 / 电池 / 网络）。
@@ -27,6 +27,7 @@
 #include "esp_lcd_st77916.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"   /* esp_ptr_dma_capable */
 #include "esp_log.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -37,9 +38,11 @@
 #include "assistant_ui.h"  /* 小智助手页（MQTT assistant 命令） */
 #include "net.h"
 #include "battery.h"
+#include "bt_link.h"       /* 蓝牙链路抽象层（本版是桩：协议栈未编译，恒「未启用」） */
 #include "web.h"           /* 网页配置后台（配网 / 网页 OTA），WiFi 连上后起 */
 #include "app_settings.h"  /* NVS 配置：WiFi / HA / MQTT / 设置页口令 */
 #include "ha_client.h"
+#include "ha_ws.h"
 #include "layout.h"
 #include "bg_image.h"
 #include "ui_home.h"
@@ -170,6 +173,9 @@ static void lcd_init(void)
 static void lvgl_init(void)
 {
     lv_init();
+    /* LVGL 9.6 的堆由 main/lv_mem_psram.c 从 PSRAM 分配（CONFIG_LV_USE_CUSTOM_MALLOC），
+       内部 RAM 里不再保留 64 KB 的静态池。 */
+    ESP_LOGI(TAG, "LVGL 内存：PSRAM 池（自定义分配器）");
     lv_tick_set_cb(tick_cb);
 
     /* 必须先建「显示」：lv_screen_active() 取的是默认显示的活动屏幕，
@@ -182,14 +188,28 @@ static void lvgl_init(void)
         return;
     }
 
-    const size_t buf_bytes = LCD_W * 16 * sizeof(lv_color_t);   /* 16 行：SPI 需要等量的内部 DMA 中转缓冲，块越小越安全 */
-    void *b1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
-    void *b2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
+    /* 绘制缓冲放在【内部 RAM + DMA 可用 + 缓存对齐】：
+       SPI 驱动只有当缓冲不能直接 DMA 时才申请中转缓冲并 memcpy（每块 11.5 KB 纯浪费）。
+       放内部 RAM 后 need_malloc=false → 零拷贝，整屏刷新时间从 ~29 ms 降到 ~7 ms。
+       16 行/块：两块共 23 KB 内部 RAM（内存紧张，优先保 RAM）。 */
+    const size_t buf_bytes = LCD_W * 16 * sizeof(lv_color_t);
+    const size_t align = 64;   /* SPI DMA 缓冲的缓存行对齐（本芯片 64 字节） */
+    void *b1 = heap_caps_aligned_alloc(align, buf_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    void *b2 = heap_caps_aligned_alloc(align, buf_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (b1 == NULL || b2 == NULL) {
+        ESP_LOGE(TAG, "绘制缓冲分配失败（内部 RAM 不足），回退到 PSRAM（会有中转拷贝）");
+        if (b1) heap_caps_free(b1);
+        if (b2) heap_caps_free(b2);
+        b1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
+        b2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
+    }
     lv_display_set_flush_cb(s_disp, lv_flush_cb);
     /* 面板要 RGB565 大端，LVGL 默认小端：显式声明字节交换 */
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
     lv_display_set_buffers(s_disp, b1, b2, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
-    ESP_LOGI(TAG, "LVGL 初始化完成, 缓冲 %u KB x2", (unsigned)(buf_bytes / 1024));
+    ESP_LOGI(TAG, "LVGL 初始化完成：绘制缓冲 %u KB x2（%s，DMA 直发零拷贝）",
+             (unsigned)(buf_bytes / 1024),
+             esp_ptr_dma_capable(b1) ? "内部 RAM" : "PSRAM 回退");
 }
 
 static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
@@ -373,14 +393,18 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     /* 小智助手页现在只是主界面的最后一页（不再是悬浮二级页）：
        旋钮在它上面照常翻页，所以这里不再做避让。 */
     const int8_t diff = encoder_read_diff();
-    /* 旋钮：顺时针（实测 diff<0）= 下一页 / 调大。
-       灯详情页开着时先交给它调亮度/色温（只有真正调了值才响一下）；
-       灯关着或手指正按着滑条时它返回 false，而详情页开着就不翻页、也不震动。 */
+    /* 方向只在这里定义一次：顺时针 = +1（调大 / 下一页），逆时针 = -1。
+       硬件实测顺时针时 diff < 0；若换成反相编码器，只改这一行的 ? 分支即可。 */
     if (diff != 0) {
-        if (ui_home_detail_knob(diff < 0 ? 1 : -1)) {
-            haptic_click();          /* 调了一格：一次触觉 */
+        const int dir = (diff < 0) ? 1 : -1;
+        const bool adjusting = ui_home_detail_knob(dir);
+        if (ui_home_detail_open()) {
+            ESP_LOGD(TAG, "旋钮: diff=%d 顺时针方向=%d 调值=%d", diff, dir, (int)adjusting);
+        }
+        if (adjusting) {
+            haptic_click();
         } else if (!ui_home_detail_open()) {
-            ui_home_page_step(diff < 0 ? 1 : -1);
+            ui_home_page_step(dir);
             haptic_click();
         }
     }
@@ -528,6 +552,14 @@ static void apply_cmd(const char *json)
         xiaozhi_client_configure(en, ep);
         ESP_LOGI(TAG, "小智（调试覆盖）：enabled=%d endpoint=%s", (int)en, ep ? ep : "-");
 
+    } else if (strcmp(cmd, "ha_ws") == 0) {
+        /* 调试：{cmd:"ha_ws"} 打一行 WebSocket 状态（事件/命令/往返/最后错误/内部 RAM），
+           同时发到 MQTT log 主题，人不在设备边也能看。 */
+        char buf[256];
+        ha_ws_status(buf, sizeof(buf));
+        ESP_LOGI(TAG, "HA WebSocket：%s", buf);
+        net_publish_log(buf);
+
     } else if (strcmp(cmd, "log") == 0) {
         /* 按需抓日志：先把环形缓冲里的最近 40 行发一次，之后按 s_log_on 继续推 */
         char *dump = malloc(4096);
@@ -621,6 +653,10 @@ void app_main(void)
 
     /* 最先读 NVS 配置：后面 net_wifi_start / net_mqtt_start / 网页都要用 */
     app_settings_init();
+    /* 蓝牙链路抽象层：本版是桩（协议栈未编译），只读 NVS 里的音频输出偏好、建互斥量。
+       放在 NVS 初始化之后、任何界面构建之前：设置页第一次画出来就能拿到正确的偏好，
+       而且不启动任何蓝牙栈、不改开机顺序。 */
+    bt_link_init();
     backlight_init();
     lcd_init();
     lvgl_init();
@@ -697,6 +733,14 @@ void app_main(void)
         ESP_LOGW(TAG, "WiFi 未连接，跳过 HA 初始化");
     }
 
+    /* WebSocket 长连接：下行 state_changed（卡片即时刷新），上行 service call（快路径）。
+       地址/协议由 app_settings 里的 HA URL 推导，WiFi 晚上线也没关系（任务内部等网络）。
+       放在 HA REST 初始化之后：开机先出首屏状态，再由 WS 接管实时更新。 */
+    /* 隔离测试：临时不启动 WS，确认开机崩溃是否由它引起 */
+    if (0 && !ha_ws_start()) {
+        ESP_LOGW(TAG, "HA WebSocket 任务启动失败，继续只用 REST 轮询");
+    }
+
     ui_home_apply(has_layout ? lay : NULL);   /* 没有布局就只显示 System 页 */
     free(lay);
     ESP_LOGI(TAG, "进入 LVGL 主循环");
@@ -738,8 +782,10 @@ void app_main(void)
                 {
                     lv_mem_monitor_t mon;
                     lv_mem_monitor(&mon);
-                    ESP_LOGI(TAG, "LVGL 池: 空闲 %u/%u 字节, 最大块 %u, 碎片 %u%%",
+                    /* 自定义分配器没有固定池：free/total 反映 PSRAM 堆，已用/峰值才是 LVGL 自己。 */
+                    ESP_LOGI(TAG, "LVGL 池(PSRAM): 空闲 %u/%u 字节, 已用 %u, 峰值 %u, 最大块 %u, 碎片 %u%%",
                              (unsigned)mon.free_size, (unsigned)mon.total_size,
+                             (unsigned)(mon.total_size - mon.free_size), (unsigned)mon.max_used,
                              (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct);
                 }
                 {

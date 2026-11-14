@@ -11,6 +11,13 @@ extern "C" {
 
 #define HA_MAX_ENTITIES 24
 
+/** REST 轮询节奏：由 ha_ws 根据 WebSocket 状态切换（见 ha_client_set_poll_mode）。 */
+typedef enum {
+    HA_POLL_NORMAL = 0,   /* 5 秒 REST 轮询（默认；WS 不可用时的兜底） */
+    HA_POLL_SLOW,         /* 60 秒兜底一致性检查（明文 ws:// 已接管，无 TLS 开销） */
+    HA_POLL_PAUSED,       /* 暂停并释放常驻 HTTP/TLS（wss:// 已接管，只留一条 TLS） */
+} ha_client_poll_mode_t;
+
 typedef struct {
     char entity_id[96];
     char name[48];
@@ -72,8 +79,37 @@ esp_err_t ha_client_history(const char *entity_id, int hours, float *values, int
 /** HA REST 是否可达（最近一次请求成功）。界面上的 HA 圆点用它。 */
 bool ha_client_online(void);
 
-/** 启动后台轮询。 */
+/** 启动后台轮询（幂等：重复调用不会创建第二个轮询任务）。 */
 void ha_client_start_poll(void);
+
+/* -------------------------------------------------------------------------
+ * WebSocket（ha_ws.c）用的追加接口。都是线程安全的短操作，可从任意任务调用。
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief 用一条外部状态更新实体（WebSocket 的 state_changed 事件）。
+ *
+ * @param entity_id  实体 id（必须在关注列表里，否则返回 false）
+ * @param state      新状态字符串，如 "on" / "off" / "23.5"
+ * @param attrs_json 新状态的 attributes 对象（可为 NULL；解析方式与 REST 全量刷新一致）
+ */
+bool ha_client_apply_state(const char *entity_id, const char *state, const char *attrs_json);
+
+/** 切换 REST 轮询节奏；只在状态真正改变时打一条日志，并唤醒轮询任务。 */
+void ha_client_set_poll_mode(ha_client_poll_mode_t mode);
+ha_client_poll_mode_t ha_client_poll_mode(void);
+
+/** 关闭并销毁常驻 HTTP 客户端（释放它占的 TLS/socket 内存，下次用时按需重建）。 */
+void ha_client_release_http(void);
+
+/** 常驻 HTTP 客户端当前是否存在（ha_ws 用来确认 TLS 内存是否真的还回去了）。 */
+bool ha_client_http_alive(void);
+
+/** HA 客户端是否初始化成功（ha_ws 在 WiFi 晚连上时用它补初始化）。 */
+bool ha_client_is_ready(void);
+
+/** WebSocket 认证状态同步给界面上的 HA 圆点（REST 成功/失败也会改它）。 */
+void ha_client_set_online(bool online);
 
 #ifdef __cplusplus
 }
