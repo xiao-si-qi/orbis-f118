@@ -1,24 +1,29 @@
 /**
  * @file assistant_ui.c
- * @brief 小智助手界面：纯白底 + 会动的脸（两只眼睛 + 一张嘴）+ 中文状态文字。
+ * @brief 小智助手页：纯白底 + 会动的脸（两只眼睛 + 一张嘴）+ 中文状态文字。
+ *
+ * 它是主界面（ui_home）的最后一页：ui_home 建好页面对象后调用
+ * assistant_ui_build(page)，本模块把内容画进去，翻页/圆点/手势全按普通页走，
+ * 不再有"二级悬浮页"。
  *
  * 为什么这么画（这块板子内存很紧，内部 RAM 只剩几十 KB）：
  *   - 不用任何图片资源：眼睛是带圆角的 lv_obj，嘴是 lv_arc / 小圆 / 药丸块，
  *     思考时是一圈转动的 lv_arc，全部靠"改尺寸、改角度"动起来；
  *   - 一共十几个对象、没有额外缓冲，动画在一个 50ms 的 LVGL 定时器里算，
- *     关页面时把定时器 pause 掉，不空转；
- *   - 页面第一次打开时才创建，之后只隐藏；ui_home 重建界面（收到新 cfg）会把
- *     整棵控件树 lv_obj_clean 掉，这里用 LV_EVENT_DELETE 把指针清空，下次再建。
+ *     页面不可见时把定时器 pause 掉，不空转；
+ *   - ui_home 重建界面（收到新 cfg）会把整棵控件树 lv_obj_clean 掉，这里用
+ *     LV_EVENT_DELETE 把指针清空，下次 build 再建。
  *
  * 表情（对应 xiaozhi_state()）：
  *   IDLE       圆眼睛 + 微笑弧，每 3~6 秒眨一次眼
  *   LISTENING  眼睛略放大、轻轻上下浮动，嘴变成小 "o"，头顶一个呼吸的录音点
  *   THINKING   眼睛压成两道短线，嘴的位置是一圈转动的弧
- *   SPEAKING   嘴（药丸块）按两个正弦叠加张合，眼睛跟着微微眯
+ *   SPEAKING   嘴（药丸块）按两个正弦叠加张合，眼睛跟着微微眯，副标题显示 TTS 字幕
  *   ERROR      眼睛压平、颜色转灰，副标题显示服务端给的原因
  *   CONNECTING 正常眼睛 + 一条短横线的嘴，等握手
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -26,6 +31,7 @@
 #include "lvgl.h"
 
 #include "assistant_ui.h"
+#include "ui_home.h"        /* 翻页：ui_home_goto_assistant() / ui_home_goto_first() */
 #include "xiaozhi_client.h"
 
 LV_FONT_DECLARE(lv_font_cjk16);
@@ -40,7 +46,7 @@ static const char *TAG = "assistant";
 #define C_TRACK   lv_color_hex(0xD9D9DE)
 #define C_CHIP    lv_color_hex(0xF2F2F7)
 
-/* ---- 几何：360x360 圆屏，内容压在 y=50..300 的安全带里 ---- */
+/* ---- 几何：360x360 圆屏，内容压在 y=50..320 的安全带里 ---- */
 #define EYE_CY    150
 #define EYE_CX_L  146
 #define EYE_CX_R  214
@@ -49,8 +55,12 @@ static const char *TAG = "assistant";
 
 #define ANIM_MS   50              /* 表情动画节奏：20 帧/秒 */
 
-static lv_obj_t *s_page;
-static lv_obj_t *s_close;
+/* ---- 副标题（最近一句识别结果 / 小智说的话）：最多两行，超长打点 ---- */
+#define SUB_W     276             /* 圆屏 y≈295 处可见宽度约 276px，别越界 */
+#define SUB_LINES 2
+#define SUB_MAX   136
+
+static lv_obj_t *s_page;          /* 调用方（ui_home）给的父对象，不是我们建的 */
 static lv_obj_t *s_dot;           /* 聆听时的录音指示点 */
 static lv_obj_t *s_eye[2];
 static lv_obj_t *s_mouth_smile;   /* 微笑弧（空闲）*/
@@ -58,11 +68,11 @@ static lv_obj_t *s_mouth_o;       /* 小 "o"（聆听）*/
 static lv_obj_t *s_mouth_line;    /* 药丸块（说话时张合 / 出错时一条线）*/
 static lv_obj_t *s_think_arc;     /* 思考时转圈的弧 */
 static lv_obj_t *s_status;        /* 待机 / 正在聆听… */
-static lv_obj_t *s_sub;           /* 最近一句识别结果 / 出错原因 */
+static lv_obj_t *s_sub;           /* 小智说的话 / 最近一句识别结果 / 出错原因 */
 static lv_obj_t *s_hint;          /* 激活码 / 操作提示 */
 
 static lv_timer_t *s_anim_timer;
-static bool s_open;
+static bool s_visible;            /* 页面当前是否可见（由 ui_home 翻页控制）*/
 static xz_state_t s_face = (xz_state_t)-1;
 
 static uint32_t s_tick;
@@ -73,8 +83,9 @@ static bool s_blink_active;
 
 /* 文字缓存：内容没变就不动 LVGL 标签（500ms 一次也别白重排）*/
 static char s_txt_status[24];
-static char s_txt_sub[128];
+static char s_txt_sub[SUB_MAX];
 static char s_txt_hint[32];
+static char s_sub_src[SUB_MAX];   /* 副标题原文：没变就不用重新排版 */
 
 static lv_point_t s_press;
 static bool s_swiped;
@@ -82,11 +93,6 @@ static bool s_swiped;
 /* ------------------------------------------------------------------------- */
 /* 小工具                                                                     */
 /* ------------------------------------------------------------------------- */
-
-static void anim_translate_cb(void *var, int32_t v)
-{
-    lv_obj_set_style_translate_x((lv_obj_t *)var, (lv_coord_t)v, 0);
-}
 
 static const char *face_name(xz_state_t st)
 {
@@ -128,14 +134,18 @@ static lv_obj_t *make_block(lv_obj_t *parent, lv_coord_t w, lv_coord_t h,
     return o;
 }
 
-/** 一行中文标签（居中、超长打点）。 */
-static lv_obj_t *make_label(lv_obj_t *parent, lv_color_t color, lv_coord_t width)
+/** 中文标签：居中；height<=0 表示按内容自适应，>0 表示固定高度、放不下打点。 */
+static lv_obj_t *make_label(lv_obj_t *parent, lv_color_t color, lv_coord_t width,
+                            lv_coord_t height)
 {
     lv_obj_t *l = lv_label_create(parent);
     lv_obj_set_style_text_font(l, &lv_font_cjk16, 0);
     lv_obj_set_style_text_color(l, color, 0);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(l, width);
+    if (height > 0) {
+        lv_obj_set_height(l, height);
+    }
     lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
     lv_label_set_text(l, "");
     lv_obj_set_clickable(l, false);
@@ -170,13 +180,61 @@ static void set_text_if(lv_obj_t *label, char *cache, size_t cap, const char *te
     lv_label_set_text(label, cache);
 }
 
+/**
+ * 把一句话裁成"最多 lines 行"：先按显示宽度量，超了就从尾部按 UTF-8 字符回退，
+ * 最后补一个 "…"。这样长句只会被省略，不会把圆屏撑破。
+ * 只在文字变化时调用（结果有缓存），所以这里的逐字测量不会拖慢 500ms 刷新。
+ */
+static void fit_lines(char *dst, size_t cap, const char *src, lv_coord_t width, int lines)
+{
+    if (dst == NULL || cap == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (src == NULL || src[0] == '\0') {
+        return;
+    }
+
+    const size_t ell = sizeof("…") - 1;                 /* "…" = 3 字节 */
+    const size_t keep = (cap > ell + 1) ? cap - ell - 1 : cap;   /* 给 "…" 留位置 */
+    size_t n = strlen(src);
+    if (n > keep) {
+        n = keep;
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) {
+            n--;
+        }
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+
+    const int32_t max_h = lv_font_get_line_height(&lv_font_cjk16) * lines;
+    lv_point_t sz;
+    lv_text_get_size(&sz, dst, &lv_font_cjk16, 0, 0, width, LV_TEXT_FLAG_NONE);
+    if (sz.y <= max_h) {
+        return;                                          /* 放得下：原样显示（含换行）*/
+    }
+
+    while (n > 0) {
+        n--;
+        while (n > 0 && ((unsigned char)dst[n] & 0xC0) == 0x80) {
+            n--;                                         /* 退到字符首字节 */
+        }
+        dst[n] = '\0';
+        lv_text_get_size(&sz, dst, &lv_font_cjk16, 0, 0, width - 16, LV_TEXT_FLAG_NONE);
+        if (sz.y <= max_h) {
+            break;
+        }
+    }
+    snprintf(dst + n, cap - n, "…");
+}
+
 /* ------------------------------------------------------------------------- */
 /* 状态 → 表情                                                                */
 /* ------------------------------------------------------------------------- */
 
 static void face_apply(xz_state_t st)
 {
-    if (s_page == NULL) {
+    if (s_page == NULL || s_eye[0] == NULL) {
         return;
     }
     s_face = st;
@@ -300,35 +358,46 @@ static void refresh_text(void)
     const bool ready = xiaozhi_client_ready();
     const char *code = xiaozhi_activation_code();
     const char *last = xiaozhi_last_text();
-    char sub[128] = "";
+    const char *tts = xiaozhi_last_tts_text();
+    const char *sub_src = "";
     char hint[32] = "";
 
     if (st == XZ_ERROR) {
-        snprintf(sub, sizeof(sub), "%s", xiaozhi_client_status_text());
+        sub_src = xiaozhi_client_status_text();
+    } else if (st == XZ_SPEAKING && tts[0] != '\0') {
+        sub_src = tts;                    /* 正在说话：显示小智这句 TTS 字幕 */
     } else if (last[0] != '\0') {
-        snprintf(sub, sizeof(sub), "%s", last);     /* 最近一句识别结果 */
+        sub_src = last;                   /* 其它状态：还是最近一句识别结果 */
     }
 
     if (code[0] != '\0') {
         /* 激活码比什么都重要：单独一行，副标题让位 */
         snprintf(hint, sizeof(hint), "待激活 %s", code);
-        sub[0] = '\0';
+        sub_src = "";
     } else if (st == XZ_LISTENING) {
         snprintf(hint, sizeof(hint), "再次轻触结束");
     } else if (st == XZ_IDLE) {
-        snprintf(hint, sizeof(hint), "%s", ready ? "轻触说话 · 右滑返回" : "在 switchyard 打开语音");
+        snprintf(hint, sizeof(hint), "%s", ready ? "轻触说话 · 滑动翻页" : "在 switchyard 打开语音");
     } else {
-        snprintf(hint, sizeof(hint), "右滑返回");
+        snprintf(hint, sizeof(hint), "滑动翻页");
     }
 
     set_text_if(s_status, s_txt_status, sizeof(s_txt_status), face_text(st, ready));
-    set_text_if(s_sub, s_txt_sub, sizeof(s_txt_sub), sub);
+
+    /* 原文没变就不重新排版（fit_lines 要逐字测量） */
+    if (strcmp(s_sub_src, sub_src) != 0) {
+        snprintf(s_sub_src, sizeof(s_sub_src), "%s", sub_src);
+        char sub[SUB_MAX];
+        fit_lines(sub, sizeof(sub), sub_src, SUB_W, SUB_LINES);
+        set_text_if(s_sub, s_txt_sub, sizeof(s_txt_sub), sub);
+    }
+
     set_text_if(s_hint, s_txt_hint, sizeof(s_txt_hint), hint);
 }
 
 static void refresh(void)
 {
-    if (!s_open || s_page == NULL) {
+    if (!s_visible || s_page == NULL) {
         return;
     }
     const xz_state_t st = xiaozhi_state();
@@ -364,6 +433,11 @@ static void handle_tap(void)
 
 static void page_event_cb(lv_event_t *e)
 {
+    /* ui_home 给整棵控件树开了事件冒泡：只认落在页面/脸本身的触摸，
+       忽略"音频自检"按钮等子对象冒上来的事件（否则点按钮会顺手开麦）。 */
+    if (lv_event_get_target(e) != s_page) {
+        return;
+    }
     const lv_event_code_t code = lv_event_get_code(e);
     lv_indev_t *indev = lv_indev_active();
     if (indev == NULL) {
@@ -381,11 +455,10 @@ static void page_event_cb(lv_event_t *e)
         const int dx = p.x - s_press.x;
         const int dy = p.y - s_press.y;
         const int ady = (dy < 0) ? -dy : dy;
-        /* 右滑关闭（和主界面的滑动判定同一套思路：横向位移够大且比纵向大）*/
-        if (dx > 60 && dx > ady) {
+        /* 横向拖得够远（左右都算）：这是翻页手势，交给 ui_home 处理，
+           别再当成"轻触说话"（LVGL 在同对象上按下/抬起仍可能补一个 CLICKED）。 */
+        if (abs(dx) > 40 && abs(dx) > ady) {
             s_swiped = true;
-            ESP_LOGI(TAG, "右滑：关闭小智界面");
-            assistant_ui_close();
         }
         return;
     }
@@ -398,19 +471,11 @@ static void page_event_cb(lv_event_t *e)
     }
 }
 
-static void close_clicked_cb(lv_event_t *e)
-{
-    (void)e;
-    ESP_LOGI(TAG, "点关闭按钮");
-    assistant_ui_close();
-}
-
 static void page_delete_cb(lv_event_t *e)
 {
     (void)e;
     /* ui_home 重建界面时整棵控件树被删掉：指针必须清空，否则下次会踩野指针 */
     s_page = NULL;
-    s_close = NULL;
     s_dot = NULL;
     s_eye[0] = NULL;
     s_eye[1] = NULL;
@@ -421,18 +486,22 @@ static void page_delete_cb(lv_event_t *e)
     s_status = NULL;
     s_sub = NULL;
     s_hint = NULL;
-    s_open = false;
+    s_visible = false;
     s_face = (xz_state_t)-1;
+    s_txt_status[0] = '\0';
+    s_txt_sub[0] = '\0';
+    s_txt_hint[0] = '\0';
+    s_sub_src[0] = '\0';
     if (s_anim_timer != NULL) {
         lv_timer_pause(s_anim_timer);   /* 定时器不在对象树里，留着下次复用 */
     }
-    ESP_LOGW(TAG, "小智界面被界面重建移除（下次打开会重新创建）");
+    ESP_LOGW(TAG, "小智页被界面重建移除（下次 build 会重新创建）");
 }
 
 static void anim_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    if (!s_open || s_page == NULL) {
+    if (!s_visible || s_page == NULL) {
         return;
     }
 
@@ -441,7 +510,7 @@ static void anim_timer_cb(lv_timer_t *t)
         face_apply(st);
         refresh_text();
     } else if ((s_tick % 10) == 0) {
-        refresh_text();                /* 识别结果/激活码可能变了，500ms 看一次 */
+        refresh_text();                /* 识别结果/TTS 字幕/激活码可能变了，500ms 看一次 */
     }
 
     s_tick++;
@@ -455,59 +524,50 @@ static void anim_timer_cb(lv_timer_t *t)
 }
 
 /* ------------------------------------------------------------------------- */
-/* 创建                                                                       */
+/* 构建：把内容画进调用方给的页面（ui_home 的最后一页）                       */
 /* ------------------------------------------------------------------------- */
 
-static void create_ui(void)
+void assistant_ui_build(lv_obj_t *parent)
 {
-    lv_obj_t *scr = lv_screen_active();
-    if (scr == NULL) {
+    if (parent == NULL) {
+        ESP_LOGE(TAG, "小智页创建失败：parent 为空");
         return;
     }
+    if (s_page == parent) {
+        return;                     /* 同一页重复构建：什么都不用做 */
+    }
+    if (s_page != NULL) {
+        ESP_LOGW(TAG, "小智页：旧页面还没销毁就重建，先解绑（指针以新页为准）");
+    }
+    s_page = parent;
 
-    lv_obj_t *page = lv_obj_create(scr);
-    lv_obj_remove_style_all(page);
-    lv_obj_set_size(page, 360, 360);
-    lv_obj_set_pos(page, 0, 0);
-    lv_obj_set_style_bg_color(page, C_BG, 0);
-    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(page, 0, 0);
-    lv_obj_set_style_radius(page, 0, 0);
-    lv_obj_set_style_pad_all(page, 0, 0);
-    lv_obj_set_scrollable(page, false);
-    lv_obj_set_clickable(page, true);          /* 整页接轻触/滑动 */
-    lv_obj_add_event_cb(page, page_event_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(page, page_event_cb, LV_EVENT_RELEASED, NULL);
-    lv_obj_add_event_cb(page, page_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(page, page_delete_cb, LV_EVENT_DELETE, NULL);
-    lv_obj_set_hidden(page, true);
-    s_page = page;
-
-    /* 顶部关闭按钮：圆屏顶上 y<30 只有中间看得见，所以放顶部正中 */
-    s_close = lv_button_create(page);
-    lv_obj_remove_style_all(s_close);
-    lv_obj_set_size(s_close, 34, 34);
-    lv_obj_align(s_close, LV_ALIGN_TOP_MID, 0, 8);
-    lv_obj_set_style_radius(s_close, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_close, C_CHIP, 0);
-    lv_obj_set_style_bg_opa(s_close, LV_OPA_COVER, 0);
-    lv_obj_add_event_cb(s_close, close_clicked_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *x = lv_label_create(s_close);
-    lv_label_set_text(x, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_color(x, C_MUTED, 0);
-    lv_obj_center(x);
+    /* 父对象归我们布置：纯白底、正好 360x360、铺满、整页接触摸 */
+    lv_obj_remove_style_all(parent);
+    lv_obj_set_size(parent, 360, 360);
+    lv_obj_set_pos(parent, 0, 0);
+    lv_obj_set_style_bg_color(parent, C_BG, 0);
+    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(parent, 0, 0);
+    lv_obj_set_style_radius(parent, 0, 0);
+    lv_obj_set_style_pad_all(parent, 0, 0);
+    lv_obj_set_scrollable(parent, false);
+    lv_obj_set_clickable(parent, true);          /* 整页接轻触/滑动 */
+    lv_obj_add_event_cb(parent, page_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(parent, page_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(parent, page_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(parent, page_delete_cb, LV_EVENT_DELETE, NULL);
 
     /* 录音指示点（聆听时呼吸）*/
-    s_dot = make_block(page, 12, 12, C_ACCENT, LV_RADIUS_CIRCLE);
+    s_dot = make_block(parent, 12, 12, C_ACCENT, LV_RADIUS_CIRCLE);
     lv_obj_set_pos(s_dot, 174, 88);
 
     /* 两只眼睛 */
-    s_eye[0] = make_block(page, 36, 46, C_INK, 16);
-    s_eye[1] = make_block(page, 36, 46, C_INK, 16);
+    s_eye[0] = make_block(parent, 36, 46, C_INK, 16);
+    s_eye[1] = make_block(parent, 36, 46, C_INK, 16);
     set_eyes(36, 46);
 
     /* 微笑：只画下半圈的一段弧 */
-    s_mouth_smile = lv_arc_create(page);
+    s_mouth_smile = lv_arc_create(parent);
     lv_obj_remove_style_all(s_mouth_smile);
     lv_obj_set_size(s_mouth_smile, 120, 120);
     lv_obj_set_pos(s_mouth_smile, MOUTH_CX - 60, 115);      /* 圆心约 (180,175) */
@@ -524,7 +584,7 @@ static void create_ui(void)
     lv_arc_set_angles(s_mouth_smile, 25, 155);              /* 下半圈 = 微笑 */
 
     /* 聆听时的小 "o" */
-    s_mouth_o = lv_obj_create(page);
+    s_mouth_o = lv_obj_create(parent);
     lv_obj_remove_style_all(s_mouth_o);
     lv_obj_set_size(s_mouth_o, 26, 26);
     lv_obj_set_pos(s_mouth_o, MOUTH_CX - 13, MOUTH_CY - 13);
@@ -536,11 +596,11 @@ static void create_ui(void)
     lv_obj_set_clickable(s_mouth_o, false);
 
     /* 说话的嘴（药丸块，改高度就是张嘴/闭嘴）*/
-    s_mouth_line = make_block(page, 44, 12, C_INK, LV_RADIUS_CIRCLE);
+    s_mouth_line = make_block(parent, 44, 12, C_INK, LV_RADIUS_CIRCLE);
     lv_obj_set_pos(s_mouth_line, MOUTH_CX - 22, MOUTH_CY - 6);
 
     /* 思考：一圈转动的弧 */
-    s_think_arc = lv_arc_create(page);
+    s_think_arc = lv_arc_create(parent);
     lv_obj_remove_style_all(s_think_arc);
     lv_obj_set_size(s_think_arc, 60, 60);
     lv_obj_set_pos(s_think_arc, MOUTH_CX - 30, MOUTH_CY - 30);
@@ -557,23 +617,38 @@ static void create_ui(void)
     lv_arc_set_bg_angles(s_think_arc, 0, 360);
     lv_arc_set_angles(s_think_arc, 0, 90);
 
-    /* 文字：状态 / 最近一句（或出错原因）/ 激活码或操作提示 */
-    s_status = make_label(page, C_INK, 300);
+    /* 文字：状态 / 小智说的话（或最近一句识别结果）/ 激活码或操作提示 */
+    s_status = make_label(parent, C_INK, 300, 0);
     lv_label_set_text(s_status, "待机");
     lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 236);
 
-    s_sub = make_label(page, C_MUTED, 280);
-    lv_obj_align(s_sub, LV_ALIGN_TOP_MID, 0, 260);
+    s_sub = make_label(parent, C_MUTED, SUB_W, lv_font_get_line_height(&lv_font_cjk16) * SUB_LINES);
+    lv_obj_align(s_sub, LV_ALIGN_TOP_MID, 0, 256);
 
-    s_hint = make_label(page, C_MUTED, 240);
-    lv_obj_align(s_hint, LV_ALIGN_TOP_MID, 0, 284);
+    s_hint = make_label(parent, C_MUTED, 240, 0);
+    lv_obj_align(s_hint, LV_ALIGN_TOP_MID, 0, 300);
 
     s_txt_status[0] = '\0';
     s_txt_sub[0] = '\0';
     s_txt_hint[0] = '\0';
+    s_sub_src[0] = '\0';
 
+    s_visible = false;              /* ui_home 建完会自动隐藏非当前页 */
     face_apply(XZ_IDLE);            /* 先把各部件的显隐摆好 */
     s_face = XZ_IDLE;
+
+    if (s_anim_timer == NULL) {
+        s_anim_timer = lv_timer_create(anim_timer_cb, ANIM_MS, NULL);
+    }
+    if (s_anim_timer != NULL) {
+        lv_timer_pause(s_anim_timer);   /* 还没翻到这一页：先不跑动画 */
+    }
+
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+    ESP_LOGI(TAG, "小智页已建好（最后一页）：LVGL 池空闲 %u/%u 字节（已用 %u%%），内部 RAM %u KB",
+             (unsigned)mon.free_size, (unsigned)mon.total_size, (unsigned)mon.used_pct,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -583,96 +658,61 @@ static void create_ui(void)
 void assistant_ui_open(void)
 {
     if (s_page == NULL) {
-        create_ui();
-        if (s_page == NULL) {
-            ESP_LOGE(TAG, "小智界面创建失败（内存不足）");
-            return;
-        }
-        lv_mem_monitor_t mon;
-        lv_mem_monitor(&mon);
-        ESP_LOGI(TAG, "小智界面已创建：LVGL 池空闲 %u/%u 字节（已用 %u%%），内部 RAM %u KB",
-                 (unsigned)mon.free_size, (unsigned)mon.total_size, (unsigned)mon.used_pct,
-                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
-    }
-
-    if (s_open) {
-        lv_obj_move_foreground(s_page);     /* 已经在：只置顶 */
+        ESP_LOGW(TAG, "小智页还没建好（布局未就绪或 voice.enabled=false），忽略打开命令");
         return;
     }
-
-    s_open = true;
-    lv_obj_set_hidden(s_page, false);
-    lv_obj_move_foreground(s_page);         /* 压在主界面所有页/子页之上 */
-
-    const xz_state_t st = xiaozhi_state();
-    face_apply(st);
-    refresh_text();
-
-    lv_obj_set_style_translate_x(s_page, 360, 0);   /* 从右滑入，和主界面翻页一致 */
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_page);
-    lv_anim_set_values(&a, 360, 0);
-    lv_anim_set_time(&a, 220);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&a, anim_translate_cb);
-    lv_anim_start(&a);
-
-    if (s_anim_timer == NULL) {
-        s_anim_timer = lv_timer_create(anim_timer_cb, ANIM_MS, NULL);
-    }
-    if (s_anim_timer != NULL) {
-        lv_timer_resume(s_anim_timer);
-    }
-
-    ESP_LOGI(TAG, "小智界面打开（状态：%s）", face_name(st));
-}
-
-static void close_done_cb(lv_anim_t *a)
-{
-    (void)a;
-    if (s_page == NULL || s_open) {
-        return;                 /* 动画期间又被打开了：别把新界面藏掉 */
-    }
-    lv_obj_set_hidden(s_page, true);
-    lv_obj_set_style_translate_x(s_page, 0, 0);
+    ui_home_goto_assistant();       /* 翻页；翻到后 ui_home 会回调 tick 刷新表情/文字 */
+    ESP_LOGI(TAG, "打开小智页（翻到最后一页，状态：%s）", face_name(xiaozhi_state()));
 }
 
 void assistant_ui_close(void)
 {
-    if (!s_open || s_page == NULL) {
+    if (s_page == NULL) {
+        ESP_LOGW(TAG, "小智页还没建好，忽略关闭命令");
         return;
     }
-    s_open = false;
-    if (s_anim_timer != NULL) {
-        lv_timer_pause(s_anim_timer);       /* 关着就不跑动画，省 CPU */
-    }
-
     /* 还在聆听：顺手关麦，别把麦克风留在后台 */
     if (xiaozhi_state() == XZ_LISTENING) {
         xiaozhi_listen_stop();
-        ESP_LOGI(TAG, "关闭界面时还在聆听，已请求关麦");
+        ESP_LOGI(TAG, "关闭小智页时还在聆听，已请求关麦");
     }
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_page);
-    lv_anim_set_values(&a, lv_obj_get_style_translate_x(s_page, 0), 360);
-    lv_anim_set_time(&a, 200);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
-    lv_anim_set_exec_cb(&a, anim_translate_cb);
-    lv_anim_set_completed_cb(&a, close_done_cb);
-    lv_anim_start(&a);
-
-    ESP_LOGI(TAG, "小智界面关闭");
+    ui_home_goto_first();
+    ESP_LOGI(TAG, "关闭小智页（回到第一页）");
 }
 
 bool assistant_ui_is_open(void)
 {
-    return s_open;
+    return s_visible;
 }
 
 void assistant_ui_tick(void)
 {
+    if (s_page == NULL) {
+        return;
+    }
+
+    /* 页面可见性由 ui_home 的翻页控制：可见才跑 50ms 表情动画 */
+    const bool visible = !lv_obj_is_hidden(s_page);
+    if (visible != s_visible) {
+        s_visible = visible;
+        if (visible) {
+            if (s_anim_timer != NULL) {
+                lv_timer_resume(s_anim_timer);
+            }
+            face_apply(xiaozhi_state());
+            refresh_text();
+            ESP_LOGI(TAG, "小智页可见：表情动画恢复（状态：%s）", face_name(s_face));
+        } else {
+            if (s_anim_timer != NULL) {
+                lv_timer_pause(s_anim_timer);
+            }
+            /* 离开这一页时如果还在聆听，顺手关麦（和以前离开悬浮页的行为一致）*/
+            if (xiaozhi_state() == XZ_LISTENING) {
+                xiaozhi_listen_stop();
+                ESP_LOGI(TAG, "离开小智页时还在聆听，已请求关麦");
+            }
+        }
+    }
+
     refresh();
 }

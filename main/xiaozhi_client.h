@@ -20,7 +20,7 @@
 /** 按布局配置启动/停止。endpoint 为空或 enabled=false 时停止。 */
 void xiaozhi_client_configure(bool enabled, const char *endpoint);
 
-/** 给语音页显示的一行状态文字（永远非 NULL）。 */
+/** 给小智助手页显示的一行状态文字（永远非 NULL）。 */
 const char *xiaozhi_client_status_text(void);
 
 /** 官方平台的激活码（空字符串表示无需激活）*/
@@ -65,5 +65,12 @@ void xiaozhi_listen_stop(void);
  * 返回的是内部快照，界面直接显示即可，别长期持有。
  */
 const char *xiaozhi_last_text(void);
+
+/**
+ * 最近一次服务端"要说的话"（tts 消息里的 text，最多 120 字节），永远非 NULL。
+ * 界面只在 XZ_SPEAKING 时显示它；下次开麦（listen start）会清空，
+ * 避免把上一轮的回复当成这一轮的。和 xiaozhi_last_text() 一样是内部快照。
+ */
+const char *xiaozhi_last_tts_text(void);
 
 #endif /* XIAOZHI_CLIENT_H */

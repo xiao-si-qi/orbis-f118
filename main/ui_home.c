@@ -1,9 +1,11 @@
 ﻿/**
- * 家庭控制屏界面：JSON 布局驱动 + 一个固件内置的「System」页。
+ * 家庭控制屏界面：JSON 布局驱动 + 固件内置的「System」页 + 「小智 AI」页。
  *
  * 页 0..N-1 来自 HA 的 /local/orbis/layout.json（每页最多 4 个 tile）；
- * 最后一页是固件自己画的系统页：固件版本 / Wi-Fi / IP / 运行时长 / 内存，
- * 以及「检查更新」按钮（拉 HA 上的 firmware.json，有新版本就下载并重启）。
+ * 倒数第二页是固件自己画的系统页：固件版本 / Wi-Fi / IP / 运行时长 / 内存，
+ * 以及「检查更新」按钮（拉 HA 上的 firmware.json，有新版本就下载并重启）；
+ * 最后一页是小智助手页（纯白底 + 会动的脸，内容由 assistant_ui.c 画进来，
+ * 布局里 voice.enabled=true 时才建）。翻页、旋钮、手势、圆点和其它页完全一样。
  */
 
 #include <math.h>
@@ -21,7 +23,7 @@
 #include "lvgl.h"
 
 #include "app_settings.h"
-#include "assistant_ui.h"   /* 语音页的「小智」按钮 + 500ms 定时器里的 assistant_ui_tick() */
+#include "assistant_ui.h"   /* 小智助手页（最后一页）的内容 + 500ms 定时器里的 tick */
 #include "bsp_board.h"      /* 新板 shim（引脚表 + bsp_display_set_backlight） */
 #include "ha_client.h"
 #include "layout.h"
@@ -30,8 +32,7 @@
 #include "battery.h"
 #include "bg_image.h"
 #include "ui_home.h"
-#include "voice_audio.h"    /* 语音页的「音频自检」按钮 */
-#include "xiaozhi_client.h" /* 小智服务端状态文字 */
+#include "voice_audio.h"    /* 小智页顶部「音频自检」按钮 */
 
 /* 旧工程用的是 lv_font_noto_18_cjk（LVGL 9.2 专用）；新工程只有 lv_font_cjk16
    （16px / 4bpp，GB2312 + ASCII，自带 montserrat_20 兜底）。 */
@@ -198,13 +199,14 @@ static bool is_status_page(int page)
     return s_layout_valid && page == s_json_pages;
 }
 
-/* 小智语音页：只有布局里 voice.enabled=true（见 layout.c 的 voice 段）时才会建这一页。
-   服务端地址同样来自布局，由 main.c 的 apply_cfg() 交给 xiaozhi_client_configure()。 */
-#define UI_VOICE_PAGE 1
+/* 小智助手页：只有布局里 voice.enabled=true（见 layout.c 的 voice 段）时才会建这一页，
+   并且永远是最后一页。服务端地址同样来自布局，由 main.c 的 apply_cfg() 交给
+   xiaozhi_client_configure()。 */
+#define UI_ASSISTANT_PAGE 1
 
-static bool is_voice_page(int page)
+static bool is_assistant_page(int page)
 {
-    return UI_VOICE_PAGE && s_layout_valid && s_layout.voice_enabled && page == s_json_pages + 1;
+    return UI_ASSISTANT_PAGE && s_layout_valid && s_layout.voice_enabled && page == s_json_pages + 1;
 }
 
 static const char *page_title(int page)
@@ -212,10 +214,19 @@ static const char *page_title(int page)
     if (is_status_page(page)) {
         return "System";
     }
-    if (is_voice_page(page)) {
+    if (is_assistant_page(page)) {
         return "小智 AI";
     }
     return s_layout.pages[page].name;
+}
+
+/* 小智页是纯白底：圆点要换成深色（当前页墨色、其它页浅灰），否则白底上看不见 */
+static lv_color_t dot_color(int cur_page, int dot)
+{
+    if (dot == cur_page) {
+        return is_assistant_page(cur_page) ? lv_color_hex(0x1C1C1E) : COLOR_TEXT;
+    }
+    return is_assistant_page(cur_page) ? lv_color_hex(0xC7C7CC) : lv_color_hex(0x3A3A3C);
 }
 
 /* ---------------- 翻页动画 ---------------- */
@@ -256,7 +267,7 @@ static void pages_apply_visibility(void)
             lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
         }
         if (s_dots[i]) {
-            lv_obj_set_style_bg_color(s_dots[i], (i == s_page) ? COLOR_TEXT : lv_color_hex(0x3A3A3C), 0);
+            lv_obj_set_style_bg_color(s_dots[i], dot_color(s_page, i), 0);
         }
     }
     if (s_title) {
@@ -297,7 +308,7 @@ static void show_page_dir(int page, int dir)
     /* 圆点 + 标题立刻更新，不跟着动画走 */
     for (int i = 0; i < s_page_count; i++) {
         if (s_dots[i]) {
-            lv_obj_set_style_bg_color(s_dots[i], (i == page) ? COLOR_TEXT : lv_color_hex(0x3A3A3C), 0);
+            lv_obj_set_style_bg_color(s_dots[i], dot_color(page, i), 0);
         }
     }
     if (s_title) {
@@ -340,6 +351,9 @@ static void show_page_dir(int page, int dir)
     } else {
         s_animating = false;
     }
+
+    /* 小智页只是普通一页：翻到/翻走都立刻启停它的表情动画（不必等 500ms 定时器）*/
+    assistant_ui_tick();
 }
 
 static void show_page(int page)
@@ -745,28 +759,36 @@ static void build_status_page(lv_obj_t *scr)
     s_pages[s_json_pages] = page;
 }
 
-static lv_obj_t *s_voice_lines[3];
-static lv_obj_t *s_voice_open_btn;
-static lv_obj_t *s_voice_test_btn;
-static lv_obj_t *s_voice_test_label;
+/* ---- 小智助手页（最后一页）的附加控件：音频自检 ---- */
+static lv_obj_t *s_selftest_label;
 
 /* 自检任务跑在独立任务里（录音 1.5s + 回放，不能阻塞 LVGL）。
-   约定和 net.c 一样：任务只写静态变量，LVGL 线程在 refresh_voice_page() 里读。 */
+   约定和 net.c 一样：任务只写静态变量，LVGL 线程在 refresh_selftest_label() 里读。 */
 static volatile int s_voice_test_state;   /* 0=空闲 1=请求中 2=完成 3=失败 */
-static int s_voice_test_hold;             /* 结果在页面上保留的轮数 */
 static int s_voice_test_peak;
-static int s_voice_test_rms;
+static uint32_t s_voice_test_until;       /* 结果在按钮上保留到什么时候（lv_tick） */
+static char s_selftest_shown[24];         /* 按钮当前文字（避免 500ms 重复重排） */
 
-#if UI_VOICE_PAGE
+#if UI_ASSISTANT_PAGE
 static void voice_test_task(void *arg)
 {
     (void)arg;
     int peak = 0, rms = 0;
     const int rc = voice_audio_selftest(&peak, &rms);
     s_voice_test_peak = peak;
-    s_voice_test_rms = rms;
     s_voice_test_state = (rc == 0) ? 2 : 3;
+    /* 按钮上只放峰值（宽度有限），峰值 + RMS 完整结果在日志里 */
+    ESP_LOGI(TAG, "音频自检结果：峰值 %d / RMS %d（%s）", peak, rms, rc == 0 ? "成功" : "失败");
     vTaskDelete(NULL);
+}
+
+static void selftest_set_label(const char *text)
+{
+    if (s_selftest_label == NULL || strcmp(s_selftest_shown, text) == 0) {
+        return;
+    }
+    snprintf(s_selftest_shown, sizeof(s_selftest_shown), "%s", text);
+    lv_label_set_text(s_selftest_label, text);
 }
 
 static void voice_test_btn_cb(lv_event_t *e)
@@ -776,8 +798,9 @@ static void voice_test_btn_cb(lv_event_t *e)
         return;                 /* 已经在跑了 */
     }
     s_voice_test_state = 1;
-    s_voice_test_hold = 0;
-    lv_label_set_text(s_voice_test_label, "录音中…");
+    s_voice_test_until = 0;
+    selftest_set_label("录音中…");
+    ESP_LOGI(TAG, "音频自检：开始录音");
     /* 音频只占一路 I2S + 少量 PSRAM，任务栈给 6 KB 足够 */
     if (xTaskCreate(voice_test_task, "audio_test", 6144, NULL, 4, NULL) != pdPASS) {
         s_voice_test_state = 3;
@@ -785,116 +808,89 @@ static void voice_test_btn_cb(lv_event_t *e)
     }
 }
 
-static void voice_open_assistant_cb(lv_event_t *e)
+/** 按钮文字跟着自检状态走：录音中… → 峰值 xxx（保留 5 秒）→ 音频自检。 */
+static void refresh_selftest_label(void)
 {
-    (void)e;
-    ESP_LOGI(TAG, "语音页：打开小智助手界面");
-    assistant_ui_open();
+    const int st = s_voice_test_state;
+    if (st == 1) {
+        selftest_set_label("录音中…");
+        return;
+    }
+    if (st == 2 || st == 3) {
+        if (s_voice_test_until == 0) {
+            s_voice_test_until = lv_tick_get() + 5000;     /* 500ms/轮 → 约 5 秒 */
+        }
+        if ((int32_t)(lv_tick_get() - s_voice_test_until) < 0) {
+            char buf[24];
+            if (st == 2) {
+                snprintf(buf, sizeof(buf), "峰值 %d", s_voice_test_peak);
+            } else {
+                snprintf(buf, sizeof(buf), "自检失败");
+            }
+            selftest_set_label(buf);
+            return;
+        }
+        s_voice_test_state = 0;         /* 5 秒到了：复位，下次还能点 */
+    }
+    selftest_set_label("音频自检");
 }
 
-static void build_voice_page(lv_obj_t *scr)
+/**
+ * 最后一页：小智助手页。
+ * 页面对象交给 assistant_ui_build() 布置（纯白底、360x360、整页接触摸/轻触说话），
+ * 这里只补一个「音频自检」小按钮——原来语音页底部的那个，挪到白页顶部（脸的上面）。
+ */
+static void build_assistant_page(lv_obj_t *scr)
 {
     lv_obj_t *page = lv_obj_create(scr);
     lv_obj_set_size(page, 360, 360);
     lv_obj_set_pos(page, 0, 0);
-    lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(page, 0, 0);
-    lv_obj_set_style_pad_all(page, 0, 0);
-    lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *card = lv_obj_create(page);
-    lv_obj_remove_style_all(card);
-    lv_obj_set_pos(card, 32, 88);
-    lv_obj_set_size(card, 296, 150);
-    lv_obj_set_style_bg_color(card, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(card, (lv_opa_t)(bg_image_card_opa_pct() * 255 / 100), 0);
-    lv_obj_set_style_radius(card, 22, 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_color(card, COLOR_BORDER, 0);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-
-    for (int i = 0; i < 3; i++) {
-        s_voice_lines[i] = lv_label_create(page);
-        lv_label_set_text(s_voice_lines[i], "--");
-        lv_obj_set_style_text_color(s_voice_lines[i], i == 0 ? COLOR_TEXT : COLOR_MUTED, 0);
-        lv_obj_set_style_text_font(s_voice_lines[i], &lv_font_cjk16, 0);
-        lv_obj_set_width(s_voice_lines[i], 264);
-        lv_obj_set_style_text_align(s_voice_lines[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(s_voice_lines[i], LV_ALIGN_TOP_MID, 0, 108 + i * 40);
-    }
-
-    /* 一排两个按钮：左「小智」（打开助手界面：白底会动的脸 + 触摸说话），
-       右「音频自检」（录 1.5s → 日志/按钮上出峰值与 RMS → 回放，走线路输出）。
-       圆屏下部收窄，两个 130 宽的按钮放在 y=250 刚好在安全带里。 */
-    s_voice_open_btn = lv_button_create(page);
-    lv_obj_set_size(s_voice_open_btn, 130, 40);
-    lv_obj_align(s_voice_open_btn, LV_ALIGN_TOP_MID, -70, 250);
-    lv_obj_set_style_bg_color(s_voice_open_btn, lv_color_white(), 0);
-    lv_obj_set_style_bg_opa(s_voice_open_btn, LV_OPA_90, 0);
-    lv_obj_set_style_radius(s_voice_open_btn, 14, 0);
-    lv_obj_add_event_cb(s_voice_open_btn, voice_open_assistant_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *open_label = lv_label_create(s_voice_open_btn);
-    lv_label_set_text(open_label, "小智");
-    lv_obj_set_style_text_font(open_label, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(open_label, lv_color_black(), 0);
-    lv_obj_center(open_label);
-
-    s_voice_test_btn = lv_button_create(page);
-    lv_obj_set_size(s_voice_test_btn, 130, 40);
-    lv_obj_align(s_voice_test_btn, LV_ALIGN_TOP_MID, 70, 250);
-    lv_obj_set_style_bg_color(s_voice_test_btn, COLOR_ACCENT, 0);
-    lv_obj_set_style_radius(s_voice_test_btn, 14, 0);
-    lv_obj_add_event_cb(s_voice_test_btn, voice_test_btn_cb, LV_EVENT_CLICKED, NULL);
-
-    s_voice_test_label = lv_label_create(s_voice_test_btn);
-    lv_label_set_text(s_voice_test_label, "音频自检");
-    lv_obj_set_style_text_font(s_voice_test_label, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_voice_test_label, COLOR_TEXT, 0);
-    lv_obj_center(s_voice_test_label);
-
     s_pages[s_json_pages + 1] = page;
-}
-#endif /* UI_VOICE_PAGE */
 
-/** 刷新语音页文字（配置变化或连接状态变化时调用）。 */
-static void refresh_voice_page(void)
+    assistant_ui_build(page);
+
+    lv_obj_t *btn = lv_button_create(page);
+    lv_obj_set_size(btn, 110, 30);
+    lv_obj_align(btn, LV_ALIGN_TOP_MID, -30, 26);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xF2F2F7), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, 15, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_add_event_cb(btn, voice_test_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    s_selftest_label = lv_label_create(btn);
+    lv_obj_set_style_text_font(s_selftest_label, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_selftest_label, lv_color_hex(0x3A3A3C), 0);
+    lv_obj_center(s_selftest_label);
+    s_selftest_shown[0] = '\0';
+    selftest_set_label("音频自检");
+}
+#endif /* UI_ASSISTANT_PAGE */
+
+/* ------------------------------------------------------------------------- */
+/* 小智页导航（MQTT assistant 命令用）                                        */
+/* ------------------------------------------------------------------------- */
+
+/** 翻到小智页（最后一页）。页面不存在（布局未就绪 / voice.enabled=false）时只记日志。 */
+void ui_home_goto_assistant(void)
 {
-    if (s_voice_lines[0] == NULL) {
+    if (s_page_count <= 0 || !is_assistant_page(s_json_pages + 1)) {
+        ESP_LOGW(TAG, "小智页不存在（布局未就绪或 voice.enabled=false），忽略翻页");
         return;
     }
-    lv_label_set_text(s_voice_lines[0], s_layout.voice_enabled ? "小智 AI 已启用" : "小智 AI 未启用");
+    ESP_LOGI(TAG, "翻到小智页：第 %d/%d 页", s_json_pages + 1, s_page_count);
+    show_page_dir(s_json_pages + 1, 1);
+}
 
-    const char *ep = s_layout.voice_endpoint;
-    char pretty[LAYOUT_VOICE_ENDPOINT_MAX];
-    snprintf(pretty, sizeof(pretty), "%s", ep[0] ? ep : "未配置服务端地址");
-    lv_label_set_text(s_voice_lines[1], pretty);
-
-    /* 第三行：自检结果优先（保留约 5 秒），其次是服务端状态文字 */
-    char status[96];
-    const int st = s_voice_test_state;
-    if (st == 1) {
-        snprintf(status, sizeof(status), "音频自检：录音中…");
-    } else if (st == 2 || st == 3) {
-        if (s_voice_test_hold == 0) {
-            s_voice_test_hold = 10;          /* 500ms/轮 → 约 5 秒 */
-        }
-        if (st == 2) {
-            snprintf(status, sizeof(status), "峰值 %d / RMS %d", s_voice_test_peak, s_voice_test_rms);
-        } else {
-            snprintf(status, sizeof(status), "音频自检失败（看日志）");
-        }
-        if (s_voice_test_hold == 1) {        /* 最后一轮：把状态和按钮文案复位 */
-            if (s_voice_test_label != NULL) {
-                lv_label_set_text(s_voice_test_label, "音频自检");
-            }
-            s_voice_test_state = 0;
-        }
-        s_voice_test_hold--;
-    } else {
-        snprintf(status, sizeof(status), "%s", xiaozhi_client_status_text());
+/** 回到第一页（MQTT 关闭小智页用）。 */
+void ui_home_goto_first(void)
+{
+    if (s_page_count <= 0) {
+        return;
     }
-    lv_label_set_text(s_voice_lines[2], status);
+    ESP_LOGI(TAG, "回到第一页");
+    show_page_dir(0, -1);
 }
 
 static void refresh_status_page(void)
@@ -1053,7 +1049,9 @@ static void refresh_timer_cb(lv_timer_t *t)
         chart_fail_result();
     }
 
-    refresh_voice_page();
+#if UI_ASSISTANT_PAGE
+    refresh_selftest_label();      /* 小智页顶部「音频自检」按钮的文字/结果 */
+#endif
     if (s_detail_visible) {
         detail_apply_entity();     /* 子页数值跟着轮询刷新 */
     }
@@ -2117,16 +2115,14 @@ static void build_ui(void)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_page_tiles, 0, sizeof(s_page_tiles));
     memset(s_sys_lines, 0, sizeof(s_sys_lines));
-    memset(s_voice_lines, 0, sizeof(s_voice_lines));
-    s_voice_open_btn = NULL;
-    s_voice_test_btn = NULL;
-    s_voice_test_label = NULL;
+    s_selftest_label = NULL;
+    s_selftest_shown[0] = '\0';
 
     s_json_pages = s_layout.page_count;
     s_page_count = s_json_pages + 1; /* 加 System 页 */
-#if UI_VOICE_PAGE
+#if UI_ASSISTANT_PAGE
     if (s_layout_valid && s_layout.voice_enabled) {
-        s_page_count++;              /* 再加小智 AI 页 */
+        s_page_count++;              /* 再加小智助手页（最后一页） */
     }
 #endif
     s_title = NULL;
@@ -2200,9 +2196,9 @@ static void build_ui(void)
 
     /* System 页 */
     build_status_page(scr);
-#if UI_VOICE_PAGE
+#if UI_ASSISTANT_PAGE
     if (s_layout_valid && s_layout.voice_enabled) {
-        build_voice_page(scr);
+        build_assistant_page(scr);          /* 最后一页：白底小智页 */
     }
 #endif
 
@@ -2255,10 +2251,11 @@ static void build_ui(void)
     if (s_page < 0) {
         s_page = 0;
     }
-    refresh_voice_page();
     pages_apply_visibility();
+    assistant_ui_tick();             /* 小智页如果是当前页，立刻恢复表情动画 */
     s_animating = false;
-    ESP_LOGI(TAG, "UI built: %d page(s) + system", s_json_pages);
+    ESP_LOGI(TAG, "UI built: %d page(s) + system（小智页：%s），共 %d 页",
+             s_json_pages, is_assistant_page(s_json_pages + 1) ? "有" : "无", s_page_count);
 
     build_detail_view(scr);
     s_detail_visible = false;

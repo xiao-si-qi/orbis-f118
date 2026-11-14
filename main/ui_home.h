@@ -12,6 +12,12 @@ void ui_home_boot(void);
 /** 旋钮翻页：delta>0 下一页，delta<0 上一页（子页面打开时忽略） */
 void ui_home_page_step(int delta);
 
+/** 翻到最后一页（小智助手页）。页面不存在时只记日志。MQTT assistant 命令用。 */
+void ui_home_goto_assistant(void);
+
+/** 翻回第一页（MQTT 关闭小智页用）。 */
+void ui_home_goto_first(void);
+
 /** 用布局重建界面（可在任意任务调用，内部切回 LVGL 上下文）。 */
 void ui_home_apply(const layout_t *layout);
 

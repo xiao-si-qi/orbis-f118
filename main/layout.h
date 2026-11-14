@@ -34,7 +34,7 @@ typedef struct {
 typedef struct {
     char title[24];
     int rotation;      /* 屏幕方向 0/90/180/270，来自布局 JSON 的 rotation 字段 */
-    int voice_enabled; /* 小智 AI 语音页是否启用 */
+    int voice_enabled; /* 小智 AI 助手页（最后一页）是否启用 */
     char voice_endpoint[LAYOUT_VOICE_ENDPOINT_MAX]; /* 小智服务端（OTA/发现接口）*/      /* 屏幕方向 0/90/180/270，来自布局 JSON 的 rotation 字段 */
     int page_count;
     layout_page_t pages[LAYOUT_MAX_PAGES];

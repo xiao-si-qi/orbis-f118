@@ -62,6 +62,7 @@ static const char *TAG = "xiaozhi";
 #define XZ_STATUS_MAX   72
 #define XZ_NOTE_MAX     40
 #define XZ_TEXT_MAX     96      /* 界面显示的"最近一句"上限（字节）*/
+#define XZ_TTS_MAX      120     /* 界面显示的"小智说的话"上限（字节，UTF-8 安全截断）*/
 #define XZ_DISCOVER_MAX (24 * 1024)
 #define XZ_WS_BUF       768     /* 文本帧累积缓冲：hello/stt/llm 的 JSON 可能上百字节 */
 
@@ -114,6 +115,11 @@ static char s_last_text[XZ_TEXT_MAX + 1];
 static char s_text_snap[XZ_TEXT_MAX + 1];
 static portMUX_TYPE s_text_mux = portMUX_INITIALIZER_UNLOCKED;
 
+/* 最近一次 tts 文本（服务端要说的话）：写读规则同 stt，只是缓冲大一点。
+   只在 XZ_SPEAKING 时显示，所以不会占着屏幕不放。 */
+static char s_last_tts[XZ_TTS_MAX + 1];
+static char s_tts_snap[XZ_TTS_MAX + 1];
+
 /* hello 可能被分片，这里做个小累积缓冲 */
 static char s_rx[XZ_WS_BUF];
 static size_t s_rx_len;
@@ -127,7 +133,6 @@ static bool s_first_frame_logged;
 enum { XZ_ST_IDLE = 0, XZ_ST_LISTEN, XZ_ST_THINK, XZ_ST_SPEAK };
 
 static volatile bool s_uplink;          /* 允许上行（麦克风）*/
-static volatile bool s_pending_listen;  /* 连上后要发一次 listen start */
 static volatile bool s_tts_active;      /* 服务端说 tts 还没结束 */
 static volatile bool s_stream_stop = true;
 static volatile bool s_sender_alive;
@@ -221,6 +226,17 @@ static void set_last_text(const char *text)
     }
     taskENTER_CRITICAL(&s_text_mux);
     utf8_copy(s_last_text, sizeof(s_last_text), text);
+    taskEXIT_CRITICAL(&s_text_mux);
+}
+
+/** 记下服务端这轮要说的话（120 字节封顶，界面在"正在说话"时显示）。 */
+static void set_last_tts(const char *text)
+{
+    if (text == NULL) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_text_mux);
+    utf8_copy(s_last_tts, sizeof(s_last_tts), text);
     taskEXIT_CRITICAL(&s_text_mux);
 }
 
@@ -539,8 +555,7 @@ static int stream_send_text(const char *json)
 
 /**
  * 发一条 listen start/stop。
- * start 带 mode=auto（和原来的自动流程一字不差，服务端自己 VAD 收尾）；
- * stop 不带 mode：手动关麦时服务端只要一个 state。
+ * start 带 mode=auto（服务端自己 VAD 收尾）；stop 不带 mode：手动关麦时服务端只要一个 state。
  * 只在音频任务里调用（会阻塞等网络），界面线程绝不能直接调。
  */
 static bool send_listen(const char *state, bool with_mode)
@@ -581,8 +596,7 @@ static void stream_start(void)
     }
     xSemaphoreTake(s_stream_lock, portMAX_DELAY);
     s_stream_stop = false;
-    s_uplink = false;
-    s_pending_listen = true;
+    s_uplink = false;               /* 不自动开麦：等界面「轻触说话」再发 listen start */
     s_tts_active = false;
     if (!s_sender_alive) {
         s_sender_alive = true;      /* 先占位，任务里不再重复置位 */
@@ -614,7 +628,6 @@ static void stream_set_stop(void)
         s_stream_stop = true;
     }
     s_uplink = false;
-    s_pending_listen = false;
     s_tts_active = false;
     s_listen_req = 0;           /* 连接断了：丢掉界面还没被消费的开/关麦请求 */
     xz_think_clear();
@@ -688,22 +701,11 @@ static void xz_sender_task(void *arg)
     int64_t stat_at = esp_timer_get_time();
 
     while (stream_keep_running(&s_sender_alive)) {
-        /* 连上后先替服务端开麦（小智协议：listen start 由设备发起，auto 由服务端 VAD 收尾） */
-        if (s_pending_listen && s_ready) {
-            s_pending_listen = false;
-            if (send_listen("start", true)) {
-                ESP_LOGI(TAG, "已发送 listen start（auto），开始上行");
-                s_uplink = true;
-                xz_think_clear();
-                xz_set_state(XZ_ST_LISTEN);
-            } else {
-                ESP_LOGW(TAG, "listen start 发送失败，1 秒后重试");
-                s_pending_listen = true;
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-        }
+        /* 注意：连上服务端后不自动开麦。上行只由界面「轻触说话」
+           （xiaozhi_listen_start）或服务端 listen start 消息来打开，
+           否则页一出来就在"正在聆听"，麦克风也一直开着。 */
 
-        /* 界面「轻触说话」的手动开/关麦：和自动流程走同一条 listen 消息。
+        /* 界面「轻触说话」的手动开/关麦：和原来走同一条 listen 消息。
            发送放在音频任务里做，LVGL 线程只置 s_listen_req，绝不在界面线程里等网络。 */
         const int req = s_listen_req;
         if (req != 0 && s_ready) {
@@ -711,7 +713,6 @@ static void xz_sender_task(void *arg)
             if (req == 1) {
                 if (send_listen("start", true)) {
                     ESP_LOGI(TAG, "手动：已发送 listen start，开始上行");
-                    s_pending_listen = false;       /* 别让自动流程再发一次 */
                     s_uplink = true;
                     xz_think_clear();
                     xz_set_state(XZ_ST_LISTEN);
@@ -1012,7 +1013,7 @@ static void handle_server_hello(const cJSON *root)
     s_error = false;
     xz_think_clear();
     set_status("已连接");
-    stream_start();          /* 起编解码任务；listen start 由上行任务发 */
+    stream_start();          /* 起编解码任务（上下行都靠它；开麦等界面点了才发） */
 }
 
 static void handle_text_message(const char *json)
@@ -1038,13 +1039,19 @@ static void handle_text_message(const char *json)
 
     } else if (strcmp(t, "listen") == 0) {
         if (strcmp(st, "start") == 0) {
-            /* 开麦：先把没放完的回复丢掉，避免麦克风听见自己的喇叭声 */
-            play_flush(false);
-            s_tts_active = false;
-            s_uplink = true;
-            xz_think_clear();
-            xz_set_state(XZ_ST_LISTEN);
-            ESP_LOGI(TAG, "服务端：开始聆听");
+            /* 服务端确认开始聆听。麦克风只由界面轻触（xiaozhi_listen_start()）打开：
+               这里不再置 s_uplink，否则服务端一句 listen start 就能把麦打开，
+               又变回"自动聆听"了。没等我们请求就来的，只记日志不认。 */
+            if (s_uplink) {
+                play_flush(false);     /* 先把没放完的回复丢掉，避免麦克风听见喇叭声 */
+                s_tts_active = false;
+                set_last_tts("");      /* 新一轮开始：上一轮的回复字幕作废 */
+                xz_think_clear();
+                xz_set_state(XZ_ST_LISTEN);
+                ESP_LOGI(TAG, "服务端：确认开始聆听");
+            } else {
+                ESP_LOGW(TAG, "服务端要求开麦，但设备没有轻触请求，忽略（只认轻触说话）");
+            }
         } else {
             s_uplink = false;
             if (s_ready) {
@@ -1057,6 +1064,13 @@ static void handle_text_message(const char *json)
         }
 
     } else if (strcmp(t, "tts") == 0) {
+        /* 字幕：sentence_start 带整句 text，有的服务端在 start 里也带一份。
+           先记下来，界面在"正在说话"时显示（和音频播放互不影响）。 */
+        const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
+        if (cJSON_IsString(text) && text->valuestring[0] != '\0') {
+            ESP_LOGI(TAG, "小智说：%.120s", text->valuestring);
+            set_last_tts(text->valuestring);
+        }
         if (strcmp(st, "start") == 0) {
             s_uplink = false;              /* 半双工：放音时不发麦克风 */
             s_tts_active = true;
@@ -1071,7 +1085,7 @@ static void handle_text_message(const char *json)
             }
             ESP_LOGI(TAG, "服务端：TTS 结束");
         } else if (strcmp(st, "sentence_start") == 0) {
-            /* 只是字幕，忽略 */
+            /* 字幕已在上面记过，这里不用再处理 */
         }
 
     } else if (strcmp(t, "abort") == 0) {
@@ -1438,4 +1452,12 @@ const char *xiaozhi_last_text(void)
     memcpy(s_text_snap, s_last_text, sizeof(s_text_snap));
     taskEXIT_CRITICAL(&s_text_mux);
     return s_text_snap;
+}
+
+const char *xiaozhi_last_tts_text(void)
+{
+    taskENTER_CRITICAL(&s_text_mux);
+    memcpy(s_tts_snap, s_last_tts, sizeof(s_tts_snap));
+    taskEXIT_CRITICAL(&s_text_mux);
+    return s_tts_snap;
 }
