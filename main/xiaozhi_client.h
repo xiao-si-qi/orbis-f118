@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file xiaozhi_client.h
  * @brief 小智 AI 服务端接入（OTA 发现 + WebSocket 握手 + Opus 音频双向流）。
  *
@@ -22,6 +22,9 @@ void xiaozhi_client_configure(bool enabled, const char *endpoint);
 
 /** 给语音页显示的一行状态文字（永远非 NULL）。 */
 const char *xiaozhi_client_status_text(void);
+
+/** 官方平台的激活码（空字符串表示无需激活）*/
+const char *xiaozhi_activation_code(void);
 
 /** 是否已连上服务端（hello 完成）。 */
 bool xiaozhi_client_ready(void);

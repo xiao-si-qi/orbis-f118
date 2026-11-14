@@ -93,6 +93,7 @@ static char s_client_id[40];
 static char s_device_id[24];
 static char s_status[XZ_STATUS_MAX];
 static char s_note[XZ_NOTE_MAX];
+static char s_activation[16];      /* 官方平台激活码（显示给用户）*/
 static char s_session[40];
 
 static volatile bool s_ready;
@@ -271,6 +272,31 @@ static bool discover_ws_url(void)
     bool ok = false;
     cJSON *root = cJSON_Parse(buf);
     if (root != NULL) {
+        /* 首次连接官方平台时不会直接给 websocket，而是给激活码：
+           {"activation":{"code":"123456","message":"...","challenge":"..."}}
+           设备要把 code 显示出来，用户在 xiaozhi.me 控制台绑定后才会下发 websocket。 */
+        const cJSON *act = cJSON_GetObjectItemCaseSensitive(root, "activation");
+        if (cJSON_IsObject(act)) {
+            const cJSON *acode = cJSON_GetObjectItemCaseSensitive(act, "code");
+            const cJSON *amsg = cJSON_GetObjectItemCaseSensitive(act, "message");
+            const char *code = cJSON_IsString(acode) ? acode->valuestring : NULL;
+            if (code != NULL && code[0] != '\0') {
+                snprintf(s_activation, sizeof(s_activation), "%s", code);
+                ESP_LOGW(TAG, "需要激活，激活码 %s", s_activation);
+                if (cJSON_IsString(amsg)) {
+                    ESP_LOGW(TAG, "服务端提示: %s", amsg->valuestring);
+                }
+                {
+                    char hint[32];
+                    snprintf(hint, sizeof(hint), "待激活 %s", s_activation);
+                    set_status(hint);
+                }
+                cJSON_Delete(root);
+                free(buf);
+                return false;      /* 交给重试循环：绑定后再取 websocket */
+            }
+        }
+
         const cJSON *ws = cJSON_GetObjectItemCaseSensitive(root, "websocket");
         const cJSON *url = cJSON_IsObject(ws) ? cJSON_GetObjectItemCaseSensitive(ws, "url") : NULL;
         if (cJSON_IsString(url) && url->valuestring[0] != '\0') {
@@ -1199,6 +1225,11 @@ void xiaozhi_client_configure(bool enabled, const char *endpoint)
         s_enabled = false;
         snprintf(s_status, sizeof(s_status), "任务创建失败");
     }
+}
+
+const char *xiaozhi_activation_code(void)
+{
+    return s_activation;
 }
 
 const char *xiaozhi_client_status_text(void)
