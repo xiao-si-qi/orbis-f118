@@ -17,6 +17,8 @@
 
 LV_FONT_DECLARE(lv_font_cjk16);
 #include "net.h"
+#include "detail.h"
+#include "bg_image.h"
 
 
 static const char *TAG = "orbis-f118";
@@ -309,12 +311,7 @@ static void card_clicked_cb(lv_event_t *e)
     if (c == NULL) return;
     haptic_click();
     if (c->toggle) {
-        const char *svc = "toggle";
-        const ha_entity_t *ent = ha_client_find(c->entity);
-        if (ent != NULL && ent->on) svc = "turn_off";
-        else if (ent != NULL && !ent->on) svc = "turn_on";
-        ESP_LOGI(TAG, "点击 %s -> %s", c->entity, svc);
-        ha_client_action(c->entity, svc);
+        detail_open(c->entity);          /* 灯：打开详情页（开关/亮度/色温） */
     } else {
         ESP_LOGI(TAG, "点击 %s（仅显示）", c->entity);
     }
@@ -325,8 +322,8 @@ static lv_obj_t *make_card(lv_obj_t *scr, int x, int y, const char *name, card_t
     lv_obj_t *card = lv_obj_create(scr);
     lv_obj_set_size(card, 150, 100);
     lv_obj_set_pos(card, x, y);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0x141418), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(card, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(card, (lv_opa_t)(255 * 62 / 100), 0);   /* 黑色半透明，透出背景图 */
     lv_obj_set_style_radius(card, 18, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_pad_all(card, 12, 0);
@@ -376,15 +373,16 @@ static void update_statusbar(void)
 {
     if (s_bat_label) {
         const int mv = s_bat_mv;
-        if (mv > 2500) {
+        /* 只显示合理范围（3.0–4.3 V）——GPIO55 目前读到的是饱和值，不要误导 */
+        if (mv >= 3000 && mv <= 4300) {
             int pct = (mv - 3200) * 100 / (4200 - 3200);
             if (pct < 0) pct = 0;
             if (pct > 100) pct = 100;
-            lv_label_set_text_fmt(s_bat_label, "%d.%01dV %d%%", mv / 1000, (mv % 1000) / 100, pct);
+            lv_label_set_text_fmt(s_bat_label, "%d.%02dV %d%%", mv / 1000, (mv % 1000) / 10, pct);
             lv_obj_set_style_text_color(s_bat_label,
                 pct > 30 ? lv_color_hex(0x30D158) : lv_color_hex(0xFF453A), 0);
         } else {
-            lv_label_set_text(s_bat_label, "no bat");
+            lv_label_set_text(s_bat_label, "");
         }
     }
     int level = 0;
@@ -408,6 +406,8 @@ static void ui_timer_cb(lv_timer_t *t)
 {
     (void)t;
     update_cards();
+    update_statusbar();
+    detail_refresh();
 }
 
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
@@ -429,8 +429,8 @@ static void build_cards_ui(void)
     /* ---- 顶部状态栏：HA 点 / WiFi 信号格 / 电池 ---- */
     lv_obj_t *bar = lv_obj_create(scr);
     lv_obj_remove_style_all(bar);
-    lv_obj_set_size(bar, 230, 24);
-    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 46);
+    lv_obj_set_size(bar, 190, 24);
+    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 44);
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
     s_ha_dot = lv_obj_create(bar);
@@ -454,14 +454,14 @@ static void build_cards_ui(void)
         lv_obj_set_style_bg_color(s_rssi_bars[i], lv_color_hex(0x3A3A3C), 0);
         lv_obj_set_style_bg_opa(s_rssi_bars[i], LV_OPA_COVER, 0);
         lv_obj_set_style_radius(s_rssi_bars[i], 1, 0);
-        lv_obj_align(s_rssi_bars[i], LV_ALIGN_LEFT_MID, 108 + i * 8, 4);
+        lv_obj_align(s_rssi_bars[i], LV_ALIGN_LEFT_MID, 78 + i * 8, 4);
     }
 
     s_bat_label = lv_label_create(bar);
     lv_label_set_text(s_bat_label, "---");
     lv_obj_set_style_text_font(s_bat_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_bat_label, lv_color_hex(0x8E8E93), 0);
-    lv_obj_align(s_bat_label, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_align(s_bat_label, LV_ALIGN_RIGHT_MID, -2, 0);
 
     const int x0 = 22, y0 = 84, gap = 14;
     for (int i = 0; i < CARD_COUNT; i++) {
@@ -491,7 +491,19 @@ void app_main(void)
     xTaskCreate(battery_task, "bat", 4096, NULL, 3, NULL);
     net_wifi_start();
     net_mqtt_start();
+    bg_image_init();
     build_cards_ui();
+    bg_image_bind(lv_screen_active());
+    {
+        static const char *bg_json =
+            "{\"bg\":{\"images\":["
+            "\"https://ha.xiaosiqi.cn/local/switchyard/orbis/bg/1.jpg\","
+            "\"https://ha.xiaosiqi.cn/local/switchyard/orbis/bg/2.jpg\","
+            "\"https://ha.xiaosiqi.cn/local/switchyard/orbis/bg/3.jpg\"],"
+            "\"interval\":20,\"dim\":65,\"card\":60}}";
+        bg_image_apply_json(bg_json);
+        ESP_LOGI(TAG, "背景图配置已应用");
+    }
 
     /* 等 WiFi 连上再初始化 HA */
     for (int i = 0; i < 60 && !net_wifi_connected(); i++) vTaskDelay(pdMS_TO_TICKS(500));
@@ -514,7 +526,7 @@ void app_main(void)
             if (last_beat % 5 == 0) {
                 net_mqtt_tick();
                 net_mqtt_publish_state();
-                ESP_LOGI(TAG, "网络: wifi=%d rssi=%d mqtt=%d", net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
+                ESP_LOGI(TAG, "电池: %d mV | 网络: wifi=%d rssi=%d mqtt=%d", s_bat_mv, net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
                 ESP_LOGI(TAG, "心跳 %u s，内部 RAM %u KB，PSRAM %u KB",
                          last_beat,
                          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
