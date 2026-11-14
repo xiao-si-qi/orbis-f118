@@ -1,4 +1,4 @@
-﻿#include <string.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
@@ -262,6 +262,12 @@ void net_mqtt_publish_state(void)
              APP_FW_VERSION,
              (unsigned)(esp_get_free_heap_size() / 1024), ota_percent(),
              net_ip_string());
+
+    /* QoS0 + retain：状态每 5 秒一次，不需要确认，省 outbox 内存 */
+    const int mid = esp_mqtt_client_publish(s_mqtt, t, payload, 0, 0, 1);
+    if (mid < 0) {
+        ESP_LOGW(TAG, "state 发布失败（返回 %d）", mid);
+    }
 }
 
 bool net_take_cfg(char *out, size_t len)
