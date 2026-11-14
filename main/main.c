@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -75,32 +76,38 @@ static i2c_master_dev_handle_t s_touch;
 /* 厂商初始化表（类型由 esp_lcd_st77916.h 提供）*/
 #include "lcd_init_commands.h"
 
+/* ---- 显示刷新：同步等待完成 ----
+   曾经试过异步（完成回调里直接调 lv_display_flush_ready）：花屏，
+   因为 LVGL 不是 ISR 安全的，且上一块没传完就提交下一块会错位。
+   现在回到同步：提交后等完成标志（1 ms 粒度），另有 200 ms 兜底。 */
 static volatile bool s_flush_done;
+static volatile uint32_t s_flush_count;      /* 每秒 flush 块数，用来算 FPS */
 
 static bool on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *ed, void *ctx)
 {
-    (void)io;
-    (void)ed;
-    (void)ctx;
-    s_flush_done = true;      /* 由 lv_flush_cb 等待后统一通知 LVGL */
+    (void)io; (void)ed; (void)ctx;
+    s_flush_done = true;
     return false;
 }
 
 static void lv_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    /* 同步等待本块传输完成再通知 LVGL：
-       异步回调一旦丢一次，LVGL 会死等 flushing 标志（实测卡在 wait_for_flushing）。 */
     s_flush_done = false;
     esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, px_map);
 
-    const int64_t deadline = esp_timer_get_time() + 200 * 1000;   /* 200 ms 兜底 */
+
+    /* 不要用 vTaskDelay(1)：整屏 23 块 × 1 ms ≈ 23 ms，比传输本身还慢。
+       一块 16 行在 80 MHz 四线约 0.29 ms，用 20 µs 粒度自旋即可。 */
+    const int64_t deadline = esp_timer_get_time() + 200 * 1000;
     while (!s_flush_done && esp_timer_get_time() < deadline) {
-        vTaskDelay(1);
+        esp_rom_delay_us(20);
     }
     s_flush_done = false;
+    s_flush_count++;
     lv_display_flush_ready(disp);
 }
 
+static void flush_watchdog(void) { }   /* 同步模式下不需要 */
 static uint32_t tick_cb(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
@@ -134,7 +141,7 @@ static void lcd_init(void)
     esp_lcd_panel_io_handle_t io = NULL;
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .cs_gpio_num = PIN_CS, .dc_gpio_num = -1, .spi_mode = 0,
-        .pclk_hz = 40 * 1000 * 1000, .trans_queue_depth = 10,
+        .pclk_hz = 80 * 1000 * 1000,   /* 厂家 BSP 值：四线 40 MB/s；花屏真因是无显示对象，与时钟无关 */ .trans_queue_depth = 10,
         .lcd_cmd_bits = 32, .lcd_param_bits = 8,
         .on_color_trans_done = on_color_done,
         .flags.quad_mode = 1,
@@ -165,10 +172,19 @@ static void lvgl_init(void)
     lv_init();
     lv_tick_set_cb(tick_cb);
 
+    /* 必须先建「显示」：lv_screen_active() 取的是默认显示的活动屏幕，
+       没有 display 时它就是 NULL，之后每一次 lv_obj_create(scr) 都会在
+       "父对象为 NULL → 找不到默认显示" 这一步失败并返回 NULL。
+       这时 LVGL 池其实几乎全空，看起来却像"内存不足"，很容易误判。 */
+    s_disp = lv_display_create(LCD_W, LCD_H);
+    if (s_disp == NULL) {
+        ESP_LOGE(TAG, "LVGL display 创建失败（内存不足），界面无法显示");
+        return;
+    }
+
     const size_t buf_bytes = LCD_W * 16 * sizeof(lv_color_t);   /* 16 行：SPI 需要等量的内部 DMA 中转缓冲，块越小越安全 */
     void *b1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
     void *b2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
-    s_disp = lv_display_create(LCD_W, LCD_H);
     lv_display_set_flush_cb(s_disp, lv_flush_cb);
     /* 面板要 RGB565 大端，LVGL 默认小端：显式声明字节交换 */
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
@@ -357,10 +373,16 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     /* 小智助手页现在只是主界面的最后一页（不再是悬浮二级页）：
        旋钮在它上面照常翻页，所以这里不再做避让。 */
     const int8_t diff = encoder_read_diff();
-    /* 旋钮翻页：顺时针（实测 diff<0）下一页，每格一次触觉反馈 */
+    /* 旋钮：顺时针（实测 diff<0）= 下一页 / 调大。
+       灯详情页开着时先交给它调亮度/色温（只有真正调了值才响一下）；
+       灯关着或手指正按着滑条时它返回 false，而详情页开着就不翻页、也不震动。 */
     if (diff != 0) {
-        ui_home_page_step(diff < 0 ? 1 : -1);
-        haptic_click();
+        if (ui_home_detail_knob(diff < 0 ? 1 : -1)) {
+            haptic_click();          /* 调了一格：一次触觉 */
+        } else if (!ui_home_detail_open()) {
+            ui_home_page_step(diff < 0 ? 1 : -1);
+            haptic_click();
+        }
     }
     data->enc_diff = 0;              /* 不交给 LVGL 组导航（ui_home 没有键盘组） */
     data->state = LV_INDEV_STATE_RELEASED;
@@ -681,6 +703,7 @@ void app_main(void)
 
     uint32_t last_beat = 0;
     while (1) {
+        flush_watchdog();
         uint32_t d = lv_timer_handler();
         net_mqtt_tick();          /* 连上后立刻发布 meta 并订阅，不等心跳 */
 
@@ -712,6 +735,25 @@ void app_main(void)
             if (last_beat % 5 == 0) {
                 net_mqtt_publish_state();
                 ESP_LOGI(TAG, "电池原始值: %d | 网络: wifi=%d rssi=%d mqtt=%d", s_bat_raw, net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
+                {
+                    lv_mem_monitor_t mon;
+                    lv_mem_monitor(&mon);
+                    ESP_LOGI(TAG, "LVGL 池: 空闲 %u/%u 字节, 最大块 %u, 碎片 %u%%",
+                             (unsigned)mon.free_size, (unsigned)mon.total_size,
+                             (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct);
+                }
+                {
+                    static uint32_t last_cnt, last_us;
+                    const uint32_t cnt = s_flush_count;
+                    const uint32_t now_us = (uint32_t)esp_timer_get_time();
+                    const uint32_t flush_blocks = cnt - last_cnt;
+                    const uint32_t dt_us = (last_us ? (now_us - last_us) : 5000000U);
+                    last_cnt = cnt; last_us = now_us;
+                    /* 每块 16 行 → 整屏 23 块；块/秒 ÷ 23 = 整屏帧率 */
+                    const uint32_t blocks_per_s = dt_us ? (uint32_t)((uint64_t)flush_blocks * 1000000ULL / dt_us) : 0;
+                    ESP_LOGI(TAG, "刷新: %u 块/秒 ≈ %u fps（16 行/块，80 MHz）",
+                             (unsigned)blocks_per_s, (unsigned)(blocks_per_s * 10 / 23 / 10));
+                }
                 ESP_LOGI(TAG, "心跳 %u s，内部 RAM %u KB，PSRAM %u KB",
                          last_beat,
                          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),

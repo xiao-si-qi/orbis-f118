@@ -46,6 +46,11 @@ static const char *TAG = "ui";
    同名宏，移植过来的调用点（约 60 处）保持原样。 */
 static inline void ui_obj_set_flags(lv_obj_t *obj, lv_obj_flag_t f, bool en)
 {
+    /* 防御：构建失败（LVGL 池耗尽）或重建窗口期里，宁可不设也不要踩空。
+       新工程 LV_USE_ASSERT_* 全关，LVGL 不会替我们挡 NULL。 */
+    if (obj == NULL) {
+        return;
+    }
     if (f & LV_OBJ_FLAG_HIDDEN)         lv_obj_set_hidden(obj, en);
     if (f & LV_OBJ_FLAG_CLICKABLE)      lv_obj_set_clickable(obj, en);
     if (f & LV_OBJ_FLAG_SCROLLABLE)     lv_obj_set_scrollable(obj, en);
@@ -157,6 +162,17 @@ static int s_chart_cache_n;
 static float s_chart_cache_min, s_chart_cache_max, s_chart_cache_avg;
 static uint32_t s_chart_cache_at;
 static char s_detail_entity[96];
+/* 旋钮在灯详情页里调什么：默认亮度，点过色温滑条就切色温（换一只灯时复位） */
+#define DETAIL_KNOB_BR        0
+#define DETAIL_KNOB_CT        1
+#define DETAIL_CT_STEP_K      100      /* 色温每格 100K */
+#define DETAIL_KNOB_SEND_MS   200      /* 网络命令最快 200ms 一条（转得快时合并）*/
+#define DETAIL_KNOB_IDLE_MS   300      /* 停转这么久之后一定补发最后的值 */
+static int s_detail_knob_target = DETAIL_KNOB_BR;
+static bool s_knob_dirty;              /* 有还没发出去的值 */
+static uint32_t s_knob_last_send;
+static uint32_t s_knob_last_change;
+static void detail_knob_flush(void);
 /* 用户刚拖过滑条时，短时间内以本地值为准（HA 的轮询会慢半拍，灯关着时甚至没有 brightness） */
 static bool s_sw_override_on;
 static uint32_t s_sw_override_until;
@@ -248,18 +264,32 @@ static void anim_translate_cb(void *var, int32_t v)
 
 static void anim_done_cb(lv_anim_t *a)
 {
-    lv_obj_t *out = (lv_obj_t *)a->user_data;
-    if (out != NULL && a->var != out) {
+    /* 动画变量就是"滑出去的那一页"：动画结束必须把它真正隐藏掉。
+       以前这里写的是 a->var != out（两者本来就相等），条件永远为假，
+       于是翻走的页一直处于"可见"状态、只是停在 x=±360：
+       小智页因此永远骗过 lv_obj_is_hidden()，表情定时器/文字刷新一直跑，
+       子页面/翻页的可见性判断也跟着失真。 */
+    lv_obj_t *out = (lv_obj_t *)a->var;
+    if (out != NULL) {
         lv_obj_add_flag(out, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_x(out, 0);
     }
     s_animating = false;
 }
 
-/** 直接把所有页的可见性/位置/圆点/标题刷成"只有 s_page 可见"。构建首帧用。 */
+/** 小智助手页在 s_pages[] 里的下标；没有这一页时返回 -1。 */
+static int assistant_page_index(void)
+{
+    return is_assistant_page(s_json_pages + 1) ? (s_json_pages + 1) : -1;
+}
+
+/** 把所有页的可见性/位置/圆点/标题刷成"只有 s_page 可见"。构建首帧用。 */
 static void pages_apply_visibility(void)
 {
     for (int i = 0; i < s_page_count; i++) {
+        if (s_pages[i] == NULL) {          /* 这一页没建出来（LVGL 池不够）：跳过 */
+            continue;
+        }
         lv_obj_set_x(s_pages[i], 0);
         if (i == s_page) {
             lv_obj_remove_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
@@ -278,10 +308,11 @@ static void pages_apply_visibility(void)
     }
     int visible = 0;
     for (int i = 0; i < s_page_count; i++) {
-        if (!lv_obj_is_hidden(s_pages[i])) {
+        if (s_pages[i] != NULL && !lv_obj_is_hidden(s_pages[i])) {
             visible++;
         }
     }
+    assistant_ui_set_visible(s_page == assistant_page_index());
     ESP_LOGI(TAG, "showing page %d/%d (visible=%d)", s_page, s_page_count, visible);
 }
 
@@ -303,6 +334,15 @@ static void show_page_dir(int page, int dir)
     if (s_animating) {
         return;   /* 动画中忽略，避免页面叠在一起 */
     }
+
+    /* 防御：页面没建出来（比如 LVGL 池耗尽）时绝不碰 NULL。
+       新工程 LV_USE_ASSERT_* 全关，LVGL 不会替我们挡空指针。 */
+    lv_obj_t *in = s_pages[page];
+    lv_obj_t *out = (prev >= 0 && prev < s_page_count) ? s_pages[prev] : NULL;
+    if (in == NULL) {
+        ESP_LOGW(TAG, "页面 %d 还没建好，忽略翻页", page);
+        return;
+    }
     s_page = page;
 
     /* 圆点 + 标题立刻更新，不跟着动画走 */
@@ -318,8 +358,10 @@ static void show_page_dir(int page, int dir)
         lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 18);
     }
 
-    lv_obj_t *in = s_pages[page];
-    lv_obj_t *out = s_pages[prev];
+    /* 小智页的可见性：这里只改标志 + 起停定时器，不碰任何 LVGL 对象
+       （本函数会在事件回调里被调用，避免在翻页过程中重排/改标签）。 */
+    assistant_ui_set_visible(page == assistant_page_index());
+
     const lv_coord_t dist = (dir >= 0) ? 360 : -360;
 
     /* 新页先放到屏幕外，再滑到 0 */
@@ -352,8 +394,8 @@ static void show_page_dir(int page, int dir)
         s_animating = false;
     }
 
-    /* 小智页只是普通一页：翻到/翻走都立刻启停它的表情动画（不必等 500ms 定时器）*/
-    assistant_ui_tick();
+    /* 注意：这里不再调用 assistant_ui_tick()（那会在这个事件回调里改标签/重排）。
+       小智页的表情动画起停已经由上面的 assistant_ui_set_visible() 完成。 */
 }
 
 static void show_page(int page)
@@ -698,9 +740,46 @@ static void ota_button_cb(lv_event_t *e)
     }
 }
 
+/**
+ * 页面对象没建出来时，先把原因查清楚再报。
+ * lv_obj_create() 返回 NULL 不一定是内存不足：父对象无效（最常见的
+ * lv_screen_active() 为 NULL——LVGL 根本没建 display）时它同样返回 NULL，
+ * 而这时 LVGL 池可能几乎全空。以前这里一律写"内存不足"，把人带偏过。
+ */
+static void report_page_create_failed(const char *name, lv_obj_t *parent)
+{
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+
+    if (parent == NULL) {
+        ESP_LOGE(TAG, "%s创建失败：没有活动屏幕（lv_screen_active() 返回 NULL，"
+                      "先查 lv_display_create() 是否成功），本页跳过", name);
+        return;
+    }
+    if (!lv_obj_is_in_widget_tree(parent)) {
+        ESP_LOGE(TAG, "%s创建失败：父对象 %p 不在控件树里（显示/屏幕已失效），本页跳过",
+                 name, (void *)parent);
+        return;
+    }
+    if (mon.free_size < 1024 || mon.free_biggest_size < 1024) {
+        ESP_LOGE(TAG, "%s创建失败（LVGL 内存不足：空闲 %u/%u 字节，最大块 %u，碎片 %u%%），本页跳过",
+                 name, (unsigned)mon.free_size, (unsigned)mon.total_size,
+                 (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct);
+        return;
+    }
+    ESP_LOGE(TAG, "%s创建失败，但 LVGL 池还空闲 %u/%u 字节（最大块 %u，碎片 %u%%）"
+                  "——不是内存不足，父对象 %p 在控件树里，需查 LVGL 内部状态",
+             name, (unsigned)mon.free_size, (unsigned)mon.total_size,
+             (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct, (void *)parent);
+}
+
 static void build_status_page(lv_obj_t *scr)
 {
     lv_obj_t *page = lv_obj_create(scr);
+    if (page == NULL) {
+        report_page_create_failed("System 页", scr);
+        return;
+    }
     lv_obj_set_size(page, 360, 360);
     lv_obj_set_pos(page, 0, 0);
     lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, 0);
@@ -843,15 +922,23 @@ static void refresh_selftest_label(void)
 static void build_assistant_page(lv_obj_t *scr)
 {
     lv_obj_t *page = lv_obj_create(scr);
+    if (page == NULL) {
+        report_page_create_failed("小智页", scr);
+        return;
+    }
     lv_obj_set_size(page, 360, 360);
     lv_obj_set_pos(page, 0, 0);
     s_pages[s_json_pages + 1] = page;
 
+    /* 内容全部由 assistant_ui 画进来；失败时它会把内部指针清空，这一页就空着 */
     assistant_ui_build(page);
+
 
     lv_obj_t *btn = lv_button_create(page);
     lv_obj_set_size(btn, 110, 30);
-    lv_obj_align(btn, LV_ALIGN_TOP_MID, -30, 26);
+    /* 水平居中（x 偏移 0）；y=26 时芯片左右各占 125..235，
+       圆屏顶部 y=26 可见宽度约 87..273，整块都在圆内。 */
+    lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 26);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0xF2F2F7), 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn, 15, 0);
@@ -891,6 +978,11 @@ void ui_home_goto_first(void)
     }
     ESP_LOGI(TAG, "回到第一页");
     show_page_dir(0, -1);
+}
+
+bool ui_home_assistant_current(void)
+{
+    return is_assistant_page(s_page);
 }
 
 static void refresh_status_page(void)
@@ -1052,6 +1144,7 @@ static void refresh_timer_cb(lv_timer_t *t)
 #if UI_ASSISTANT_PAGE
     refresh_selftest_label();      /* 小智页顶部「音频自检」按钮的文字/结果 */
 #endif
+    detail_knob_flush();           /* 旋钮停转后补发最后一条亮度/色温命令 */
     if (s_detail_visible) {
         detail_apply_entity();     /* 子页数值跟着轮询刷新 */
     }
@@ -1380,6 +1473,170 @@ static void detail_apply_entity(void)
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* 灯详情页：旋钮调亮度 / 色温                                                */
+/* ------------------------------------------------------------------------- */
+
+/** 这只灯现在算不算"开着"（和 detail_apply_entity 的判断一致，含本地开关覆盖）*/
+static bool detail_light_on(const ha_entity_t *e)
+{
+    if (e == NULL) {
+        return false;
+    }
+    if (s_sw_override_until > lv_tick_get()) {
+        return s_sw_override_on;
+    }
+    return e->on;
+}
+
+/** 旋钮这次该调哪个：优先用用户点过的那个控件，不支持就退回另一个。 */
+static int detail_knob_target_for(const ha_entity_t *e)
+{
+    if (e == NULL) {
+        return -1;
+    }
+    if (s_detail_knob_target == DETAIL_KNOB_CT && e->has_tint) {
+        return DETAIL_KNOB_CT;
+    }
+    if (e->has_brightness) {
+        return DETAIL_KNOB_BR;
+    }
+    if (e->has_tint) {
+        return DETAIL_KNOB_CT;
+    }
+    return -1;
+}
+
+/** 把"当前旋钮值"排进命令队列（不阻塞：真正的 HA 调用在 worker 任务里）。 */
+static bool detail_knob_send(int target, int value)
+{
+    if (s_cmd_q == NULL || s_detail_entity[0] == '\0') {
+        return false;
+    }
+    cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    snprintf(cmd.entity, sizeof(cmd.entity), "%s", s_detail_entity);
+    snprintf(cmd.service, sizeof(cmd.service), "turn_on");
+    if (target == DETAIL_KNOB_CT) {
+        snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"color_temp_kelvin\":%d}", value);
+    } else {
+        snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"brightness_pct\":%d}", value);
+    }
+    return xQueueSend(s_cmd_q, &cmd, 0) == pdTRUE;
+}
+
+/**
+ * 旋钮在灯详情页里调值。
+ * 返回 true 表示"这次旋转被详情页吃掉了，并且真的调了值"（调用方响一下触觉）；
+ * 返回 false 表示没消费（详情页没开 / 灯是关的 / 这只灯不支持 / 手指正按着滑条），
+ * 调用方据此决定要不要翻页 + 震动。
+ */
+bool ui_home_detail_knob(int delta)
+{
+    if (delta == 0 || !s_detail_visible || s_detail == NULL) {
+        return false;
+    }
+    if (s_press_on_slider) {
+        return false;                  /* 手指正在拖滑条：这一格让给手指 */
+    }
+    const ha_entity_t *e = ha_client_find(s_detail_entity);
+    if (e == NULL || !detail_light_on(e)) {
+        return false;                  /* 灯关着：旋钮什么也不做（也不翻页）*/
+    }
+    const int target = detail_knob_target_for(e);
+    if (target < 0) {
+        return false;
+    }
+
+    lv_obj_t *slider = (target == DETAIL_KNOB_CT) ? s_detail_ct_slider : s_detail_br_slider;
+    lv_obj_t *label = (target == DETAIL_KNOB_CT) ? s_detail_ct_value : s_detail_br_value;
+    if (slider == NULL || label == NULL) {
+        return false;
+    }
+
+    /* 以滑条当前值为基准（它已经反映了实体值或本地刚调过的值）*/
+    int v = (int)lv_slider_get_value(slider);
+    v += (target == DETAIL_KNOB_CT) ? delta * DETAIL_CT_STEP_K : delta;
+
+    const int vmin = (int)lv_slider_get_min_value(slider);
+    const int vmax = (int)lv_slider_get_max_value(slider);
+    if (v < vmin) {
+        v = vmin;
+    }
+    if (v > vmax) {
+        v = vmax;
+    }
+    if (v == (int)lv_slider_get_value(slider)) {
+        return true;                   /* 已经到头：吃掉这一格，但不用发命令 */
+    }
+
+    /* 1) 立刻更新界面（滑条 + 数字 + 背景色），不等网络 */
+    lv_slider_set_value(slider, v, LV_ANIM_OFF);
+    char buf[24];
+    if (target == DETAIL_KNOB_CT) {
+        snprintf(buf, sizeof(buf), "%dK", v);
+        s_ct_override = v;
+        s_ct_override_until = lv_tick_get() + OVERRIDE_MS;
+    } else {
+        snprintf(buf, sizeof(buf), "%d%%", v);
+        s_br_override = v;
+        s_br_override_until = lv_tick_get() + OVERRIDE_MS;
+    }
+    lv_label_set_text(label, buf);
+    detail_update_ambience();
+
+    /* 2) 网络命令限流：至少隔 200ms 发一条；停手后由 refresh 定时器补发最后值 */
+    const uint32_t now = lv_tick_get();
+    s_knob_dirty = true;
+    s_knob_last_change = now;
+    if ((uint32_t)(now - s_knob_last_send) >= DETAIL_KNOB_SEND_MS) {
+        if (detail_knob_send(target, v)) {
+            s_knob_last_send = now;
+            s_knob_dirty = false;
+        }
+    }
+    return true;
+}
+
+/** refresh 定时器里调用：停转一小会儿后把最后的值补发出去（限流窗口可能吞掉它）。*/
+static void detail_knob_flush(void)
+{
+    if (!s_knob_dirty || !s_detail_visible) {
+        return;
+    }
+    if ((uint32_t)(lv_tick_get() - s_knob_last_change) < DETAIL_KNOB_IDLE_MS) {
+        return;
+    }
+    const ha_entity_t *e = ha_client_find(s_detail_entity);
+    const int target = detail_knob_target_for(e);
+    if (target < 0) {
+        s_knob_dirty = false;
+        return;
+    }
+    lv_obj_t *slider = (target == DETAIL_KNOB_CT) ? s_detail_ct_slider : s_detail_br_slider;
+    if (slider == NULL) {
+        s_knob_dirty = false;
+        return;
+    }
+    if (detail_knob_send(target, (int)lv_slider_get_value(slider))) {
+        s_knob_dirty = false;
+        s_knob_last_send = lv_tick_get();
+        ESP_LOGI(TAG, "旋钮补发最后值：%s = %d", target == DETAIL_KNOB_CT ? "色温" : "亮度",
+                 (int)lv_slider_get_value(slider));
+    }
+}
+
+/** 点一下滑条就把旋钮切到那个控件上（拖动也会先经过 PRESSED）。 */
+static void detail_slider_pressed_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    if (slider == s_detail_ct_slider) {
+        s_detail_knob_target = DETAIL_KNOB_CT;
+    } else if (slider == s_detail_br_slider) {
+        s_detail_knob_target = DETAIL_KNOB_BR;
+    }
+}
+
 static void detail_slider_changed_cb(lv_event_t *e)
 {
     lv_obj_t *slider = lv_event_get_target(e);
@@ -1511,6 +1768,7 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_set_height(s_detail_br_slider, 12);
     lv_slider_set_range(s_detail_br_slider, 1, 100);
     lv_obj_align(s_detail_br_slider, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_add_event_cb(s_detail_br_slider, detail_slider_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_detail_br_slider, detail_slider_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_detail_br_slider, detail_slider_changed_cb, LV_EVENT_RELEASED, NULL);
 
@@ -1535,6 +1793,7 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_set_height(s_detail_ct_slider, 12);
     lv_slider_set_range(s_detail_ct_slider, 2700, 6500);
     lv_obj_align(s_detail_ct_slider, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_add_event_cb(s_detail_ct_slider, detail_slider_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_detail_ct_slider, detail_slider_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_detail_ct_slider, detail_slider_changed_cb, LV_EVENT_RELEASED, NULL);
 }
@@ -1546,6 +1805,11 @@ void ui_home_open_detail(const char *entity_id)
         return;
     }
     ESP_LOGI(TAG, "open detail: %s", entity_id);
+    if (strcmp(entity_id, s_detail_entity) != 0) {
+        /* 换了一只灯：旋钮回到"调亮度"（这是用户最常用的）*/
+        s_detail_knob_target = DETAIL_KNOB_BR;
+        s_knob_dirty = false;
+    }
     snprintf(s_detail_entity, sizeof(s_detail_entity), "%s", entity_id);
     detail_apply_entity();
     s_detail_visible = true;
@@ -1614,7 +1878,7 @@ static void detail_close_done_cb(lv_anim_t *a)
     for (int i = 0; i < s_page_count; i++) {
         if (s_dots[i]) {
             lv_obj_remove_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_bg_color(s_dots[i], (i == s_page) ? COLOR_TEXT : lv_color_hex(0x3A3A3C), 0);
+            lv_obj_set_style_bg_color(s_dots[i], dot_color(s_page, i), 0);
         }
     }
     s_animating = false;
@@ -2103,6 +2367,13 @@ bool ui_home_climate_open(void)
 static void build_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
+    if (scr == NULL) {
+        /* 没有默认显示：lv_screen_active() 是 NULL，下面每次 lv_obj_create() 都会
+           静默失败（LV_USE_ASSERT_* 全关，LVGL 不挡 NULL），界面会整片空白。 */
+        ESP_LOGE(TAG, "构建界面失败：没有活动屏幕（lv_screen_active() 为 NULL），"
+                      "检查 LVGL display 是否创建成功");
+        return;
+    }
     lv_obj_clean(scr);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     bg_image_bind(scr);       /* 背景图铺在最底层 */
@@ -2254,8 +2525,20 @@ static void build_ui(void)
     pages_apply_visibility();
     assistant_ui_tick();             /* 小智页如果是当前页，立刻恢复表情动画 */
     s_animating = false;
+
+    /* 页数对不对，一看日志就知道：s_pages[] 里空着的就是没建出来的页 */
+    int built = 0;
+    for (int i = 0; i < s_page_count; i++) {
+        if (s_pages[i] != NULL) {
+            built++;
+        }
+    }
     ESP_LOGI(TAG, "UI built: %d page(s) + system（小智页：%s），共 %d 页",
              s_json_pages, is_assistant_page(s_json_pages + 1) ? "有" : "无", s_page_count);
+    if (built != s_page_count) {
+        ESP_LOGE(TAG, "页面没建全：只有 %d/%d 页有效，缺失的页在翻页时会跳过（原因见上面的报错）",
+                 built, s_page_count);
+    }
 
     build_detail_view(scr);
     s_detail_visible = false;
@@ -2276,6 +2559,10 @@ static void apply_async_cb(void *arg)
 void ui_home_boot(void)
 {
     lv_obj_t *scr = lv_screen_active();
+    if (scr == NULL) {
+        ESP_LOGE(TAG, "启动页无法显示：没有活动屏幕（lv_screen_active() 为 NULL）");
+        return;
+    }
     lv_obj_clean(scr);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     bg_image_bind(scr);       /* 背景图铺在最底层 */

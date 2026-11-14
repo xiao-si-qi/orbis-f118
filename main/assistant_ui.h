@@ -27,6 +27,14 @@ extern "C" {
 /** 把助手页内容画进调用方给的父对象（ui_home 的最后一页）。可重复调用（同一对象）。 */
 void assistant_ui_build(lv_obj_t *parent);
 
+/**
+ * 页面可见性通知（ui_home 翻页时调用）。
+ * 只改内部标志 + 起停 50ms 表情定时器，**不碰任何 LVGL 对象**，
+ * 所以可以安全地在翻页事件回调里调用；真正的文字刷新留到定时器里做。
+ * 离开页面时如果还在聆听，会顺手关麦。
+ */
+void assistant_ui_set_visible(bool visible);
+
 /** 翻到助手页（MQTT 打开命令走这里；页面不存在时只记日志）。 */
 void assistant_ui_open(void);
 

@@ -73,7 +73,17 @@ static lv_obj_t *s_hint;          /* 激活码 / 操作提示 */
 
 static lv_timer_t *s_anim_timer;
 static bool s_visible;            /* 页面当前是否可见（由 ui_home 翻页控制）*/
+static bool s_need_sync;          /* 刚变成可见：下一次定时器先整帧刷新一次 */
 static xz_state_t s_face = (xz_state_t)-1;
+
+/** 脸是不是都建好了。LV_USE_ASSERT_* 全关时，LVGL 不会替我们挡空指针，
+    所以每次动这些对象前都要先过一遍。 */
+static bool face_ready(void)
+{
+    return s_page != NULL && s_eye[0] != NULL && s_eye[1] != NULL &&
+           s_mouth_smile != NULL && s_mouth_o != NULL && s_mouth_line != NULL &&
+           s_think_arc != NULL && s_dot != NULL;
+}
 
 static uint32_t s_tick;
 static uint32_t s_seed = 0x2545F491u;
@@ -123,6 +133,10 @@ static lv_obj_t *make_block(lv_obj_t *parent, lv_coord_t w, lv_coord_t h,
                             lv_color_t color, lv_coord_t radius)
 {
     lv_obj_t *o = lv_obj_create(parent);
+    if (o == NULL) {
+        ESP_LOGE(TAG, "小智脸：控件创建失败（LVGL 内存不足）");
+        return NULL;
+    }
     lv_obj_remove_style_all(o);
     lv_obj_set_size(o, w, h);
     lv_obj_set_style_bg_color(o, color, 0);
@@ -139,6 +153,10 @@ static lv_obj_t *make_label(lv_obj_t *parent, lv_color_t color, lv_coord_t width
                             lv_coord_t height)
 {
     lv_obj_t *l = lv_label_create(parent);
+    if (l == NULL) {
+        ESP_LOGE(TAG, "小智脸：文字控件创建失败（LVGL 内存不足）");
+        return NULL;
+    }
     lv_obj_set_style_text_font(l, &lv_font_cjk16, 0);
     lv_obj_set_style_text_color(l, color, 0);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
@@ -234,7 +252,7 @@ static void fit_lines(char *dst, size_t cap, const char *src, lv_coord_t width, 
 
 static void face_apply(xz_state_t st)
 {
-    if (s_page == NULL || s_eye[0] == NULL) {
+    if (!face_ready()) {
         return;
     }
     s_face = st;
@@ -313,6 +331,9 @@ static void anim_idle(void)
 /* 聆听：眼睛轻轻浮动 + 录音点呼吸 */
 static void anim_listen(void)
 {
+    if (!face_ready()) {
+        return;
+    }
     const int32_t s = lv_trigo_sin((int16_t)((s_tick * 7) % 360));
     const lv_opa_t opa = (lv_opa_t)(90 + (s + 32768) * 140 / 65536);   /* 90..230 */
     lv_obj_set_style_bg_opa(s_dot, opa, 0);
@@ -325,12 +346,18 @@ static void anim_listen(void)
 /* 思考：嘴的位置转圈 */
 static void anim_think(void)
 {
+    if (!face_ready()) {
+        return;
+    }
     lv_arc_set_rotation(s_think_arc, (int32_t)((s_tick * 10) % 360));  /* 1.8 秒一圈 */
 }
 
 /* 说话：嘴按两个频率张合 */
 static void anim_speak(void)
 {
+    if (!face_ready()) {
+        return;
+    }
     const int32_t a = lv_trigo_sin((int16_t)((s_tick * 13) % 360));
     const int32_t b = lv_trigo_sin((int16_t)((s_tick * 7) % 360));
     int h = 12 + (int)((a + 32768) * 26 / 65536) + (int)((b + 32768) * 6 / 65536);
@@ -384,12 +411,15 @@ static void refresh_text(void)
 
     set_text_if(s_status, s_txt_status, sizeof(s_txt_status), face_text(st, ready));
 
-    /* 原文没变就不重新排版（fit_lines 要逐字测量） */
+    /* 原文没变就不重新排版（fit_lines 要逐字测量）。
+       注意直接写进 s_txt_sub，不再在栈上开一个 SUB_MAX 的临时缓冲：
+       500ms 定时器本来就跑在 LVGL 的定时器回调里，能省一点栈就省一点。 */
     if (strcmp(s_sub_src, sub_src) != 0) {
         snprintf(s_sub_src, sizeof(s_sub_src), "%s", sub_src);
-        char sub[SUB_MAX];
-        fit_lines(sub, sizeof(sub), sub_src, SUB_W, SUB_LINES);
-        set_text_if(s_sub, s_txt_sub, sizeof(s_txt_sub), sub);
+        fit_lines(s_txt_sub, sizeof(s_txt_sub), sub_src, SUB_W, SUB_LINES);
+        if (s_sub != NULL) {
+            lv_label_set_text(s_sub, s_txt_sub);
+        }
     }
 
     set_text_if(s_hint, s_txt_hint, sizeof(s_txt_hint), hint);
@@ -501,8 +531,14 @@ static void page_delete_cb(lv_event_t *e)
 static void anim_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    if (!s_visible || s_page == NULL) {
+    if (!s_visible || !face_ready()) {
         return;
+    }
+
+    if (s_need_sync) {                 /* 刚翻到这一页：先整帧对齐一次 */
+        s_need_sync = false;
+        face_apply(xiaozhi_state());
+        refresh_text();
     }
 
     const xz_state_t st = xiaozhi_state();
@@ -559,15 +595,20 @@ void assistant_ui_build(lv_obj_t *parent)
 
     /* 录音指示点（聆听时呼吸）*/
     s_dot = make_block(parent, 12, 12, C_ACCENT, LV_RADIUS_CIRCLE);
-    lv_obj_set_pos(s_dot, 174, 88);
-
     /* 两只眼睛 */
     s_eye[0] = make_block(parent, 36, 46, C_INK, 16);
     s_eye[1] = make_block(parent, 36, 46, C_INK, 16);
+    if (s_dot == NULL || s_eye[0] == NULL || s_eye[1] == NULL) {
+        goto fail;                  /* LVGL 池不够：别再往下建，免得留下半张脸 */
+    }
+    lv_obj_set_pos(s_dot, 174, 88);
     set_eyes(36, 46);
 
     /* 微笑：只画下半圈的一段弧 */
     s_mouth_smile = lv_arc_create(parent);
+    if (s_mouth_smile == NULL) {
+        goto fail;
+    }
     lv_obj_remove_style_all(s_mouth_smile);
     lv_obj_set_size(s_mouth_smile, 120, 120);
     lv_obj_set_pos(s_mouth_smile, MOUTH_CX - 60, 115);      /* 圆心约 (180,175) */
@@ -585,6 +626,9 @@ void assistant_ui_build(lv_obj_t *parent)
 
     /* 聆听时的小 "o" */
     s_mouth_o = lv_obj_create(parent);
+    if (s_mouth_o == NULL) {
+        goto fail;
+    }
     lv_obj_remove_style_all(s_mouth_o);
     lv_obj_set_size(s_mouth_o, 26, 26);
     lv_obj_set_pos(s_mouth_o, MOUTH_CX - 13, MOUTH_CY - 13);
@@ -597,10 +641,16 @@ void assistant_ui_build(lv_obj_t *parent)
 
     /* 说话的嘴（药丸块，改高度就是张嘴/闭嘴）*/
     s_mouth_line = make_block(parent, 44, 12, C_INK, LV_RADIUS_CIRCLE);
+    if (s_mouth_line == NULL) {
+        goto fail;
+    }
     lv_obj_set_pos(s_mouth_line, MOUTH_CX - 22, MOUTH_CY - 6);
 
     /* 思考：一圈转动的弧 */
     s_think_arc = lv_arc_create(parent);
+    if (s_think_arc == NULL) {
+        goto fail;
+    }
     lv_obj_remove_style_all(s_think_arc);
     lv_obj_set_size(s_think_arc, 60, 60);
     lv_obj_set_pos(s_think_arc, MOUTH_CX - 30, MOUTH_CY - 30);
@@ -619,13 +669,14 @@ void assistant_ui_build(lv_obj_t *parent)
 
     /* 文字：状态 / 小智说的话（或最近一句识别结果）/ 激活码或操作提示 */
     s_status = make_label(parent, C_INK, 300, 0);
+    s_sub = make_label(parent, C_MUTED, SUB_W, lv_font_get_line_height(&lv_font_cjk16) * SUB_LINES);
+    s_hint = make_label(parent, C_MUTED, 240, 0);
+    if (s_status == NULL || s_sub == NULL || s_hint == NULL) {
+        goto fail;
+    }
     lv_label_set_text(s_status, "待机");
     lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 236);
-
-    s_sub = make_label(parent, C_MUTED, SUB_W, lv_font_get_line_height(&lv_font_cjk16) * SUB_LINES);
     lv_obj_align(s_sub, LV_ALIGN_TOP_MID, 0, 256);
-
-    s_hint = make_label(parent, C_MUTED, 240, 0);
     lv_obj_align(s_hint, LV_ALIGN_TOP_MID, 0, 300);
 
     s_txt_status[0] = '\0';
@@ -649,6 +700,29 @@ void assistant_ui_build(lv_obj_t *parent)
     ESP_LOGI(TAG, "小智页已建好（最后一页）：LVGL 池空闲 %u/%u 字节（已用 %u%%），内部 RAM %u KB",
              (unsigned)mon.free_size, (unsigned)mon.total_size, (unsigned)mon.used_pct,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    return;
+
+fail:
+    /* 建到一半失败（LVGL 内存不足）：把指针全部清掉，本模块就当没启用。
+       这一页还剩一块白底，不影响翻页和其它页面。 */
+    s_page = NULL;
+    s_dot = NULL;
+    s_eye[0] = NULL;
+    s_eye[1] = NULL;
+    s_mouth_smile = NULL;
+    s_mouth_o = NULL;
+    s_mouth_line = NULL;
+    s_think_arc = NULL;
+    s_status = NULL;
+    s_sub = NULL;
+    s_hint = NULL;
+    s_visible = false;
+    s_need_sync = false;
+    s_face = (xz_state_t)-1;
+    if (s_anim_timer != NULL) {
+        lv_timer_pause(s_anim_timer);
+    }
+    ESP_LOGE(TAG, "小智页创建失败（LVGL 内存不足），表情/文字停用（其它页面不受影响）");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -685,34 +759,52 @@ bool assistant_ui_is_open(void)
     return s_visible;
 }
 
+void assistant_ui_set_visible(bool visible)
+{
+    if (s_page == NULL) {
+        s_visible = false;
+        s_need_sync = false;
+        return;
+    }
+    if (visible == s_visible) {
+        return;
+    }
+    s_visible = visible;
+
+    if (visible) {
+        /* 只起定时器 + 打个标记：真正的表情/文字刷新放到 50ms 定时器里做，
+           这样本函数可以安全地在翻页事件回调里调用（不碰 LVGL 对象）。 */
+        s_need_sync = true;
+        if (s_anim_timer != NULL) {
+            lv_timer_resume(s_anim_timer);
+        }
+        ESP_LOGI(TAG, "小智页可见：表情动画恢复");
+    } else {
+        s_need_sync = false;
+        if (s_anim_timer != NULL) {
+            lv_timer_pause(s_anim_timer);
+        }
+        /* 离开这一页时如果还在聆听，顺手关麦 */
+        if (xiaozhi_state() == XZ_LISTENING) {
+            xiaozhi_listen_stop();
+            ESP_LOGI(TAG, "离开小智页时还在聆听，已请求关麦");
+        }
+    }
+}
+
 void assistant_ui_tick(void)
 {
     if (s_page == NULL) {
         return;
     }
 
-    /* 页面可见性由 ui_home 的翻页控制：可见才跑 50ms 表情动画 */
-    const bool visible = !lv_obj_is_hidden(s_page);
-    if (visible != s_visible) {
-        s_visible = visible;
-        if (visible) {
-            if (s_anim_timer != NULL) {
-                lv_timer_resume(s_anim_timer);
-            }
-            face_apply(xiaozhi_state());
-            refresh_text();
-            ESP_LOGI(TAG, "小智页可见：表情动画恢复（状态：%s）", face_name(s_face));
-        } else {
-            if (s_anim_timer != NULL) {
-                lv_timer_pause(s_anim_timer);
-            }
-            /* 离开这一页时如果还在聆听，顺手关麦（和以前离开悬浮页的行为一致）*/
-            if (xiaozhi_state() == XZ_LISTENING) {
-                xiaozhi_listen_stop();
-                ESP_LOGI(TAG, "离开小智页时还在聆听，已请求关麦");
-            }
-        }
-    }
+    /* 兜底：除了翻页，详情/折线/空调这些子页面会盖住当前页。
+       注意只认"当前页就是小智页"（翻页动画期间 s_page 已经是目标页），
+       否则会在滑出的动画里又把它点开。 */
+    const bool covered = ui_home_detail_open() || ui_home_chart_open() || ui_home_climate_open();
+    assistant_ui_set_visible(ui_home_assistant_current() && !covered && !lv_obj_is_hidden(s_page));
 
-    refresh();
+    if (s_visible) {
+        refresh();
+    }
 }
