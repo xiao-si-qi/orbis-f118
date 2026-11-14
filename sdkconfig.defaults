@@ -29,7 +29,6 @@ CONFIG_LV_DEF_REFR_PERIOD=16
 # The stack is NOT started at boot: bt_link.c brings up
 # esp_bt_controller_init/enable + bluedroid on demand and tears it down after
 # 60 s idle (see the lifecycle comment at the top of bt_link.c).
-CONFIG_BT_ENABLED=y
 CONFIG_BTDM_CTRL_MODE_BLE_ONLY=n
 CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
 CONFIG_BTDM_CTRL_MODE_BTDM=n
@@ -41,3 +40,10 @@ CONFIG_BT_BLE_ENABLED=n
 # classic BT. IDF 6.1 (this project) no longer defines that Kconfig symbol at all
 # (it only survives as a comment in the old example sdkconfig files), so there is
 # nothing to set here: it is permanently off and cannot be switched on by accident.
+CONFIG_BT_ENABLED=y
+# BT memory optimisation: allocate from PSRAM first, single ACL link, no BT logs, small task stacks
+CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
+CONFIG_BT_ACL_CONNECTIONS=1
+CONFIG_BT_STACK_NO_LOG=y
+CONFIG_BT_BTC_TASK_STACK_SIZE=3072
+CONFIG_BT_BTU_TASK_STACK_SIZE=3584

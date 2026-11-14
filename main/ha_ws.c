@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Home Assistant WebSocket 客户端（/api/websocket）。
  *
  * 设计要点：
@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -41,7 +42,7 @@
 static const char *TAG = "ha_ws";
 
 #define HA_WS_URL_MAX            (APP_HA_URL_MAX + 32)
-#define HA_WS_JSON_MAX           (4 * 1024)      /* 单条 WS 文本消息上限 */
+#define HA_WS_JSON_MAX           (4 * 1024)      /* 单条 WS 消息上限：实测 16KB 会让 cJSON 解析时内存不足崩溃，4KB 稳定 */
 #define HA_WS_ATTRS_MAX          1536            /* attributes 序列化缓冲 */
 #define HA_WS_TX_MAX             512             /* 单条 service call JSON 上限 */
 #define HA_WS_TASK_STACK         6144            /* supervisor 任务栈 */
@@ -52,9 +53,12 @@ static const char *TAG = "ha_ws";
 #define HA_WS_REST_RESUME_FAILS  3               /* 连续失败几次后让 REST 接管 */
 #define HA_WS_BACKOFF_MIN_S      5
 #define HA_WS_BACKOFF_MAX_S      60
-#define HA_WS_PENDING_MAX        8
+#define HA_WS_PENDING_MAX        4               /* 结果 ~25ms 就回来，4 个够用，省内部 RAM */
 #define HA_WS_ID_SUBSCRIBE       1
 #define HA_WS_SUMMARY_US         (60LL * 1000 * 1000)
+
+/* 起 supervisor 任务前至少要有这么多内部 RAM（6KB 栈 + TCB/信号量 + 余量）。 */
+#define HA_WS_START_MIN_FREE     (12 * 1024)
 
 typedef struct {
     int id;
@@ -83,16 +87,19 @@ static volatile uint32_t s_fail;
 static volatile int64_t s_last_rtt_us;
 static char s_last_err[64];
 
-static char s_rx[HA_WS_JSON_MAX + 1];
+/* 接收缓冲不放 .bss：内部 RAM 只剩 38-54KB，4KB 静态缓冲会挤掉 REST 首轮 TLS 的
+ * 余量。改为 ha_ws_start() 时从 PSRAM 申请（8 字节对齐），stop 时归还。 */
+static char *s_rx;
 static size_t s_rx_len;
 static int s_rx_total;
 static bool s_rx_skip;
 
 static int s_next_id = 2;                        /* 1 留给 subscribe_events */
-static char s_conn_url[HA_WS_URL_MAX];
-static char s_conn_token[APP_HA_TOKEN_MAX];
+/* 只存 URL/令牌的哈希用于判断配置变化，不再各存一份 160/256 字节副本。 */
+static uint32_t s_conn_url_hash;
+static uint32_t s_conn_token_hash;
 
-static ha_ws_pending_t s_pending[HA_WS_PENDING_MAX];
+static ha_ws_pending_t s_pending[HA_WS_PENDING_MAX] __attribute__((aligned(8)));
 
 /* ------------------------------------------------------------------------- */
 /* 小工具                                                                     */
@@ -101,6 +108,17 @@ static ha_ws_pending_t s_pending[HA_WS_PENDING_MAX];
 static int64_t now_us(void)
 {
     return esp_timer_get_time();
+}
+
+/** 32 位 FNV-1a：只用来判断 HA 地址/令牌是否变了，不保存令牌副本。 */
+static uint32_t hash_str(const char *s)
+{
+    uint32_t h = 2166136261u;
+    while (s != NULL && *s != '\0') {
+        h ^= (uint8_t)(*s++);
+        h *= 16777619u;
+    }
+    return h;
 }
 
 static void set_last_err(const char *fmt, ...)
@@ -430,6 +448,12 @@ static void handle_text_frame(esp_websocket_event_data_t *ev)
     if (ev->data_ptr == NULL || ev->data_len <= 0) {
         return;
     }
+    if (s_rx == NULL) {
+        s_fail++;
+        set_last_err("接收缓冲未就绪");
+        ESP_LOGW(TAG, "接收缓冲未分配，丢弃本条 WS 消息");
+        return;
+    }
     const int total = (ev->payload_len > 0) ? ev->payload_len
                                             : (ev->payload_offset + ev->data_len);
     if (ev->payload_offset == 0) {
@@ -754,8 +778,8 @@ static void ha_ws_task(void *arg)
                 ESP_LOGI(TAG, "HA WS: %s（%s，内部 RAM %u KB）", url,
                          tls ? "TLS" : "明文，仅限可信内网",
                          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
-                snprintf(s_conn_url, sizeof(s_conn_url), "%s", url);
-                snprintf(s_conn_token, sizeof(s_conn_token), "%s", app_settings_get()->ha_token);
+                s_conn_url_hash = hash_str(url);
+                s_conn_token_hash = hash_str(app_settings_get()->ha_token);
 
                 const int64_t t0 = now_us();
                 bool policy_applied = false;
@@ -804,8 +828,8 @@ static void ha_ws_task(void *arg)
                         char cur[HA_WS_URL_MAX];
                         bool cur_tls = false;
                         if (!build_ws_url(cur, sizeof(cur), &cur_tls) || cur_tls != tls ||
-                            strcmp(cur, s_conn_url) != 0 ||
-                            strcmp(app_settings_get()->ha_token, s_conn_token) != 0) {
+                            hash_str(cur) != s_conn_url_hash ||
+                            hash_str(app_settings_get()->ha_token) != s_conn_token_hash) {
                             ESP_LOGI(TAG, "HA 地址/令牌已变化：重建 WebSocket（无需重启）");
                             settings_changed = true;
                             break;
@@ -854,6 +878,11 @@ static void ha_ws_task(void *arg)
     }
 
     cleanup_client(s_client);
+    heap_caps_free(s_rx);
+    s_rx = NULL;
+    s_rx_len = 0;
+    s_rx_skip = false;
+    s_rx_total = 0;
     s_task = NULL;
     ESP_LOGI(TAG, "WebSocket 任务退出（%s）", ever_authed ? "曾经连上过" : "从未连上");
     vTaskDelete(NULL);
@@ -868,17 +897,47 @@ bool ha_ws_start(void)
     if (s_task != NULL) {
         return true;
     }
+
+    /* 内部 RAM 只剩 38-54KB：任务栈都拿不出来时别硬上，REST 兜底还能用。 */
+    const uint32_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (free_int < HA_WS_START_MIN_FREE) {
+        ESP_LOGW(TAG, "内部 RAM 不足（%u KB < %u KB），暂不启动 WebSocket，继续用 REST",
+                 (unsigned)(free_int / 1024), (unsigned)(HA_WS_START_MIN_FREE / 1024));
+        return false;
+    }
+
+    /* 4KB JSON 接收缓冲放 PSRAM（8 字节对齐）：不占 .bss，也不占内部堆，
+       把开机首轮 REST/TLS 需要的内部 RAM 完整让出来。 */
+    if (s_rx == NULL) {
+        s_rx = heap_caps_aligned_alloc(8, HA_WS_JSON_MAX + 1,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_rx == NULL) {
+            ESP_LOGE(TAG, "WebSocket 接收缓冲分配失败（PSRAM 不足），不启动 WebSocket");
+            return false;
+        }
+        s_rx[0] = '\0';
+    }
+
     if (s_tx_lock == NULL) {
         s_tx_lock = xSemaphoreCreateMutex();
         if (s_tx_lock == NULL) {
-            ESP_LOGE(TAG, "WebSocket 互斥量创建失败");
+            ESP_LOGE(TAG, "WebSocket 互斥量创建失败，不启动 WebSocket");
+            heap_caps_free(s_rx);
+            s_rx = NULL;
             return false;
         }
     }
     s_stop_req = false;
+    ESP_LOGI(TAG, "WebSocket 启动：内部 RAM %u KB（最大块 %u KB），%d 字节 RX 缓冲在 PSRAM",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             HA_WS_JSON_MAX + 1);
     if (xTaskCreate(ha_ws_task, "ha_ws", HA_WS_TASK_STACK, NULL, 4, &s_task) != pdPASS) {
         s_task = NULL;
-        ESP_LOGE(TAG, "WebSocket 任务创建失败");
+        ESP_LOGE(TAG, "WebSocket 任务创建失败（内部 RAM %u KB），继续用 REST",
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+        heap_caps_free(s_rx);
+        s_rx = NULL;
         return false;
     }
     return true;

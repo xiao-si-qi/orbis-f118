@@ -733,16 +733,16 @@ void app_main(void)
         ESP_LOGW(TAG, "WiFi 未连接，跳过 HA 初始化");
     }
 
-    /* WebSocket 长连接：下行 state_changed（卡片即时刷新），上行 service call（快路径）。
-       地址/协议由 app_settings 里的 HA URL 推导，WiFi 晚上线也没关系（任务内部等网络）。
-       放在 HA REST 初始化之后：开机先出首屏状态，再由 WS 接管实时更新。 */
-    /* 隔离测试：临时不启动 WS，确认开机崩溃是否由它引起 */
-    if (0 && !ha_ws_start()) {
-        ESP_LOGW(TAG, "HA WebSocket 任务启动失败，继续只用 REST 轮询");
-    }
-
     ui_home_apply(has_layout ? lay : NULL);   /* 没有布局就只显示 System 页 */
     free(lay);
+
+    /* WebSocket 长连接：下行 state_changed（卡片即时刷新），上行 service call（快路径）。
+       地址/协议由 app_settings 里的 HA URL 推导，WiFi 晚上线也没关系（任务内部等网络）。
+       放在界面构建完成之后：先让首屏把内部 RAM 用完，再起 WS 任务（6KB 栈）并交出 REST TLS。 */
+    if (!ha_ws_start()) {
+        ESP_LOGW(TAG, "HA WebSocket 未启动（内部 RAM 不足或任务创建失败），继续只用 REST 轮询");
+    }
+
     ESP_LOGI(TAG, "进入 LVGL 主循环");
 
     uint32_t last_beat = 0;
