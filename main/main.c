@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
@@ -295,6 +295,8 @@ typedef struct {
     bool toggle;
 } card_t;
 
+static lv_group_t *s_card_group;
+static lv_indev_t *s_enc_indev;
 static lv_obj_t *s_page_main;
 static lv_obj_t *s_page_set;
 static int s_cur_page;
@@ -345,6 +347,12 @@ static void gesture_cb(lv_event_t *e)
     else if (dir == LV_DIR_RIGHT) show_page(s_cur_page - 1);
 }
 
+static void card_focus_cb(lv_event_t *e)
+{
+    (void)e;
+    haptic_click();
+}
+
 static lv_obj_t *make_card(lv_obj_t *scr, int x, int y, const char *name, card_t *ctx)
 {
     lv_obj_t *card = lv_obj_create(scr);
@@ -358,6 +366,11 @@ static lv_obj_t *make_card(lv_obj_t *scr, int x, int y, const char *name, card_t
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(card, card_clicked_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_add_event_cb(card, card_focus_cb, LV_EVENT_FOCUSED, NULL);
+    /* 旋钮选中时的描边 */
+    lv_obj_set_style_outline_width(card, 3, LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_color(card, lv_color_hex(0x0A84FF), LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_pad(card, 3, LV_STATE_FOCUSED);
 
     lv_obj_t *lab = lv_label_create(card);
     lv_label_set_text(lab, name);
@@ -443,11 +456,8 @@ static void ui_timer_cb(lv_timer_t *t)
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
-    const int8_t diff = encoder_read_diff();
-    if (diff != 0) {
-        haptic_click();
-    }
-    data->enc_diff = diff;
+    /* 震动由卡片焦点回调负责，这里只上报转动量 */
+    data->enc_diff = encoder_read_diff();
     data->state = LV_INDEV_STATE_RELEASED;
 }
 
@@ -477,7 +487,8 @@ static void apply_cfg(const char *json)
     if (n > 4) n = 4;
     if (n <= 0) { free(lay); return; }
 
-    /* 清空旧卡片 */
+    /* 清空旧卡片与旧的按键组 */
+    if (s_card_group) { lv_group_delete(s_card_group); s_card_group = NULL; }
     lv_obj_clean(s_page_main);
 
     for (int i = 0; i < n; i++) {
@@ -498,7 +509,7 @@ static void apply_cfg(const char *json)
 
 static void build_cards_ui(void)
 {
-    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *scr = s_page_main;
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
     /* ---- 顶部状态栏：HA 点 / WiFi 信号格 / 电池 ---- */
@@ -544,8 +555,11 @@ static void build_cards_ui(void)
         s_cards[i].value = make_card(scr, x0 + col * (150 + gap), y0 + row * (100 + gap),
                                      s_cards[i].name, &s_cards[i]);
         s_cards[i].card = lv_obj_get_parent(s_cards[i].value);
+        s_cards[i].card = lv_obj_get_parent(s_cards[i].value);
+        if (s_card_group == NULL) s_card_group = lv_group_create();
+        lv_group_add_obj(s_card_group, s_cards[i].card);
+        lv_group_focus_obj(s_cards[i].card);
     }
-    update_cards();
     lv_timer_create(ui_timer_cb, 500, NULL);
 }
 void app_main(void)
@@ -560,9 +574,11 @@ void app_main(void)
     touch_init();
     encoder_init();
     haptic_init();
-    lv_indev_t *enc = lv_indev_create();
-    lv_indev_set_type(enc, LV_INDEV_TYPE_ENCODER);
-    lv_indev_set_read_cb(enc, encoder_read_cb);
+    s_enc_indev = lv_indev_create();
+    lv_indev_set_type(s_enc_indev, LV_INDEV_TYPE_ENCODER);
+    lv_indev_set_read_cb(s_enc_indev, encoder_read_cb);
+    if (s_card_group == NULL) s_card_group = lv_group_create();
+    lv_indev_set_group(s_enc_indev, s_card_group);
     xTaskCreate(battery_task, "bat", 4096, NULL, 3, NULL);
     net_wifi_start();
     net_mqtt_start();
