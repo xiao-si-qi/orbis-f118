@@ -127,7 +127,7 @@ static void lcd_init(void)
     spi_bus_config_t buscfg = {
         .sclk_io_num = PIN_SCLK, .mosi_io_num = PIN_D0, .miso_io_num = PIN_D1,
         .quadwp_io_num = PIN_D2, .quadhd_io_num = PIN_D3,
-        .max_transfer_sz = LCD_W * 80 * 2,
+        .max_transfer_sz = LCD_W * 32 * 2,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
@@ -165,7 +165,7 @@ static void lvgl_init(void)
     lv_init();
     lv_tick_set_cb(tick_cb);
 
-    const size_t buf_bytes = LCD_W * 40 * sizeof(lv_color_t);
+    const size_t buf_bytes = LCD_W * 16 * sizeof(lv_color_t);   /* 16 行：SPI 需要等量的内部 DMA 中转缓冲，块越小越安全 */
     void *b1 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
     void *b2 = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
     s_disp = lv_display_create(LCD_W, LCD_H);
