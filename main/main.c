@@ -332,8 +332,13 @@ static int64_t s_last_diag_us;       /* 错误摘要限流（60s） */
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
-    /* 震动由屏幕点击回调负责，这里只上报转动量 */
-    data->enc_diff = encoder_read_diff();
+    /* 旋钮翻页：顺时针（实测 diff<0）下一页，每格一次触觉反馈 */
+    const int8_t diff = encoder_read_diff();
+    if (diff != 0) {
+        ui_home_page_step(diff < 0 ? 1 : -1);
+        haptic_click();
+    }
+    data->enc_diff = 0;              /* 不交给 LVGL 组导航（ui_home 没有键盘组） */
     data->state = LV_INDEV_STATE_RELEASED;
 }
 

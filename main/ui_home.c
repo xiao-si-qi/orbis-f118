@@ -352,6 +352,19 @@ static void dot_clicked_cb(lv_event_t *e)
     show_page((int)(intptr_t)lv_event_get_user_data(e));
 }
 
+/* 旋钮翻页：delta>0 下一页，delta<0 上一页。
+   子页面（详情/折线/空调）开着时不翻页，避免误触。 */
+void ui_home_page_step(int delta)
+{
+    if (delta == 0 || s_page_count <= 0) return;
+    if (ui_home_detail_open() || ui_home_chart_open() || ui_home_climate_open()) return;
+    if (delta > 0) {
+        show_page_dir(s_page + 1, 1);
+    } else {
+        show_page_dir(s_page - 1, -1);
+    }
+}
+
 /* 让手势从任意子对象冒泡到页面/屏幕（否则滑在卡片上就没反应） */
 static void ui_enable_gesture_bubble(lv_obj_t *obj)
 {

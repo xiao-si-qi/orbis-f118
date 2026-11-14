@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "layout.h"
 
@@ -8,6 +8,9 @@ extern "C" {
 
 /** 启动页：在拿到布局之前先显示"connecting..."。 */
 void ui_home_boot(void);
+
+/** 旋钮翻页：delta>0 下一页，delta<0 上一页（子页面打开时忽略） */
+void ui_home_page_step(int delta);
 
 /** 用布局重建界面（可在任意任务调用，内部切回 LVGL 上下文）。 */
 void ui_home_apply(const layout_t *layout);
