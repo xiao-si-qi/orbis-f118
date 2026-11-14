@@ -1,3 +1,15 @@
+/*
+ * orbis-f118 · 360×360 圆屏（ESP32-S31 / JC3636F118）
+ *
+ * 硬件初始化沿用原来的写法（背光 / LCD / LVGL / 触摸 / 编码器 / 触觉 / 电池 / 网络）。
+ * 界面改用从 orbis-panel 移植过来的 ui_home：
+ *   - JSON 布局页（HA 下发）+ 固件内置 System 页
+ *   - 灯详情（开关/亮度/色温）、传感器折线、空调页都在 ui_home.c 里
+ *
+ * main.c 只负责：起硬件 → 起 UI → 恢复 NVS 里的布局 → 主循环里跑 LVGL、
+ * 应用 MQTT 下发的 cfg/cmd、周期上报 state。
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -15,15 +27,18 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_adc/adc_oneshot.h"
 #include "lvgl.h"
 
-LV_FONT_DECLARE(lv_font_cjk16);
+#include "bsp_shim.h"       /* bsp_display_set_backlight()（旧工程 bsp_display_* 的替代） */
 #include "net.h"
-#include "detail.h"
+#include "ha_client.h"
+#include "layout.h"
 #include "bg_image.h"
-#include "settings.h"
-#include "chart.h"
-
+#include "ui_home.h"
+#include "log_buffer.h"
+#include "ota.h"
+#include "cJSON.h"
 
 static const char *TAG = "orbis-f118";
 
@@ -53,6 +68,9 @@ static volatile bool s_flush_done;
 
 static bool on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *ed, void *ctx)
 {
+    (void)io;
+    (void)ed;
+    (void)ctx;
     s_flush_done = true;      /* 由 lv_flush_cb 等待后统一通知 LVGL */
     return false;
 }
@@ -90,14 +108,6 @@ static void backlight_init(void)
     };
     ledc_channel_config(&c);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 1023 * 40 / 100);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-}
-
-static void backlight_set(int pct)
-{
-    if (pct < 1) pct = 1;
-    if (pct > 100) pct = 100;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 1023 * pct / 100);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
@@ -174,6 +184,7 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data)
     }
     data->point.x = last_x;
     data->point.y = last_y;
+    (void)indev;
 }
 
 /* ---------- 编码器（GPIO6=B, GPIO7=A，轮询解码，不用中断）---------- */
@@ -188,6 +199,7 @@ static int s_enc_acc;
  */
 static void encoder_task(void *arg)
 {
+    (void)arg;
     int last = (gpio_get_level(7) << 1) | gpio_get_level(6);
     while (1) {
         const int cur = (gpio_get_level(7) << 1) | gpio_get_level(6);
@@ -248,6 +260,7 @@ static void haptic_click(void)
     if (s_haptic == NULL) return;
     i2c_master_transmit(s_haptic, (uint8_t[]){ 0x0C, 0x01 }, 2, 50);   /* GO */
 }
+
 static void touch_init(void)
 {
     i2c_master_bus_config_t bc = {
@@ -264,14 +277,12 @@ static void touch_init(void)
     ESP_LOGI(TAG, "触摸初始化完成 (CST816S @0x15)");
 }
 
-#include "ha_client.h"
-
 /* ---------------- 电池 ADC（GPIO55，15k/10k 分压）---------------- */
-#include "esp_adc/adc_oneshot.h"
 static volatile int s_bat_mv;
 
 static void battery_task(void *arg)
 {
+    (void)arg;
     adc_unit_t unit; adc_channel_t chan;
     if (adc_oneshot_io_to_channel(55, &unit, &chan) != ESP_OK) {
         ESP_LOGW(TAG, "GPIO55 不是 ADC 引脚");
@@ -306,189 +317,71 @@ static void battery_task(void *arg)
     }
 }
 
-/* ---------------- 卡片界面 ---------------- */
+/* ---------------- 界面：ui_home（从 orbis-panel 移植） ---------------- */
 
-typedef struct {
-    char entity[96];
-    char name[64];
-    lv_obj_t *card;
-    lv_obj_t *value;
-    bool toggle;
-} card_t;
-
-static lv_group_t *s_card_group;
-static lv_indev_t *s_enc_indev;
-static lv_obj_t *s_page_main;
-static lv_obj_t *s_page_set;
-static int s_cur_page;
-
-static const char *EID_LIGHT   = "light.xiaomi_cn_752752842_ceil05_s_2_light";
-static const char *EID_POWER   = "sensor.zong_gong_lu";
-static const char *EID_WATER   = "sensor.wm_001_temp";
-static const char *EID_WEATHER = "weather.he_feng_tian_qi";
-
-static card_t s_cards[] = {
-    { "light.xiaomi_cn_752752842_ceil05_s_2_light", "客厅主灯", NULL, NULL, true  },
-    { "sensor.zong_gong_lu",                        "总功率",   NULL, NULL, false },
-    { "sensor.wm_001_temp",                         "水温",     NULL, NULL, false },
-    { "weather.he_feng_tian_qi",                    "天气",     NULL, NULL, false },
-};
-static int s_card_count = 4;
-
-static void card_clicked_cb(lv_event_t *e)
-{
-    card_t *c = (card_t *)lv_event_get_user_data(e);
-    if (c == NULL) return;
-    haptic_click();
-    if (c->toggle) {
-        detail_open(c->entity);          /* 灯：打开详情页（开关/亮度/色温） */
-    } else if (strncmp(c->entity, "sensor.", 7) == 0 || strncmp(c->entity, "weather.", 8) == 0) {
-        chart_open(c->entity);           /* 传感器/天气：历史折线 */
-    } else {
-        ESP_LOGI(TAG, "点击 %s（仅显示）", c->entity);
-    }
-}
-
-static void show_page(int idx)
-{
-    if (idx < 0) idx = 0;
-    if (idx > 1) idx = 1;
-    s_cur_page = idx;
-    if (s_page_main) idx == 0 ? lv_obj_remove_flag(s_page_main, LV_OBJ_FLAG_HIDDEN)
-                              : lv_obj_add_flag(s_page_main, LV_OBJ_FLAG_HIDDEN);
-    if (s_page_set)  idx == 1 ? lv_obj_remove_flag(s_page_set, LV_OBJ_FLAG_HIDDEN)
-                              : lv_obj_add_flag(s_page_set, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void gesture_cb(lv_event_t *e)
-{
-    const lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-    if (detail_is_open() || chart_is_open()) return;
-    if (dir == LV_DIR_LEFT) show_page(s_cur_page + 1);
-    else if (dir == LV_DIR_RIGHT) show_page(s_cur_page - 1);
-}
-
-static void card_focus_cb(lv_event_t *e)
-{
-    (void)e;
-    haptic_click();
-}
-
-static lv_obj_t *make_card(lv_obj_t *scr, int x, int y, const char *name, card_t *ctx)
-{
-    lv_obj_t *card = lv_obj_create(scr);
-    lv_obj_set_size(card, 150, 100);
-    lv_obj_set_pos(card, x, y);
-    lv_obj_set_style_bg_color(card, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(card, (lv_opa_t)(255 * 62 / 100), 0);   /* 黑色半透明，透出背景图 */
-    lv_obj_set_style_radius(card, 18, 0);
-    lv_obj_set_style_border_width(card, 0, 0);
-    lv_obj_set_style_pad_all(card, 12, 0);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(card, card_clicked_cb, LV_EVENT_CLICKED, ctx);
-    lv_obj_add_event_cb(card, card_focus_cb, LV_EVENT_FOCUSED, NULL);
-    /* 旋钮选中时的描边 */
-    lv_obj_set_style_outline_width(card, 3, LV_STATE_FOCUSED);
-    lv_obj_set_style_outline_color(card, lv_color_hex(0x0A84FF), LV_STATE_FOCUSED);
-    lv_obj_set_style_outline_pad(card, 3, LV_STATE_FOCUSED);
-
-    lv_obj_t *lab = lv_label_create(card);
-    lv_label_set_text(lab, name);
-    lv_obj_set_style_text_font(lab, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(lab, lv_color_hex(0x8E8E93), 0);
-    lv_obj_align(lab, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    lv_obj_t *val = lv_label_create(card);
-    lv_label_set_text(val, "--");
-    lv_obj_set_style_text_font(val, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(val, lv_color_white(), 0);
-    lv_obj_align(val, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    return val;
-}
-
-static void update_cards(void)
-{
-    for (int i = 0; i < s_card_count; i++) {
-        card_t *c = &s_cards[i];
-        const ha_entity_t *e = ha_client_find(c->entity);
-        if (c->value == NULL) continue;
-        if (e == NULL || !e->fresh) {
-            lv_label_set_text(c->value, "--");
-        } else if (e->unit[0]) {
-            lv_label_set_text_fmt(c->value, "%s %s", e->state, e->unit);
-        } else {
-            lv_label_set_text(c->value, e->state);
-        }
-        if (c->card) {
-            lv_obj_set_style_bg_color(c->card,
-                (e && e->on) ? lv_color_hex(0x1F2A44) : lv_color_hex(0x141418), 0);
-        }
-    }
-}
-
-static lv_obj_t *s_bat_label;
-static lv_obj_t *s_rssi_bars[4];
-static lv_obj_t *s_ha_dot;
-
-static void update_statusbar(void)
-{
-    if (s_bat_label) {
-        const int mv = s_bat_mv;
-        /* 只显示合理范围（3.0–4.3 V）——GPIO55 目前读到的是饱和值，不要误导 */
-        if (mv >= 3000 && mv <= 4300) {
-            int pct = (mv - 3200) * 100 / (4200 - 3200);
-            if (pct < 0) pct = 0;
-            if (pct > 100) pct = 100;
-            lv_label_set_text_fmt(s_bat_label, "%d.%02dV %d%%", mv / 1000, (mv % 1000) / 10, pct);
-            lv_obj_set_style_text_color(s_bat_label,
-                pct > 30 ? lv_color_hex(0x30D158) : lv_color_hex(0xFF453A), 0);
-        } else {
-            lv_label_set_text(s_bat_label, "");
-        }
-    }
-    int level = 0;
-    if (net_wifi_connected()) {
-        const int r = net_wifi_rssi();
-        level = (r >= -55) ? 4 : (r >= -67) ? 3 : (r >= -78) ? 2 : 1;
-    }
-    for (int i = 0; i < 4; i++) {
-        if (s_rssi_bars[i]) {
-            lv_obj_set_style_bg_color(s_rssi_bars[i],
-                (i < level) ? lv_color_hex(0x30D158) : lv_color_hex(0x3A3A3C), 0);
-        }
-    }
-    if (s_ha_dot) {
-        lv_obj_set_style_bg_color(s_ha_dot,
-            ha_client_online() ? lv_color_hex(0x30D158) : lv_color_hex(0xFF453A), 0);
-    }
-}
-
-static void ui_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    update_cards();
-    update_statusbar();
-    detail_refresh();
-    if (s_cur_page == 1) settings_refresh();
-    chart_poll();
-}
+static lv_group_t *s_group;          /* 编码器用的按键组（ui_home 未使用，留空表） */
+static volatile bool s_log_on;       /* 串口日志是否同时推 MQTT */
+static int64_t s_last_diag_us;       /* 错误摘要限流（60s） */
 
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
-    /* 震动由卡片焦点回调负责，这里只上报转动量 */
+    /* 震动由屏幕点击回调负责，这里只上报转动量 */
     data->enc_diff = encoder_read_diff();
     data->state = LV_INDEV_STATE_RELEASED;
 }
 
-#include "layout.h"
-#include "cJSON.h"
-#include "ota.h"
+static void haptic_click_cb(lv_event_t *e)
+{
+    (void)e;
+    /* 旧界面在卡片获得焦点时震动；新界面没有按键组，改成"点一下就轻震" */
+    haptic_click();
+}
 
-static void build_cards_ui(void);
+static void register_layout_entities(const layout_t *layout)
+{
+    for (int p = 0; p < layout->page_count; p++) {
+        for (int t = 0; t < layout->pages[p].tile_count; t++) {
+            const layout_tile_t *tile = &layout->pages[p].tiles[t];
+            ha_client_register(tile->entity, tile->label[0] ? tile->label : NULL);
+        }
+    }
+    ESP_LOGI(TAG, "从布局注册了 %d 个实体", ha_client_count());
+}
 
-static volatile bool s_log_on;
+/** MQTT 下发的 cfg：解析布局 → 存 NVS → 注册实体 → 交给 ui_home 重建界面。 */
+static void apply_cfg(const char *json)
+{
+    /* retained cfg 每次重连都会重发：内容没变就别重建界面 */
+    static char s_last_cfg[4096];
+    if (s_last_cfg[0] != '\0' && strcmp(s_last_cfg, json) == 0) {
+        ESP_LOGI(TAG, "cfg 未变化，跳过重建");
+        return;
+    }
+    snprintf(s_last_cfg, sizeof(s_last_cfg), "%s", json);
+
+    bg_image_apply_json(json);       /* 背景图/轮播 */
+
+    /* layout_t 约 11 KB，放堆上：主任务栈不大，ui_home_apply() 内部会拷一份 */
+    layout_t *lay = calloc(1, sizeof(layout_t));
+    if (lay == NULL) {
+        ESP_LOGE(TAG, "布局内存不足");
+        return;
+    }
+    const esp_err_t perr = layout_parse(json, lay);
+    if (perr != ESP_OK || lay->page_count <= 0) {
+        ESP_LOGW(TAG, "cfg 里没有可用布局 (%s)", esp_err_to_name(perr));
+        free(lay);
+        return;
+    }
+
+    layout_save_nvs(json);
+    register_layout_entities(lay);
+    const int pages = lay->page_count;
+    ui_home_apply(lay);
+    free(lay);
+    ESP_LOGI(TAG, "cfg 已应用：共 %d 页", pages);
+}
 
 static void apply_cmd(const char *json)
 {
@@ -519,6 +412,16 @@ static void apply_cmd(const char *json)
         net_mqtt_publish_state();
 
     } else if (strcmp(cmd, "log") == 0) {
+        /* 按需抓日志：先把环形缓冲里的最近 40 行发一次，之后按 s_log_on 继续推 */
+        char *dump = malloc(4096);
+        if (dump != NULL) {
+            const size_t n = log_buffer_dump(dump, 4096, 40);
+            if (n > 0) {
+                net_publish_log(dump);
+                ESP_LOGI(TAG, "已发送 %u 字节日志", (unsigned)n);
+            }
+            free(dump);
+        }
         s_log_on = true;
         ESP_LOGI(TAG, "日志上报已开启");
 
@@ -527,116 +430,42 @@ static void apply_cmd(const char *json)
         const cJSON *jv = cJSON_GetObjectItemCaseSensitive(root, "value");
         if (cJSON_IsString(jk) && strcmp(jk->valuestring, "brightness") == 0 && cJSON_IsNumber(jv)) {
             const int pct = (int)jv->valuedouble;
-            backlight_set(pct);
+            bsp_display_set_backlight((uint8_t)pct);
             ESP_LOGI(TAG, "屏幕亮度 -> %d%%", pct);
         }
 
-    } else if (strcmp(cmd, "detail") == 0 || strcmp(cmd, "hist") == 0) {
+    } else if (strcmp(cmd, "detail") == 0) {
         const cJSON *je = cJSON_GetObjectItemCaseSensitive(root, "entity");
         if (cJSON_IsString(je)) {
-            if (cmd[0] == 'd') detail_open(je->valuestring);
-            else chart_open(je->valuestring);
+            ui_home_open_detail(je->valuestring);
         }
+
+    } else if (strcmp(cmd, "hist") == 0) {
+        /* 调试命令：同步拉 6 小时历史后直接显示折线（会短暂阻塞主循环，正常交互走点卡片） */
+        const cJSON *je = cJSON_GetObjectItemCaseSensitive(root, "entity");
+        if (cJSON_IsString(je)) {
+            static float vals[64];
+            int cnt = 0;
+            float vmin = 0, vmax = 0, vavg = 0;
+            const esp_err_t he = ha_client_history(je->valuestring, 6, vals, 64, &cnt, &vmin, &vmax, &vavg);
+            ESP_LOGI(TAG, "hist %s -> %s, %d 点 min=%.2f max=%.2f avg=%.2f",
+                     je->valuestring, esp_err_to_name(he), cnt, vmin, vmax, vavg);
+            if (he == ESP_OK && cnt > 0) {
+                ui_home_show_chart(je->valuestring, vals, cnt, vmin, vmax, vavg);
+            }
+        }
+
+    } else if (strcmp(cmd, "get") == 0) {
+        /* TODO(port): 旧工程用 mqtt_link 把 NVS 里的布局原样发回 cfg 主题；
+           net.c 目前只提供 state 发布，没有"发到 cfg 主题"的接口，这里先不支持。 */
+        ESP_LOGW(TAG, "cmd get：net.c 暂不支持回读布局（TODO(port)）");
+
+    } else {
+        ESP_LOGW(TAG, "未知 cmd: %s", cmd);
     }
     cJSON_Delete(root);
 }
 
-static void apply_cfg(const char *json)
-{
-    bg_image_apply_json(json);
-
-    /* layout_t 约 11 KB，必须放堆上：app_main 的栈只有 3.5 KB */
-    layout_t *lay = calloc(1, sizeof(layout_t));
-    if (lay == NULL) {
-        ESP_LOGE(TAG, "布局内存不足");
-        return;
-    }
-    const esp_err_t perr = layout_parse(json, lay);
-    if (perr != ESP_OK || lay->page_count <= 0) {
-        ESP_LOGW(TAG, "cfg 里没有可用布局 (%s)", esp_err_to_name(perr));
-        free(lay);
-        return;
-    }
-
-    const layout_page_t *pg = &lay->pages[0];
-    int n = pg->tile_count;
-    if (n > 4) n = 4;
-    if (n <= 0) { free(lay); return; }
-
-    /* 清空旧卡片与旧的按键组 */
-    if (s_card_group) { lv_group_delete(s_card_group); s_card_group = NULL; }
-    lv_obj_clean(s_page_main);
-
-    for (int i = 0; i < n; i++) {
-        snprintf(s_cards[i].entity, sizeof(s_cards[i].entity), "%s", pg->tiles[i].entity);
-        snprintf(s_cards[i].name, sizeof(s_cards[i].name), "%s", pg->tiles[i].label[0] ? pg->tiles[i].label : "实体");
-        s_cards[i].toggle = (pg->tiles[i].type == TILE_TOGGLE);
-        s_cards[i].value = NULL;
-        s_cards[i].card = NULL;
-    }
-    s_card_count = n;
-
-    for (int i = 0; i < n; i++) {
-        ha_client_register(s_cards[i].entity, s_cards[i].name);
-    }
-    build_cards_ui();
-    ESP_LOGI(TAG, "cfg 已应用：%d 张卡片", n);
-}
-
-static void build_cards_ui(void)
-{
-    lv_obj_t *scr = s_page_main;
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-
-    /* ---- 顶部状态栏：HA 点 / WiFi 信号格 / 电池 ---- */
-    lv_obj_t *bar = lv_obj_create(scr);
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_size(bar, 190, 24);
-    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 44);
-    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_ha_dot = lv_obj_create(bar);
-    lv_obj_remove_style_all(s_ha_dot);
-    lv_obj_set_size(s_ha_dot, 10, 10);
-    lv_obj_set_style_radius(s_ha_dot, 5, 0);
-    lv_obj_set_style_bg_color(s_ha_dot, lv_color_hex(0x8E8E93), 0);
-    lv_obj_set_style_bg_opa(s_ha_dot, LV_OPA_COVER, 0);
-    lv_obj_align(s_ha_dot, LV_ALIGN_LEFT_MID, 0, 0);
-
-    lv_obj_t *ha_lab = lv_label_create(bar);
-    lv_label_set_text(ha_lab, "HA");
-    lv_obj_set_style_text_font(ha_lab, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ha_lab, lv_color_hex(0x8E8E93), 0);
-    lv_obj_align(ha_lab, LV_ALIGN_LEFT_MID, 15, 0);
-
-    for (int i = 0; i < 4; i++) {
-        s_rssi_bars[i] = lv_obj_create(bar);
-        lv_obj_remove_style_all(s_rssi_bars[i]);
-        lv_obj_set_size(s_rssi_bars[i], 5, 6 + i * 4);
-        lv_obj_set_style_bg_color(s_rssi_bars[i], lv_color_hex(0x3A3A3C), 0);
-        lv_obj_set_style_bg_opa(s_rssi_bars[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(s_rssi_bars[i], 1, 0);
-        lv_obj_align(s_rssi_bars[i], LV_ALIGN_LEFT_MID, 78 + i * 8, 4);
-    }
-
-    s_bat_label = lv_label_create(bar);
-    lv_label_set_text(s_bat_label, "---");
-    lv_obj_set_style_text_font(s_bat_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_bat_label, lv_color_hex(0x8E8E93), 0);
-    lv_obj_align(s_bat_label, LV_ALIGN_RIGHT_MID, -2, 0);
-
-    const int x0 = 22, y0 = 84, gap = 14;
-    for (int i = 0; i < s_card_count; i++) {
-        const int col = i % 2, row = i / 2;
-        s_cards[i].value = make_card(scr, x0 + col * (150 + gap), y0 + row * (100 + gap),
-                                     s_cards[i].name, &s_cards[i]);
-        s_cards[i].card = lv_obj_get_parent(s_cards[i].value);
-        s_cards[i].card = lv_obj_get_parent(s_cards[i].value);
-        if (s_card_group == NULL) s_card_group = lv_group_create();
-        lv_group_add_obj(s_card_group, s_cards[i].card);
-    }
-    lv_timer_create(ui_timer_cb, 500, NULL);
-}
 static int log_forward(const char *fmt, va_list args)
 {
     char buf[160];
@@ -652,6 +481,8 @@ static int log_forward(const char *fmt, va_list args)
 void app_main(void)
 {
     esp_log_set_vprintf(log_forward);
+    log_buffer_init();                      /* 环形缓冲挂在 log_forward 前面，用于按需回传 */
+
     ESP_LOGI(TAG, "=========== orbis-f118 启动 ===========");
     ESP_LOGI(TAG, "PSRAM %u KB / 内部 RAM %u KB",
              (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
@@ -662,37 +493,25 @@ void app_main(void)
     touch_init();
     encoder_init();
     haptic_init();
-    s_enc_indev = lv_indev_create();
-    lv_indev_set_type(s_enc_indev, LV_INDEV_TYPE_ENCODER);
-    lv_indev_set_read_cb(s_enc_indev, encoder_read_cb);
-    if (s_card_group == NULL) s_card_group = lv_group_create();
-    lv_indev_set_group(s_enc_indev, s_card_group);
+
+    lv_indev_t *enc = lv_indev_create();
+    lv_indev_set_type(enc, LV_INDEV_TYPE_ENCODER);
+    lv_indev_set_read_cb(enc, encoder_read_cb);
+    s_group = lv_group_create();
+    lv_indev_set_group(enc, s_group);
+
     xTaskCreate(battery_task, "bat", 4096, NULL, 3, NULL);
+
+    bg_image_init();                        /* 背景图/卡片蒙版默认值要在首屏之前就位 */
     net_wifi_start();
     net_mqtt_start();
-    bg_image_init();
 
-    /* 两个页面容器：0=卡片页，1=参数页 */
-    s_page_main = lv_obj_create(lv_screen_active());
-    lv_obj_remove_style_all(s_page_main);
-    lv_obj_set_size(s_page_main, 360, 360);
-    lv_obj_set_pos(s_page_main, 0, 0);
-    lv_obj_remove_flag(s_page_main, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_page_main, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_event_cb(s_page_main, gesture_cb, LV_EVENT_GESTURE, NULL);
+    /* 启动页：先出 "Orbis / connecting..."，再等网络 */
+    ui_home_boot();
+    lv_obj_add_event_cb(lv_screen_active(), haptic_click_cb, LV_EVENT_CLICKED, NULL);
+    ESP_LOGI(TAG, "启动页已显示，等待 WiFi");
 
-    s_page_set = lv_obj_create(lv_screen_active());
-    lv_obj_remove_style_all(s_page_set);
-    lv_obj_set_size(s_page_set, 360, 360);
-    lv_obj_set_pos(s_page_set, 0, 0);
-    lv_obj_remove_flag(s_page_set, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_page_set, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_add_event_cb(s_page_set, gesture_cb, LV_EVENT_GESTURE, NULL);
-
-    build_cards_ui();
-    settings_build(s_page_set);
-    show_page(0);
-    bg_image_bind(lv_screen_active());
+    /* 默认背景（HA 的 cfg 里带 bg 时会覆盖它） */
     {
         static const char *bg_json =
             "{\"bg\":{\"images\":["
@@ -701,20 +520,39 @@ void app_main(void)
             "\"https://ha.xiaosiqi.cn/local/switchyard/orbis/bg/3.jpg\"],"
             "\"interval\":20,\"dim\":65,\"card\":60}}";
         bg_image_apply_json(bg_json);
-        ESP_LOGI(TAG, "背景图配置已应用");
     }
 
-    /* 等 WiFi 连上再初始化 HA */
-    for (int i = 0; i < 60 && !net_wifi_connected(); i++) vTaskDelay(pdMS_TO_TICKS(500));
+    /* 等 WiFi 连上（期间把启动页刷出来，别黑屏干等） */
+    for (int i = 0; i < 60 && !net_wifi_connected(); i++) {
+        lv_timer_handler();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    /* 上一次 MQTT 下发的布局（存在 NVS 里）：开机先按它建界面 */
+    layout_t *lay = calloc(1, sizeof(layout_t));
+    const bool has_layout = (lay != NULL) &&
+                            (layout_load_nvs(lay) == ESP_OK) && lay->page_count > 0;
+    if (has_layout) {
+        register_layout_entities(lay);
+        ESP_LOGI(TAG, "已从 NVS 恢复布局：%d 页", lay->page_count);
+    } else {
+        ESP_LOGW(TAG, "还没有布局，等 switchyard/%s/cfg", net_device_id());
+    }
+
     if (net_wifi_connected()) {
-        ha_client_init();
-        for (int i = 0; i < s_card_count; i++) ha_client_register(s_cards[i].entity, s_cards[i].name);
-        ha_client_fetch_all();
-        ha_client_start_poll();
-        ESP_LOGI(TAG, "HA 已启动，注册 %d 个实体", s_card_count);
+        if (ha_client_init() == ESP_OK) {
+            ha_client_fetch_all();
+            ha_client_start_poll();
+            ESP_LOGI(TAG, "HA 已启动，注册 %d 个实体", ha_client_count());
+        } else {
+            ESP_LOGE(TAG, "HA client 初始化失败");
+        }
     } else {
         ESP_LOGW(TAG, "WiFi 未连接，跳过 HA 初始化");
     }
+
+    ui_home_apply(has_layout ? lay : NULL);   /* 没有布局就只显示 System 页 */
+    free(lay);
     ESP_LOGI(TAG, "进入 LVGL 主循环");
 
     uint32_t last_beat = 0;
@@ -728,6 +566,16 @@ void app_main(void)
             static char cmd_json[1024];
             if (net_take_cfg(cfg_json, sizeof(cfg_json))) apply_cfg(cfg_json);
             if (net_take_cmd(cmd_json, sizeof(cmd_json))) apply_cmd(cmd_json);
+        }
+
+        /* 错误摘要：有就发，但 1 分钟内只发一条
+           TODO(port): 旧工程发到 /diag（retained），net.c 只有 /log 主题，先混用 */
+        if (esp_timer_get_time() - s_last_diag_us >= 60LL * 1000 * 1000) {
+            char diag[512];
+            if (log_buffer_take_diag(diag, sizeof(diag))) {
+                net_publish_log(diag);
+                s_last_diag_us = esp_timer_get_time();
+            }
         }
 
         if (esp_timer_get_time() / 1000000ULL != last_beat) {
