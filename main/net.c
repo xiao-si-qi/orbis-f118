@@ -1,4 +1,4 @@
-#include <string.h>
+﻿#include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
@@ -36,6 +36,10 @@ static char s_will_topic[96];
 static char s_cfg_buf[4096];
 static volatile bool s_cfg_pending;
 
+/* 收到的 cmd（由主循环取走） */
+static char s_cmd_buf[1024];
+static volatile bool s_cmd_pending;
+
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -68,15 +72,29 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGW(TAG, "MQTT 断开");
         break;
 
-    case MQTT_EVENT_DATA:
-        if (e->data_len > 0 && e->data_len < (int)sizeof(s_cfg_buf) &&
-            strstr(e->topic, "/cfg") != NULL) {
+    case MQTT_EVENT_DATA: {
+        /* topic 不是以 '\0' 结尾的，先拷成字符串再比较 */
+        char topic[128] = {0};
+        snprintf(topic, sizeof(topic), "%.*s", (int)e->topic_len, e->topic);
+        if (e->data_len <= 0) break;
+
+        char t_cfg[128], t_cmd[128];
+        snprintf(t_cfg, sizeof(t_cfg), "switchyard/%s/cfg", s_dev_id);
+        snprintf(t_cmd, sizeof(t_cmd), "switchyard/%s/cmd", s_dev_id);
+
+        if (strcmp(topic, t_cfg) == 0 && e->data_len < (int)sizeof(s_cfg_buf)) {
             memcpy(s_cfg_buf, e->data, (size_t)e->data_len);
             s_cfg_buf[e->data_len] = 0;
             s_cfg_pending = true;
             ESP_LOGI(TAG, "收到 cfg（%d 字节）", e->data_len);
+        } else if (strcmp(topic, t_cmd) == 0 && e->data_len < (int)sizeof(s_cmd_buf)) {
+            memcpy(s_cmd_buf, e->data, (size_t)e->data_len);
+            s_cmd_buf[e->data_len] = 0;
+            s_cmd_pending = true;
+            ESP_LOGI(TAG, "收到 cmd（%d 字节）", e->data_len);
         }
         break;
+    }
 
     default:
         break;
@@ -161,15 +179,20 @@ void net_mqtt_tick(void)
 
     snprintf(t, sizeof(t), "switchyard/%s/meta", s_dev_id);
     snprintf(payload, sizeof(payload),
-             "{\"type\":\"screen\",\"name\":\"ESP32-S31 旋钮屏\",\"fw\":\"" APP_FW_VERSION "\","
-             "\"caps\":[\"fw\",\"rssi\",\"uptime\",\"online\",\"log\",\"reboot\"],"
-             "\"display\":{\"w\":360,\"h\":360,\"formats\":[\"jpeg\"],\"fit\":[\"cover\",\"contain\"]}}");
+             "{\"type\":\"screen\","
+             "\"caps\":[\"fw\",\"rssi\",\"uptime\",\"online\",\"layout\",\"reboot\","
+             "\"brightness\",\"log\",\"background\"],"
+             "\"display\":{\"w\":360,\"h\":360,\"formats\":[\"jpeg\"],\"fit\":[\"cover\",\"contain\"]},"
+             "\"fw\":\"" APP_FW_VERSION "\","
+             "\"name\":\"ESP32-S31 旋钮屏\","
+             "\"model\":\"JC3636F118\"}");
     int r2 = esp_mqtt_client_publish(s_mqtt, t, payload, 0, 1, 1);
 
     snprintf(t, sizeof(t), "switchyard/%s/cmd", s_dev_id);
-    esp_mqtt_client_subscribe(s_mqtt, t, 1);
+    const int s1 = esp_mqtt_client_subscribe(s_mqtt, t, 1);
     snprintf(t, sizeof(t), "switchyard/%s/cfg", s_dev_id);
-    esp_mqtt_client_subscribe(s_mqtt, t, 1);
+    const int s2 = esp_mqtt_client_subscribe(s_mqtt, t, 1);
+    ESP_LOGI(TAG, "订阅结果: cmd=%d cfg=%d", s1, s2);
 
     ESP_LOGI(TAG, "meta 发布结果: availability=%d meta=%d", r1, r2);
 }
@@ -193,6 +216,22 @@ bool net_take_cfg(char *out, size_t len)
     s_cfg_pending = false;
     snprintf(out, len, "%s", s_cfg_buf);
     return true;
+}
+
+bool net_take_cmd(char *out, size_t len)
+{
+    if (!s_cmd_pending) return false;
+    s_cmd_pending = false;
+    snprintf(out, len, "%s", s_cmd_buf);
+    return true;
+}
+
+void net_publish_log(const char *text)
+{
+    if (!s_mqtt_up || text == NULL) return;
+    char t[96];
+    snprintf(t, sizeof(t), "switchyard/%s/log", s_dev_id);
+    esp_mqtt_client_publish(s_mqtt, t, text, 0, 0, 0);
 }
 
 bool net_mqtt_connected(void) { return s_mqtt_up; }

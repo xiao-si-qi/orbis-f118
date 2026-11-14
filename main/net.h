@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "esp_err.h"
 #include <stdbool.h>
@@ -31,6 +31,12 @@ void net_mqtt_publish_state(void);
 
 /** 取出收到的 cfg 负载（主循环调用） */
 bool net_take_cfg(char *out, size_t len);
+
+/** 取出收到的 cmd 负载（主循环调用） */
+bool net_take_cmd(char *out, size_t len);
+
+/** 上报一条日志到 switchyard（未连接则忽略） */
+void net_publish_log(const char *text);
 
 /** MQTT 是否已连接 */
 bool net_mqtt_connected(void);

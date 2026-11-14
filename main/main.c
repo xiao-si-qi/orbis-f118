@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -89,6 +90,14 @@ static void backlight_init(void)
     };
     ledc_channel_config(&c);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 1023 * 40 / 100);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+static void backlight_set(int pct)
+{
+    if (pct < 1) pct = 1;
+    if (pct > 100) pct = 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 1023 * pct / 100);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
@@ -474,8 +483,53 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 }
 
 #include "layout.h"
+#include "cJSON.h"
 
 static void build_cards_ui(void);
+
+static volatile bool s_log_on;
+
+static void apply_cmd(const char *json)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (root == NULL) { ESP_LOGW(TAG, "cmd 解析失败"); return; }
+
+    const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+    const char *cmd = cJSON_IsString(jcmd) ? jcmd->valuestring : NULL;
+    if (cmd == NULL) { cJSON_Delete(root); return; }
+    ESP_LOGI(TAG, "执行 cmd: %s", cmd);
+
+    if (strcmp(cmd, "reboot") == 0) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "收到重启命令");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+
+    } else if (strcmp(cmd, "state") == 0) {
+        net_mqtt_publish_state();
+
+    } else if (strcmp(cmd, "log") == 0) {
+        s_log_on = true;
+        ESP_LOGI(TAG, "日志上报已开启");
+
+    } else if (strcmp(cmd, "set") == 0) {
+        const cJSON *jk = cJSON_GetObjectItemCaseSensitive(root, "key");
+        const cJSON *jv = cJSON_GetObjectItemCaseSensitive(root, "value");
+        if (cJSON_IsString(jk) && strcmp(jk->valuestring, "brightness") == 0 && cJSON_IsNumber(jv)) {
+            const int pct = (int)jv->valuedouble;
+            backlight_set(pct);
+            ESP_LOGI(TAG, "屏幕亮度 -> %d%%", pct);
+        }
+
+    } else if (strcmp(cmd, "detail") == 0 || strcmp(cmd, "hist") == 0) {
+        const cJSON *je = cJSON_GetObjectItemCaseSensitive(root, "entity");
+        if (cJSON_IsString(je)) {
+            if (cmd[0] == 'd') detail_open(je->valuestring);
+            else chart_open(je->valuestring);
+        }
+    }
+    cJSON_Delete(root);
+}
 
 static void apply_cfg(const char *json)
 {
@@ -573,8 +627,21 @@ static void build_cards_ui(void)
     }
     lv_timer_create(ui_timer_cb, 500, NULL);
 }
+static int log_forward(const char *fmt, va_list args)
+{
+    char buf[160];
+    const int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    if (n > 0) {
+        fputs(buf, stdout);                 /* 仍然输出到串口 */
+        fflush(stdout);
+        if (s_log_on) net_publish_log(buf); /* 需要时才上报 */
+    }
+    return n;
+}
+
 void app_main(void)
 {
+    esp_log_set_vprintf(log_forward);
     ESP_LOGI(TAG, "=========== orbis-f118 启动 ===========");
     ESP_LOGI(TAG, "PSRAM %u KB / 内部 RAM %u KB",
              (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
@@ -643,14 +710,19 @@ void app_main(void)
     uint32_t last_beat = 0;
     while (1) {
         uint32_t d = lv_timer_handler();
+        net_mqtt_tick();          /* 连上后立刻发布 meta 并订阅，不等心跳 */
+
+        /* cfg / cmd 每轮都处理，避免排队时被后来的覆盖 */
+        {
+            static char cfg_json[4096];
+            static char cmd_json[1024];
+            if (net_take_cfg(cfg_json, sizeof(cfg_json))) apply_cfg(cfg_json);
+            if (net_take_cmd(cmd_json, sizeof(cmd_json))) apply_cmd(cmd_json);
+        }
+
         if (esp_timer_get_time() / 1000000ULL != last_beat) {
             last_beat = (uint32_t)(esp_timer_get_time() / 1000000ULL);
             if (last_beat % 5 == 0) {
-                net_mqtt_tick();
-                {
-                    static char cfg_json[4096];
-                    if (net_take_cfg(cfg_json, sizeof(cfg_json))) apply_cfg(cfg_json);
-                }
                 net_mqtt_publish_state();
                 ESP_LOGI(TAG, "电池: %d mV | 网络: wifi=%d rssi=%d mqtt=%d", s_bat_mv, net_wifi_connected(), net_wifi_rssi(), net_mqtt_connected());
                 ESP_LOGI(TAG, "心跳 %u s，内部 RAM %u KB，PSRAM %u KB",
