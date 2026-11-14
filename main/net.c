@@ -13,6 +13,7 @@
 #include "nvs_flash.h"
 
 #include "net.h"
+#include "ota.h"
 #include "secrets.h"
 
 #ifndef APP_FW_VERSION
@@ -180,7 +181,7 @@ void net_mqtt_tick(void)
     snprintf(t, sizeof(t), "switchyard/%s/meta", s_dev_id);
     snprintf(payload, sizeof(payload),
              "{\"type\":\"screen\","
-             "\"caps\":[\"fw\",\"rssi\",\"uptime\",\"online\",\"layout\",\"reboot\","
+             "\"caps\":[\"fw\",\"rssi\",\"uptime\",\"online\",\"layout\",\"ota\",\"reboot\","
              "\"brightness\",\"log\",\"background\"],"
              "\"display\":{\"w\":360,\"h\":360,\"formats\":[\"jpeg\"],\"fit\":[\"cover\",\"contain\"]},"
              "\"fw\":\"" APP_FW_VERSION "\","
@@ -203,10 +204,10 @@ void net_mqtt_publish_state(void)
     char t[96], payload[256];
     snprintf(t, sizeof(t), "switchyard/%s/state", s_dev_id);
     snprintf(payload, sizeof(payload),
-             "{\"uptime\":%lu,\"rssi\":%d,\"fw\":\"" APP_FW_VERSION "\",\"online\":true,\"heap\":%u}",
+             "{\"uptime\":%lu,\"rssi\":%d,\"fw\":\"" APP_FW_VERSION "\",\"online\":true,\"heap\":%u,\"ota\":%d}",
              (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ),
              net_wifi_rssi(),
-             (unsigned)(esp_get_free_heap_size() / 1024));
+             (unsigned)(esp_get_free_heap_size() / 1024), ota_percent());
     esp_mqtt_client_publish(s_mqtt, t, payload, 0, 1, 1);
 }
 

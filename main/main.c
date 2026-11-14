@@ -484,6 +484,7 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 
 #include "layout.h"
 #include "cJSON.h"
+#include "ota.h"
 
 static void build_cards_ui(void);
 
@@ -504,6 +505,15 @@ static void apply_cmd(const char *json)
         ESP_LOGW(TAG, "收到重启命令");
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
+
+    } else if (strcmp(cmd, "ota") == 0) {
+        const cJSON *ju = cJSON_GetObjectItemCaseSensitive(root, "url");
+        const cJSON *jv = cJSON_GetObjectItemCaseSensitive(root, "version");
+        if (cJSON_IsString(ju)) {
+            ota_start_url(ju->valuestring, cJSON_IsString(jv) ? jv->valuestring : NULL);
+        } else {
+            ota_start_check();      /* 没带 url：走 switchyard 的 firmware.json 检查更新 */
+        }
 
     } else if (strcmp(cmd, "state") == 0) {
         net_mqtt_publish_state();
