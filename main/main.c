@@ -48,15 +48,27 @@ static i2c_master_dev_handle_t s_touch;
 /* 厂商初始化表（类型由 esp_lcd_st77916.h 提供）*/
 #include "lcd_init_commands.h"
 
+static volatile bool s_flush_done;
+
 static bool on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *ed, void *ctx)
 {
-    lv_display_flush_ready(s_disp);
+    s_flush_done = true;      /* 由 lv_flush_cb 等待后统一通知 LVGL */
     return false;
 }
 
 static void lv_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
+    /* 同步等待本块传输完成再通知 LVGL：
+       异步回调一旦丢一次，LVGL 会死等 flushing 标志（实测卡在 wait_for_flushing）。 */
+    s_flush_done = false;
     esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, px_map);
+
+    const int64_t deadline = esp_timer_get_time() + 200 * 1000;   /* 200 ms 兜底 */
+    while (!s_flush_done && esp_timer_get_time() < deadline) {
+        vTaskDelay(1);
+    }
+    s_flush_done = false;
+    lv_display_flush_ready(disp);
 }
 
 static uint32_t tick_cb(void)
@@ -558,7 +570,6 @@ static void build_cards_ui(void)
         s_cards[i].card = lv_obj_get_parent(s_cards[i].value);
         if (s_card_group == NULL) s_card_group = lv_group_create();
         lv_group_add_obj(s_card_group, s_cards[i].card);
-        lv_group_focus_obj(s_cards[i].card);
     }
     lv_timer_create(ui_timer_cb, 500, NULL);
 }
