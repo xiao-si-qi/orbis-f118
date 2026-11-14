@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -20,6 +20,7 @@ LV_FONT_DECLARE(lv_font_cjk16);
 #include "detail.h"
 #include "bg_image.h"
 #include "settings.h"
+#include "chart.h"
 
 
 static const char *TAG = "orbis-f118";
@@ -317,6 +318,8 @@ static void card_clicked_cb(lv_event_t *e)
     haptic_click();
     if (c->toggle) {
         detail_open(c->entity);          /* 灯：打开详情页（开关/亮度/色温） */
+    } else if (strncmp(c->entity, "sensor.", 7) == 0 || strncmp(c->entity, "weather.", 8) == 0) {
+        chart_open(c->entity);           /* 传感器/天气：历史折线 */
     } else {
         ESP_LOGI(TAG, "点击 %s（仅显示）", c->entity);
     }
@@ -336,7 +339,7 @@ static void show_page(int idx)
 static void gesture_cb(lv_event_t *e)
 {
     const lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-    if (detail_is_open()) return;
+    if (detail_is_open() || chart_is_open()) return;
     if (dir == LV_DIR_LEFT) show_page(s_cur_page + 1);
     else if (dir == LV_DIR_RIGHT) show_page(s_cur_page - 1);
 }
@@ -433,6 +436,7 @@ static void ui_timer_cb(lv_timer_t *t)
     update_statusbar();
     detail_refresh();
     if (s_cur_page == 1) settings_refresh();
+    chart_poll();
 }
 
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
