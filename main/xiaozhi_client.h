@@ -32,4 +32,38 @@ bool xiaozhi_client_ready(void);
 /** 服务端类型：官方 / 自建（用于页面显示）。 */
 const char *xiaozhi_client_server_note(void);
 
+/* ------------------------- 界面用的状态 / 控制 API ------------------------- */
+
+/**
+ * 界面用的高阶状态，全部由内部标志推导：
+ *   LISTENING = 上行（麦克风）在跑；THINKING = 上行已停、回复音频还没到；
+ *   SPEAKING  = TTS 正在播放；ERROR = 发现/连接失败；CONNECTING = 发现或握手进行中。
+ */
+typedef enum {
+    XZ_IDLE = 0,    /**< 未启用，或已连上但空闲 */
+    XZ_CONNECTING,  /**< 正在发现服务端 / WebSocket 握手中 */
+    XZ_LISTENING,   /**< 麦克风上行中（服务端在听）*/
+    XZ_THINKING,    /**< 上行已停、还没有下行音频（服务端在思考）*/
+    XZ_SPEAKING,    /**< TTS 正在播放 */
+    XZ_ERROR,       /**< 发现/连接出错 */
+} xz_state_t;
+
+/** 当前状态（读几个 volatile 标志，不做任何阻塞/分配，可在 LVGL 线程调用）。 */
+xz_state_t xiaozhi_state(void);
+
+/**
+ * 手动开麦：给上行任务排一次 listen start（和自动流程发的是同一条消息）。
+ * 还没连上服务端时返回 false，界面据此提示。
+ */
+bool xiaozhi_listen_start(void);
+
+/** 手动关麦：给上行任务排一次 listen stop（LVGL 线程里只置标志，不等网络）。 */
+void xiaozhi_listen_stop(void);
+
+/**
+ * 最近一次识别到的文字（服务端 stt 消息），最多 96 字节，永远非 NULL。
+ * 返回的是内部快照，界面直接显示即可，别长期持有。
+ */
+const char *xiaozhi_last_text(void);
+
 #endif /* XIAOZHI_CLIENT_H */

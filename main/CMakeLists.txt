@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "net.c" "web.c" "ha_client.c" "app_settings.c" "ui_home.c" "log_buffer.c" "bsp_shim.c" "ota.c" "bg_image.c" "bg_cache.c" "layout.c" "lv_font_cjk16.c"
+idf_component_register(SRCS "main.c" "net.c" "web.c" "ha_client.c" "app_settings.c" "ui_home.c" "assistant_ui.c" "log_buffer.c" "bsp_shim.c" "ota.c" "bg_image.c" "bg_cache.c" "layout.c" "lv_font_cjk16.c"
                                 "voice_audio.c" "xiaozhi_client.c"
                        INCLUDE_DIRS "."
                        REQUIRES lvgl st77916 esp_lcd esp_driver_spi esp_driver_gpio esp_driver_i2c esp_driver_ledc esp_driver_i2s esp_timer heap

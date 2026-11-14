@@ -61,6 +61,7 @@ static const char *TAG = "xiaozhi";
 #define XZ_TOKEN_MAX    96
 #define XZ_STATUS_MAX   72
 #define XZ_NOTE_MAX     40
+#define XZ_TEXT_MAX     96      /* 界面显示的"最近一句"上限（字节）*/
 #define XZ_DISCOVER_MAX (24 * 1024)
 #define XZ_WS_BUF       768     /* 文本帧累积缓冲：hello/stt/llm 的 JSON 可能上百字节 */
 
@@ -100,6 +101,18 @@ static volatile bool s_ready;
 static volatile int s_gen;
 static volatile bool s_task_alive;
 static esp_websocket_client_handle_t s_ws;
+
+/* ---- 给界面看的高阶状态（不参与音频流程，只读派生）---- */
+static volatile bool s_error;          /* 发现/连接出错（界面画 ERROR 脸）*/
+static volatile bool s_thinking;       /* 上行停了、下行还没开始 */
+static volatile int64_t s_thinking_at; /* thinking 起点（8 秒兜底，避免一直转圈）*/
+static volatile int s_listen_req;      /* 界面手动请求：1=start 2=stop，上行任务消费 */
+
+/* 最近一次 stt 文字：WS 回调写、LVGL 线程读，用临界区护一下，
+   读侧拷进快照再返回，界面不会读到半句中文。 */
+static char s_last_text[XZ_TEXT_MAX + 1];
+static char s_text_snap[XZ_TEXT_MAX + 1];
+static portMUX_TYPE s_text_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* hello 可能被分片，这里做个小累积缓冲 */
 static char s_rx[XZ_WS_BUF];
@@ -165,6 +178,50 @@ static void xz_set_state(int st)
     case XZ_ST_SPEAK:  set_status("播放回复"); break;
     default:           set_status("已连接");   break;
     }
+}
+
+/** 上行停了、回复还没来：界面显示"思考中"，一直不来就 8 秒后自己收回。 */
+static void xz_think_start(void)
+{
+    s_thinking_at = esp_timer_get_time();
+    s_thinking = true;
+}
+
+static void xz_think_clear(void)
+{
+    s_thinking = false;
+}
+
+/** UTF-8 安全截断：最多 cap-1 字节，不把一个汉字劈成半个（界面会画出乱码）。 */
+static void utf8_copy(char *dst, size_t cap, const char *src)
+{
+    if (dst == NULL || cap == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (src == NULL) {
+        return;
+    }
+    size_t n = strlen(src);
+    if (n > cap - 1) {
+        n = cap - 1;
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) {
+            n--;                       /* 退到字符首字节 */
+        }
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+/** 记下最近一次识别到的文字（96 字节封顶，界面拿去显示）。 */
+static void set_last_text(const char *text)
+{
+    if (text == NULL) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_text_mux);
+    utf8_copy(s_last_text, sizeof(s_last_text), text);
+    taskEXIT_CRITICAL(&s_text_mux);
 }
 
 /** 用 MAC 生成稳定的、UUID 形态的 Client-Id（小智服务端要求合法 UUID）。 */
@@ -480,6 +537,27 @@ static int stream_send_text(const char *json)
     return sent;
 }
 
+/**
+ * 发一条 listen start/stop。
+ * start 带 mode=auto（和原来的自动流程一字不差，服务端自己 VAD 收尾）；
+ * stop 不带 mode：手动关麦时服务端只要一个 state。
+ * 只在音频任务里调用（会阻塞等网络），界面线程绝不能直接调。
+ */
+static bool send_listen(const char *state, bool with_mode)
+{
+    char msg[144];
+    const char *mode = with_mode ? ",\"mode\":\"auto\"" : "";
+    if (s_session[0] != '\0') {
+        snprintf(msg, sizeof(msg),
+                 "{\"session_id\":\"%.32s\",\"type\":\"listen\",\"state\":\"%s\"%s}",
+                 s_session, state, mode);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "{\"type\":\"listen\",\"state\":\"%s\"%s}", state, mode);
+    }
+    return stream_send_text(msg) > 0;
+}
+
 /** 每帧判一次"是否该退出"：和 stream_start 在同一把锁里，避免抢跑。 */
 static bool stream_keep_running(volatile bool *alive)
 {
@@ -538,6 +616,8 @@ static void stream_set_stop(void)
     s_uplink = false;
     s_pending_listen = false;
     s_tts_active = false;
+    s_listen_req = 0;           /* 连接断了：丢掉界面还没被消费的开/关麦请求 */
+    xz_think_clear();
     s_state = XZ_ST_IDLE;       /* 退出路径不刷状态文字，避免覆盖"未启用" */
 }
 
@@ -611,23 +691,44 @@ static void xz_sender_task(void *arg)
         /* 连上后先替服务端开麦（小智协议：listen start 由设备发起，auto 由服务端 VAD 收尾） */
         if (s_pending_listen && s_ready) {
             s_pending_listen = false;
-            char msg[128];
-            if (s_session[0] != '\0') {
-                snprintf(msg, sizeof(msg),
-                         "{\"session_id\":\"%.32s\",\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}",
-                         s_session);
-            } else {
-                snprintf(msg, sizeof(msg),
-                         "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}");
-            }
-            if (stream_send_text(msg) > 0) {
+            if (send_listen("start", true)) {
                 ESP_LOGI(TAG, "已发送 listen start（auto），开始上行");
                 s_uplink = true;
+                xz_think_clear();
                 xz_set_state(XZ_ST_LISTEN);
             } else {
                 ESP_LOGW(TAG, "listen start 发送失败，1 秒后重试");
                 s_pending_listen = true;
                 vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+
+        /* 界面「轻触说话」的手动开/关麦：和自动流程走同一条 listen 消息。
+           发送放在音频任务里做，LVGL 线程只置 s_listen_req，绝不在界面线程里等网络。 */
+        const int req = s_listen_req;
+        if (req != 0 && s_ready) {
+            s_listen_req = 0;
+            if (req == 1) {
+                if (send_listen("start", true)) {
+                    ESP_LOGI(TAG, "手动：已发送 listen start，开始上行");
+                    s_pending_listen = false;       /* 别让自动流程再发一次 */
+                    s_uplink = true;
+                    xz_think_clear();
+                    xz_set_state(XZ_ST_LISTEN);
+                } else {
+                    ESP_LOGW(TAG, "手动 listen start 发送失败");
+                }
+            } else {
+                if (send_listen("stop", false)) {
+                    ESP_LOGI(TAG, "手动：已发送 listen stop，停止上行");
+                } else {
+                    ESP_LOGW(TAG, "手动 listen stop 发送失败");
+                }
+                s_uplink = false;
+                xz_think_start();                   /* 等服务端把这次说话处理成 tts */
+                if (s_state == XZ_ST_LISTEN) {
+                    xz_set_state(XZ_ST_IDLE);
+                }
             }
         }
 
@@ -908,6 +1009,8 @@ static void handle_server_hello(const cJSON *root)
     s_ready = true;
     s_wire_ver = XZ_PROTO_VER;
     s_state = XZ_ST_IDLE;
+    s_error = false;
+    xz_think_clear();
     set_status("已连接");
     stream_start();          /* 起编解码任务；listen start 由上行任务发 */
 }
@@ -939,10 +1042,14 @@ static void handle_text_message(const char *json)
             play_flush(false);
             s_tts_active = false;
             s_uplink = true;
+            xz_think_clear();
             xz_set_state(XZ_ST_LISTEN);
             ESP_LOGI(TAG, "服务端：开始聆听");
         } else {
             s_uplink = false;
+            if (s_ready) {
+                xz_think_start();      /* 上行停了、回复还没来：界面显示"思考中" */
+            }
             if (s_state == XZ_ST_LISTEN) {
                 xz_set_state(XZ_ST_IDLE);
             }
@@ -953,9 +1060,11 @@ static void handle_text_message(const char *json)
         if (strcmp(st, "start") == 0) {
             s_uplink = false;              /* 半双工：放音时不发麦克风 */
             s_tts_active = true;
+            xz_think_clear();
             xz_set_state(XZ_ST_THINK);
         } else if (strcmp(st, "stop") == 0) {
             s_tts_active = false;
+            xz_think_clear();
             /* 队列里可能还有几百毫秒没放完：播放任务放完最后一帧再把状态收回"已连接" */
             if (s_q_count == 0 && s_state != XZ_ST_IDLE) {
                 xz_set_state(XZ_ST_IDLE);
@@ -968,6 +1077,7 @@ static void handle_text_message(const char *json)
     } else if (strcmp(t, "abort") == 0) {
         s_uplink = false;
         s_tts_active = false;
+        xz_think_clear();
         play_flush(true);                  /* 丢队列 + 让播放任务重置解码器 */
         xz_set_state(XZ_ST_IDLE);
         ESP_LOGW(TAG, "服务端：打断（停止双向、清空待播音频）");
@@ -976,6 +1086,7 @@ static void handle_text_message(const char *json)
         const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
         if (cJSON_IsString(text)) {
             ESP_LOGI(TAG, "识别到：%.120s", text->valuestring);
+            set_last_text(text->valuestring);   /* 界面显示"刚才说了什么" */
         }
 
     } else if (strcmp(t, "llm") == 0) {
@@ -1000,6 +1111,7 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGI(TAG, "WebSocket 已连接，发送 hello");
         s_wire_ver = XZ_PROTO_VER;
         s_session[0] = '\0';
+        s_error = false;
         /* v2：声明的版本要和二进制帧头一致（服务端按这个决定怎么打包下行音频） */
         const char hello[] =
             "{\"type\":\"hello\",\"version\":2,\"transport\":\"websocket\","
@@ -1065,11 +1177,15 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_ready = false;
+        s_error = true;             /* 界面先画 ERROR 脸，重连成功后由 CONNECTED 清掉 */
+        xz_think_clear();
         stream_set_stop();          /* 只置标志：编码/播放任务自己收尾并释放句柄 */
         set_status("连接断开");
         break;
     case WEBSOCKET_EVENT_ERROR:
         s_ready = false;
+        s_error = true;
+        xz_think_clear();
         stream_set_stop();
         set_status("连接出错");
         break;
@@ -1097,12 +1213,17 @@ static void xz_task(void *arg)
     /* 开机时语音配置来自 NVS，可能比 WiFi 还早就绪；发现失败就等网络好了重试 */
     while (my_gen == s_gen && s_enabled) {
         if (!net_wifi_connected()) {
+            s_error = false;
             set_status("等待网络 …");
-        } else if (discover_ws_url()) {
-            break;
-        } else if (my_gen != s_gen || !s_enabled) {
-            goto out;
         } else {
+            s_error = false;            /* 这次尝试先按"连接中"显示 */
+            if (discover_ws_url()) {
+                break;
+            }
+            if (my_gen != s_gen || !s_enabled) {
+                goto out;
+            }
+            s_error = true;             /* 发现失败：界面画 ERROR 脸 + 原因 */
             set_status("服务端不可达，稍后重试");
         }
         for (int i = 0; i < 10; i++) {
@@ -1126,6 +1247,7 @@ static void xz_task(void *arg)
     my_ws = esp_websocket_client_init(&ws_cfg);
     s_ws = my_ws;                      /* 事件回调/发送任务靠它发数据 */
     if (my_ws == NULL) {
+        s_error = true;
         set_status("WebSocket 初始化失败");
         goto out;
     }
@@ -1138,6 +1260,7 @@ static void xz_task(void *arg)
 
     esp_websocket_register_events(my_ws, WEBSOCKET_EVENT_ANY, ws_event, NULL);
     if (esp_websocket_client_start(my_ws) != ESP_OK) {
+        s_error = true;
         set_status("WebSocket 启动失败");
         goto out;
     }
@@ -1190,6 +1313,9 @@ void xiaozhi_client_configure(bool enabled, const char *endpoint)
         s_enabled = false;
         s_gen++;                 /* 让旧任务退出（任务里会停流 + stop/destroy WS） */
         s_ready = false;
+        s_error = false;
+        s_listen_req = 0;
+        xz_think_clear();
         stream_set_stop();       /* 立刻停流，不等任务（这里常在 LVGL 线程里跑） */
         snprintf(s_status, sizeof(s_status), "未启用");
         ESP_LOGI(TAG, "小智已停止");
@@ -1201,6 +1327,9 @@ void xiaozhi_client_configure(bool enabled, const char *endpoint)
     }
 
     s_enabled = true;
+    s_error = false;
+    s_listen_req = 0;
+    xz_think_clear();
     snprintf(s_endpoint, sizeof(s_endpoint), "%s", endpoint);
     s_gen++;
     const int gen = s_gen;
@@ -1223,6 +1352,7 @@ void xiaozhi_client_configure(bool enabled, const char *endpoint)
     snprintf(s_status, sizeof(s_status), "准备连接 …");
     if (xTaskCreate(xz_task, "xiaozhi", 8192, (void *)(intptr_t)gen, 4, NULL) != pdPASS) {
         s_enabled = false;
+        s_error = true;
         snprintf(s_status, sizeof(s_status), "任务创建失败");
     }
 }
@@ -1245,4 +1375,67 @@ bool xiaozhi_client_ready(void)
 const char *xiaozhi_client_server_note(void)
 {
     return s_note;
+}
+
+/* ------------------------- 界面用的状态 / 控制 API ------------------------- */
+
+xz_state_t xiaozhi_state(void)
+{
+    if (!s_enabled) {
+        return XZ_IDLE;                 /* 没开语音：不管连没连上都算空闲 */
+    }
+    if (s_state == XZ_ST_LISTEN) {
+        return XZ_LISTENING;
+    }
+    if (s_state == XZ_ST_SPEAK) {
+        return XZ_SPEAKING;
+    }
+    if (s_state == XZ_ST_THINK || s_thinking) {
+        /* 上行停了、下行还没来 = 服务端在思考。
+           说了句空话时服务端可能不回 tts，8 秒兜底收回，别让界面一直转圈。 */
+        if (s_thinking && (esp_timer_get_time() - s_thinking_at) > 8LL * 1000 * 1000) {
+            s_thinking = false;
+        } else {
+            return XZ_THINKING;
+        }
+    }
+    if (s_error) {
+        return XZ_ERROR;
+    }
+    if (!s_ready) {
+        return XZ_CONNECTING;
+    }
+    return XZ_IDLE;
+}
+
+bool xiaozhi_listen_start(void)
+{
+    if (!s_enabled) {
+        ESP_LOGW(TAG, "手动开麦被拒：小智未启用");
+        return false;
+    }
+    if (!s_ready) {
+        ESP_LOGW(TAG, "手动开麦被拒：还没连上服务端（%s）", xiaozhi_client_status_text());
+        return false;
+    }
+    s_listen_req = 1;       /* 上行任务看到就发 listen start，界面线程不等网络 */
+    ESP_LOGI(TAG, "手动开麦已排队");
+    return true;
+}
+
+void xiaozhi_listen_stop(void)
+{
+    if (!s_enabled) {
+        return;
+    }
+    s_listen_req = 2;       /* 上行任务看到就发 listen stop */
+    ESP_LOGI(TAG, "手动关麦已排队");
+}
+
+const char *xiaozhi_last_text(void)
+{
+    taskENTER_CRITICAL(&s_text_mux);
+    memcpy(s_text_snap, s_last_text, sizeof(s_text_snap));
+    taskEXIT_CRITICAL(&s_text_mux);
+    return s_text_snap;
 }

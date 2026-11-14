@@ -33,6 +33,7 @@
 #include "lvgl.h"
 
 #include "bsp_shim.h"       /* bsp_display_set_backlight()（旧工程 bsp_display_* 的替代） */
+#include "assistant_ui.h"  /* 小智助手界面（MQTT assistant 命令 / 旋钮避让） */
 #include "net.h"
 #include "battery.h"
 #include "web.h"           /* 网页配置后台（配网 / 网页 OTA），WiFi 连上后起 */
@@ -353,8 +354,15 @@ static int64_t s_last_diag_us;       /* 错误摘要限流（60s） */
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
-    /* 旋钮翻页：顺时针（实测 diff<0）下一页，每格一次触觉反馈 */
+    /* 小智助手界面开着时旋钮什么都不做（不翻底下主界面的页，也不震动）：
+       先把累计的脉冲读掉丢掉，关界面时不会突然跳好几页。 */
     const int8_t diff = encoder_read_diff();
+    if (assistant_ui_is_open()) {
+        data->enc_diff = 0;
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+    /* 旋钮翻页：顺时针（实测 diff<0）下一页，每格一次触觉反馈 */
     if (diff != 0) {
         ui_home_page_step(diff < 0 ? 1 : -1);
         haptic_click();
@@ -531,6 +539,18 @@ static void apply_cmd(const char *json)
         if (cJSON_IsString(je)) {
             ui_home_open_detail(je->valuestring);
         }
+
+    } else if (strcmp(cmd, "assistant") == 0) {
+        /* 小智助手界面开关：{cmd:"assistant"} 打开，{"cmd":"assistant","open":false} 关闭。
+           只是切界面，不碰音频通路；语音会话照旧由 layout 的 voice 段 / voice 命令控制。 */
+        const cJSON *jopen = cJSON_GetObjectItemCaseSensitive(root, "open");
+        const bool want_open = cJSON_IsBool(jopen) ? cJSON_IsTrue(jopen) : true;
+        if (want_open) {
+            assistant_ui_open();
+        } else {
+            assistant_ui_close();
+        }
+        ESP_LOGI(TAG, "小智助手界面：%s", want_open ? "打开" : "关闭");
 
     } else if (strcmp(cmd, "hist") == 0) {
         /* 调试命令：同步拉 6 小时历史后直接显示折线（会短暂阻塞主循环，正常交互走点卡片） */

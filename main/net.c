@@ -1,4 +1,4 @@
-#include <string.h>
+﻿#include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
@@ -36,6 +36,8 @@ static char s_will_topic[96];
 /* 收到的 cfg（由主循环取走） */
 static char s_cfg_buf[4096];
 static volatile bool s_cfg_pending;
+static int s_cfg_len;               /* cfg 分片累计长度 */
+static int s_cmd_len;               /* cmd 分片累计长度 */
 
 /* 收到的 cmd（由主循环取走） */
 static char s_cmd_buf[1024];
@@ -88,16 +90,41 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         snprintf(t_cfg, sizeof(t_cfg), "switchyard/%s/cfg", s_dev_id);
         snprintf(t_cmd, sizeof(t_cmd), "switchyard/%s/cmd", s_dev_id);
 
-        if (strcmp(topic, t_cfg) == 0 && e->data_len < (int)sizeof(s_cfg_buf)) {
-            memcpy(s_cfg_buf, e->data, (size_t)e->data_len);
-            s_cfg_buf[e->data_len] = 0;
-            s_cfg_pending = true;
-            ESP_LOGI(TAG, "收到 cfg（%d 字节）", e->data_len);
-        } else if (strcmp(topic, t_cmd) == 0 && e->data_len < (int)sizeof(s_cmd_buf)) {
-            memcpy(s_cmd_buf, e->data, (size_t)e->data_len);
-            s_cmd_buf[e->data_len] = 0;
-            s_cmd_pending = true;
-            ESP_LOGI(TAG, "收到 cmd（%d 字节）", e->data_len);
+        /* ESP-MQTT 把大于 buffer_size 的消息拆成多个事件（data_offset 递增）。
+           必须先拼完再交出去，否则 layout_parse 拿到的是被截断的 JSON。 */
+        if (strcmp(topic, t_cfg) == 0) {
+            if (e->current_data_offset == 0) {
+                s_cfg_len = 0;
+            }
+            if (s_cfg_len + e->data_len < (int)sizeof(s_cfg_buf)) {
+                memcpy(s_cfg_buf + s_cfg_len, e->data, (size_t)e->data_len);
+                s_cfg_len += e->data_len;
+                s_cfg_buf[s_cfg_len] = 0;
+            } else {
+                ESP_LOGW(TAG, "cfg 太大，丢弃（%d + %d）", s_cfg_len, e->data_len);
+                s_cfg_len = 0;
+                break;
+            }
+            if (e->current_data_offset + e->data_len >= e->total_data_len) {
+                s_cfg_pending = true;
+                ESP_LOGI(TAG, "收到 cfg（共 %d 字节）", s_cfg_len);
+            }
+        } else if (strcmp(topic, t_cmd) == 0) {
+            if (e->current_data_offset == 0) {
+                s_cmd_len = 0;
+            }
+            if (s_cmd_len + e->data_len < (int)sizeof(s_cmd_buf)) {
+                memcpy(s_cmd_buf + s_cmd_len, e->data, (size_t)e->data_len);
+                s_cmd_len += e->data_len;
+                s_cmd_buf[s_cmd_len] = 0;
+            } else {
+                s_cmd_len = 0;
+                break;
+            }
+            if (e->current_data_offset + e->data_len >= e->total_data_len) {
+                s_cmd_pending = true;
+                ESP_LOGI(TAG, "收到 cmd（共 %d 字节）", s_cmd_len);
+            }
         }
         break;
     }
@@ -179,6 +206,7 @@ esp_err_t net_mqtt_start(void)
         .credentials.username = sc->mqtt_user,
         .credentials.authentication.password = sc->mqtt_pass,
         .session.keepalive = 30,
+        .buffer.size = 4096,        /* 大于常见 cfg，尽量少分片（分片也已支持） */
         .session.last_will.topic = s_will_topic,
         .session.last_will.msg = "offline",
         .session.last_will.msg_len = 7,
@@ -239,6 +267,7 @@ bool net_take_cfg(char *out, size_t len)
     if (!s_cfg_pending) return false;
     s_cfg_pending = false;
     snprintf(out, len, "%s", s_cfg_buf);
+    s_cfg_len = 0;
     return true;
 }
 
@@ -247,6 +276,7 @@ bool net_take_cmd(char *out, size_t len)
     if (!s_cmd_pending) return false;
     s_cmd_pending = false;
     snprintf(out, len, "%s", s_cmd_buf);
+    s_cmd_len = 0;
     return true;
 }
 

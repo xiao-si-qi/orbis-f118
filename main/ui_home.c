@@ -21,6 +21,7 @@
 #include "lvgl.h"
 
 #include "app_settings.h"
+#include "assistant_ui.h"   /* 语音页的「小智」按钮 + 500ms 定时器里的 assistant_ui_tick() */
 #include "bsp_board.h"      /* 新板 shim（引脚表 + bsp_display_set_backlight） */
 #include "ha_client.h"
 #include "layout.h"
@@ -745,6 +746,7 @@ static void build_status_page(lv_obj_t *scr)
 }
 
 static lv_obj_t *s_voice_lines[3];
+static lv_obj_t *s_voice_open_btn;
 static lv_obj_t *s_voice_test_btn;
 static lv_obj_t *s_voice_test_label;
 
@@ -783,6 +785,13 @@ static void voice_test_btn_cb(lv_event_t *e)
     }
 }
 
+static void voice_open_assistant_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "语音页：打开小智助手界面");
+    assistant_ui_open();
+}
+
 static void build_voice_page(lv_obj_t *scr)
 {
     lv_obj_t *page = lv_obj_create(scr);
@@ -814,10 +823,26 @@ static void build_voice_page(lv_obj_t *scr)
         lv_obj_align(s_voice_lines[i], LV_ALIGN_TOP_MID, 0, 108 + i * 40);
     }
 
-    /* 「音频自检」按钮：录 1.5s → 日志/按钮上出峰值与 RMS → 回放（走线路输出） */
+    /* 一排两个按钮：左「小智」（打开助手界面：白底会动的脸 + 触摸说话），
+       右「音频自检」（录 1.5s → 日志/按钮上出峰值与 RMS → 回放，走线路输出）。
+       圆屏下部收窄，两个 130 宽的按钮放在 y=250 刚好在安全带里。 */
+    s_voice_open_btn = lv_button_create(page);
+    lv_obj_set_size(s_voice_open_btn, 130, 40);
+    lv_obj_align(s_voice_open_btn, LV_ALIGN_TOP_MID, -70, 250);
+    lv_obj_set_style_bg_color(s_voice_open_btn, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_voice_open_btn, LV_OPA_90, 0);
+    lv_obj_set_style_radius(s_voice_open_btn, 14, 0);
+    lv_obj_add_event_cb(s_voice_open_btn, voice_open_assistant_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *open_label = lv_label_create(s_voice_open_btn);
+    lv_label_set_text(open_label, "小智");
+    lv_obj_set_style_text_font(open_label, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(open_label, lv_color_black(), 0);
+    lv_obj_center(open_label);
+
     s_voice_test_btn = lv_button_create(page);
-    lv_obj_set_size(s_voice_test_btn, 180, 40);
-    lv_obj_align(s_voice_test_btn, LV_ALIGN_TOP_MID, 0, 250);
+    lv_obj_set_size(s_voice_test_btn, 130, 40);
+    lv_obj_align(s_voice_test_btn, LV_ALIGN_TOP_MID, 70, 250);
     lv_obj_set_style_bg_color(s_voice_test_btn, COLOR_ACCENT, 0);
     lv_obj_set_style_radius(s_voice_test_btn, 14, 0);
     lv_obj_add_event_cb(s_voice_test_btn, voice_test_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -1078,6 +1103,9 @@ static void refresh_timer_cb(lv_timer_t *t)
             lv_obj_remove_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
         }
     }
+
+    /* 小智助手界面：开着才刷（表情动画在 assistant_ui 自己的 50ms 定时器里）*/
+    assistant_ui_tick();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2090,6 +2118,7 @@ static void build_ui(void)
     memset(s_page_tiles, 0, sizeof(s_page_tiles));
     memset(s_sys_lines, 0, sizeof(s_sys_lines));
     memset(s_voice_lines, 0, sizeof(s_voice_lines));
+    s_voice_open_btn = NULL;
     s_voice_test_btn = NULL;
     s_voice_test_label = NULL;
 
