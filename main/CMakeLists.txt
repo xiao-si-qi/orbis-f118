@@ -1,4 +1,4 @@
-# lv_mem_psram.c 提供 liblvgl 需要的 lv_mem_init / lv_malloc_core / ... （自定义分配器）。
+﻿# lv_mem_psram.c 提供 liblvgl 需要的 lv_mem_init / lv_malloc_core / ... （自定义分配器）。
 # 静态库按依赖顺序链接，liblvgl 的 lv_init.c.obj 是在 main 之后才被拉进来的，
 # 普通链接会漏掉这个 .o；WHOLE_ARCHIVE 强制包含 main 的全部目标文件
 # （ESP-IDF 给 esp_phy 等组件也是这么做的）。

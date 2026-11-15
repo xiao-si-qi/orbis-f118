@@ -5,8 +5,18 @@ menu "Orbis panel"
         range 2 120
         default 5
         help
-            How often each entity state is refreshed through the REST API.
-            The entity list comes from the layout pushed over MQTT
-            (orbis/<id>/cfg), not from a file on the device.
+            How often each entity state is refreshed through the REST API when the
+            WebSocket channel is not in use.
+
+    config APP_WEB_ENABLED
+        bool "Enable the on-device web configuration server"
+        default n
+        help
+            Serves http://<device-ip>/ for editing WiFi / HA settings and uploading
+            firmware. Disabled by default: it costs about 6-10 KB of internal RAM
+            (httpd task stack + sockets), which this board cannot spare while the
+            Bluetooth stack and the HA WebSocket are also linked in.
+            With it disabled, changing WiFi/HA settings requires editing secrets.h
+            and reflashing.
 
 endmenu

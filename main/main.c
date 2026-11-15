@@ -1,4 +1,4 @@
-/*
+﻿/*
  * orbis-f118 · 360×360 圆屏（ESP32-S31 / JC3636F118）
  *
  * 硬件初始化沿用原来的写法（背光 / LCD / LVGL / 触摸 / 编码器 / 触觉 / 电池 / 网络）。
@@ -39,7 +39,9 @@
 #include "net.h"
 #include "battery.h"
 #include "bt_link.h"       /* 蓝牙链路抽象层（本版是桩：协议栈未编译，恒「未启用」） */
-#include "web.h"           /* 网页配置后台（配网 / 网页 OTA），WiFi 连上后起 */
+#if CONFIG_APP_WEB_ENABLED
+#include "web.h"           /* 网页配置后台（配网 / 网页 OTA）*/
+#endif
 #include "app_settings.h"  /* NVS 配置：WiFi / HA / MQTT / 设置页口令 */
 #include "ha_client.h"
 #include "ha_ws.h"
@@ -699,7 +701,9 @@ void app_main(void)
     }
 
     /* 配置页（80 端口）：一次启动后一直在跑，断线重连不需要重启它 */
+#if CONFIG_APP_WEB_ENABLED
     web_start();
+#endif
     if (net_wifi_connected()) {
         ESP_LOGI(TAG, "配置页: http://%s/ （手机浏览器打开，可改 WiFi / HA / 网页升级）",
                  net_ip_string());
@@ -752,9 +756,9 @@ void app_main(void)
         net_mqtt_tick();          /* 连上后立刻发布 meta 并订阅，不等心跳 */
 
         /* 配置页：断线重连 / 启动时失败的话在这里补起（已在跑就是空操作） */
-        if (!web_running() && net_wifi_connected()) {
-            web_start();
-        }
+    #if CONFIG_APP_WEB_ENABLED
+    web_start();
+#endif
 
         /* cfg / cmd 每轮都处理，避免排队时被后来的覆盖 */
         {
