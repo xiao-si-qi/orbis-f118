@@ -24,16 +24,18 @@ bool ui_home_assistant_current(void);
 /** 用布局重建界面（可在任意任务调用，内部切回 LVGL 上下文）。 */
 void ui_home_apply(const layout_t *layout);
 
-/** 打开子页面（灯：亮度/色温；空调：目标温度/模式/风速）。都走同一个 s_detail。 */
+/** 打开子页面（灯：亮度/色温；空调：目标温度/模式/风速；风扇：风速/预设/摇头）。
+ *  都走同一个 s_detail，按实体 id 前缀（light./climate./fan.）决定显示哪一组控件。 */
 void ui_home_open_detail(const char *entity_id);
 
 /** 关闭子页面（带滑出动画）。 */
 void ui_home_close_detail(void);
 
 /**
- * 旋钮在详情页里调值（灯：亮度/色温；空调：目标温度，整格 = 该实体的 target_temp_step）。
+ * 旋钮在详情页里调值（灯：亮度/色温；空调：目标温度，整格 = 该实体的 target_temp_step；
+ * 风扇：风速，每格 5%）。
  * 返回 true 表示这次旋转被详情页消费了（调用方响一下触觉、不要翻页）；
- * 返回 false 表示没消费（详情页没开 / 灯是关的 / 手指正按着滑条），由调用方走翻页。
+ * 返回 false 表示没消费（详情页没开 / 设备是关的 / 手指正按着滑条），由调用方走翻页。
  * delta = +1 顺时针（值变大），-1 逆时针。
  */
 bool ui_home_detail_knob(int delta);
@@ -57,7 +59,9 @@ void ui_home_open_climate(const char *entity_id);
 /** 关闭空调页。 */
 void ui_home_close_climate(void);
 
-/** 空调页是否打开（= 详情页开着，且当前实体是 climate.*）。 */
+/** 空调页是否打开（= 详情页开着，且当前实体是 climate.*）。
+ *  风扇页也是同一个 s_detail 的第三种形态（fan.*），没有单独的开 / 关函数：
+ *  打开走 ui_home_open_detail()，关闭共用 ui_home_close_detail()。 */
 bool ui_home_climate_open(void);
 
 #ifdef __cplusplus

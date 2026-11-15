@@ -31,6 +31,7 @@ typedef enum {
 #define HA_MODE_MAX   6      /* hvac_modes / fan_modes 最多记 6 个 */
 #define HA_MODE_LEN   12     /* 单个模式名最长 11 字符 + 结尾 0 */
 #define HA_FAN_LEN    16     /* 当前 fan_mode（原样字符串，直接回传给 HA） */
+#define HA_FAN_PRESET_MAX  4 /* 风扇 preset_modes 最多记 4 个（直吹/自然/循环/睡眠）*/
 
 #define HA_PRESET_ECO    0
 #define HA_PRESET_AWAY   1
@@ -63,11 +64,31 @@ typedef struct {
        旋钮/圆环/小数位全按它来；缺省 1。 */
     float temp_step;
     char fan_mode[HA_FAN_LEN];   /* 当前风速（原样回传，如 "medium low"） */
-    char hvac_modes[HA_MODE_MAX][HA_MODE_LEN];  /* 只存 HA 报上来的，如 auto/cool/heat/dry/fan_only/off */
-    char fan_modes[HA_MODE_MAX][HA_MODE_LEN];
-    uint8_t hvac_mode_count;
-    uint8_t fan_mode_count;
-    uint8_t preset_mask;         /* bit i = 支持 HA_PRESET_*，只占 1 字节（界面不显示）*/
+    /* ---- 空调 / 风扇共用一块「模式名」存储 ----
+     * climate.* 用 hvac_modes / fan_modes（外加两个计数和 preset_mask）；
+     * fan.*     用 preset_modes（这台风扇支持的预设，原样字符串，直接回传 HA，
+     *            如 "直吹风"/"自然风"/"循环风"/"睡眠"）。
+     * 一台实体不可能同时是 climate 和 fan，所以这两个视图叠在同一个 union 上：
+     * 风扇的列表借用空调那 6×12 的槽位，0 字节额外 RAM（照原先各开一份要 1.1KB）。
+     * 只有 fan.* 的解析路径会碰 preset_modes，climate.* 的路径只碰 hvac_modes。*/
+    union {
+        struct {
+            char hvac_modes[HA_MODE_MAX][HA_MODE_LEN];  /* 只存 HA 报上来的，如 auto/cool/heat/dry/fan_only/off */
+            char fan_modes[HA_MODE_MAX][HA_MODE_LEN];
+            uint8_t hvac_mode_count;
+            uint8_t fan_mode_count;
+            uint8_t preset_mask;     /* bit i = 支持 HA_PRESET_*，只占 1 字节（界面不显示）*/
+        };
+        struct {
+            char preset_modes[HA_FAN_PRESET_MAX][HA_MODE_LEN];  /* 原样，如 "自然风" */
+            uint8_t preset_mode_count;
+        };
+    };
+    /* ---- 风扇类实体（其它实体保持 0）---- */
+    int percentage;              /* 0..100（HA 的 percentage；关着时 HA 可能不报，沿用上次）*/
+    char preset_mode[16];        /* 当前预设（原样，如 "自然风"）*/
+    bool oscillating;            /* 摇头（HA 的 oscillating）*/
+    bool has_percentage;         /* 是否真的拿到过 percentage（没拿到就别显示 0%）*/
 } ha_entity_t;
 
 /** 这台空调是否支持某个预设模式（下标见 HA_PRESET_*）。*/
@@ -75,6 +96,15 @@ static inline bool ha_entity_has_preset(const ha_entity_t *e, int preset)
 {
     return e != NULL && preset >= 0 && preset < HA_PRESET_COUNT &&
            (e->preset_mask & (1u << preset)) != 0;
+}
+
+/** 这台风扇的 preset_modes 第 idx 个预设（原样中文串）；没有就 NULL。*/
+static inline const char *ha_entity_fan_preset(const ha_entity_t *e, int idx)
+{
+    if (e == NULL || idx < 0 || idx >= HA_FAN_PRESET_MAX || idx >= e->preset_mode_count) {
+        return NULL;
+    }
+    return e->preset_modes[idx];
 }
 
 /** 这台空调的 hvac_modes 里有没有 mode（"cool" / "fan_only" …）。*/

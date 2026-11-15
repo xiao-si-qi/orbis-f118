@@ -145,8 +145,7 @@ static bool s_press_on_slider;   /* 本次按压是否落在滑条上 */
 
 /* ---- 灯 / 传感器 的子页面 ---- */
 static lv_obj_t *s_detail;                       /* 全屏子页容器 */
-static lv_obj_t *s_detail_title;
-static lv_obj_t *s_back_label;
+static lv_obj_t *s_detail_name;                  /* 环心最上面一行：实体名（小号灰字）*/
 static lv_obj_t *s_detail_power_sw;
 /* 圆形拨盘：外环=亮度，内环=色温。每个环下面压一条更宽的半透明弧当"光晕"，
    子对象按创建顺序绘制，所以光晕必须先建、环后建。 */
@@ -156,32 +155,55 @@ static lv_obj_t *s_detail_icon;                  /* 中间：自绘的灯泡 */
 static lv_obj_t *s_detail_br_value;              /* 中间：大号百分比 */
 static lv_obj_t *s_detail_ct_value;              /* 中间：「3500K 中性」 */
 static lv_obj_t *s_detail_off_hint;              /* 关灯时露出的「已关闭」 */
+/* 焦点提示（见 detail_apply_focus）：环上"当前值"小圆点 + 环心下方那行小字 */
+static lv_obj_t *s_detail_marker;
+static lv_obj_t *s_detail_hint;
+static char s_detail_hint_shown[16];
 static bool s_detail_visible;
 
+#define DETAIL_MARKER_SIZE    10     /* 焦点环值点直径 */
+#define DETAIL_HINT_Y        246     /* 「旋钮：亮度 / 色温」那一行（字墨留在内孔里）*/
+
 /* 360x360 圆屏上的圆盘几何（圆心 / 半径 / 线宽 / 扫角）。
-   标题在 y=58..79、圆点行在 y=318，所以圆心定在 (180,196)：
-   LVGL 的 arc 半径是"外径"，所以外环（外径 114 / 宽 20）占 94..114，
-   内环（外径 84 / 宽 12）占 72..84，两环之间留 10px；
-   竖直方向占 82..310，中间堆栈（灯泡 150..172 / 百分比 180..210 / 色温 212..233）
-   全部落在内环以内（内环空出半径 72 的圆）。 */
+   返回键和顶部标题都删掉之后，上沿空了出来，外环从 114 长到 128（+14）：
+   抬头离状态栏（y=8..28）还有 26px，低头圆点行在 y=318（详情页里本来也藏着），
+   光晕最外 142 → 圆环整体占 y=54..338，离屏幕圆形可视区（圆心 180,180 / 半径 180）
+   最近还有 37px（左右两侧），不会切边。
+   LVGL 的 arc 半径是"外径"、线宽向内画，所以：
+     外环（亮度）外径 128 / 宽 22 → 占 106..128，光晕 116..142（露在环外 14px）；
+     内环（色温）外径 96 / 宽 14 → 占 82..96，光晕 78..102；
+     两环之间留 10px（96..106）。
+   中间堆栈（实体名 148..169 / 灯泡 170..194 / 百分比 196..226 / 色温 226..247）
+   和焦点提示行（246..267，只有 5 个汉字宽、字墨 r<=80）都在内环以内
+   （内孔半径 82 的圆）：名字那一行最靠上，y=148 处内孔宽 ~133px，
+   宽度仍卡 100px + LV_LABEL_LONG_DOT——名字再长也只会"…"掉，压不到环上
+   （14 个汉字的完整一行要 224px，比整个内孔的直径 164px 还宽，物理上放不下）。 */
 #define DETAIL_CX            180
 #define DETAIL_CY            196
+#define DETAIL_NAME_Y        148     /* 实体名（cjk16）：环心最上面一行 */
+#define DETAIL_NAME_W        100     /* ~6 个汉字，超出用 … ；见上面的说明 */
+/* 区域焦点：以 (DETAIL_CX, DETAIL_CY) 为圆心，r <= 82px 算内孔（色温区），
+   82 < r 算环带/环外（亮度区）。82 = 色温环的内沿（外径 96 - 线宽 14），
+   正好就是"环心那颗孔"的半径；按在环带上时轮的还是环自己的 PRESSED 回调。 */
+#define DETAIL_REGION_R       82
 #define DETAIL_ANG_START     135     /* 0°=右、90°=下：135° 是左下，顺时针扫 270° */
 #define DETAIL_ANG_END        45     /* = 135+270，跨 0°，缺口正好朝下 */
 #define DETAIL_ANG_SWEEP     270
-#define DETAIL_BR_R          114     /* 外环（亮度）外径 */
-#define DETAIL_BR_W           20     /* 外环线宽 18..22 */
-#define DETAIL_CT_R           84     /* 内环（色温）外径 */
-#define DETAIL_CT_W           12     /* 内环线宽 10..14 */
-#define DETAIL_BR_GLOW_R     128     /* 亮度光晕：102..128，露在环外 14px */
+#define DETAIL_BR_R          128     /* 外环（亮度）外径（114→128，吃掉删掉的返回键/标题）*/
+#define DETAIL_BR_W           22     /* 外环线宽（20→22）*/
+#define DETAIL_CT_R           96     /* 内环（色温）外径（84→96）*/
+#define DETAIL_CT_W           14     /* 内环线宽（12→14）*/
+#define DETAIL_BR_GLOW_R     142     /* 亮度光晕：116..142，露在环外 14px（跟着外环一起长）*/
 #define DETAIL_BR_GLOW_W      26
-#define DETAIL_CT_GLOW_R      90     /* 色温光晕：68..90，环两侧各露 4 / 6px */
-#define DETAIL_CT_GLOW_W      22
+#define DETAIL_CT_GLOW_R     102     /* 色温光晕：78..102，环两侧各露 4 / 6px */
+#define DETAIL_CT_GLOW_W      24
 #define DETAIL_GRAD_STEP       4     /* 色温渐变每 4° 一段（270° 最多 68 段）*/
-#define DETAIL_GRAD_WARM  lv_color_hex(0xFFB46B)
-#define DETAIL_GRAD_COOL  lv_color_hex(0xBFD8FF)
-#define DETAIL_DIM_OPA   LV_OPA_60   /* 没聚焦的环 / 文字压到 ~60% */
+#define DETAIL_DIM_OPA       90      /* 没焦点的环 / 数字压到 ~35%（要一眼看出差别）*/
 #define DETAIL_GLOW_OPA  LV_OPA_20   /* 聚焦时的光晕 */
+/* 没填满的那圈轨道：深而不显眼。焦点环 70%，非焦点环 45%（见 detail_apply_focus）。*/
+#define DETAIL_TRACK_COLOR  lv_color_hex(0x1A1A1C)
+#define DETAIL_TRACK_OPA     179     /* 70% */
+#define DETAIL_TRACK_DIM_OPA 115     /* 45% */
 /* 中间百分比用哪个字号：montserrat_28 是工程里已经编进来、但之前没人引用（被
    --gc-sections 丢掉）的那套字；引用它会让 .rodata 多 ~37.5KB flash。
    想省 flash 就换成 &lv_font_montserrat_20（标题/卡片已经在用，0 成本）。 */
@@ -190,27 +212,39 @@ static bool s_detail_visible;
 /* ---- 空调详情页（和灯共用 s_detail，同一套圆盘语言）----
  *
  * 几何：圆心 / 扫角和灯页面完全一样（DETAIL_CX/CY、135°→45°），只是只有一条环：
- *   外环 = 目标温度（外径 114 / 线宽 22，光晕 102..128），范围 = 这台机器的
+ *   外环 = 目标温度（外径 118 / 线宽 22，光晕 106..132），范围 = 这台机器的
  *   min_temp..max_temp，每格 = 它的 target_temp_step（0.5 的机器按 0.5 走）。
  *   环值单位用 0.1°C 的整数（AC_UNIT），旋钮路径上不出现浮点，吸附没有误差。
  *
+ *   为什么不是和灯页面一样的 128：下面 y=284 那排模式键顶住了环的 135°/45° 圆头。
+ *   圆头 = 半径 R-11 处一个半径 11 的圆；R=128 时圆头最低点 y=290，会压进模式键
+ *   （顶边 284）约 6px；R=118 时最低点 y=282.7，留 1.3px。所以空调环只长到 118
+ *   （+4），灯页面长到 128（+14）——宁可两页刻度差一点，也不能让环被按键切掉。
+ *
  * 360x360 圆屏、270° 环、缺口朝下 90°。缺口是一个"上窄下宽的楔形"：
- * 半径 > 92 且角度在 45°..135° 之间才没有环，所以越往下越宽。
- * 底部那几行就是按这个楔形排的（每行都验算过不压环）：
- *   风速按钮 92x26  y=234..260   （圆心下方 38..64，全在半径 92 以内，最宽处 124）
- *   5 个模式按钮 36x24 y=284..308（顶边 dy=88，环带外沿 sqrt(128²-88²)=93 > 88 才不压环）
- *   电源开关 72x32  y=314..346   （dy>=118 > 环外径 114，整行在环外）
+ * 半径 > 96 且角度在 45°..135° 之间才没有环，所以越往下越宽。
+ * 环心那一列（名字 / 图标 / 大号温度 / 室内温度 / 风速）都验算过在内孔里：
+ *   实体名  y=134..155（顶边 dy=62，内孔可用 half=sqrt(96²-62²)=73 > 60）
+ *   模式图标 28x28   y=156..184
+ *   目标温度（28 号字）y=186..215
+ *   「室内 17.0°C」    y=218..239
+ *   风速按钮 92x26    y=242..268（四角距圆心 sqrt(46²+72²)=85 < 96，落在下方缺口里）
+ * 底部那几行都在下方缺口（45°..135°）里，验算的是"离环圆头还有多远"：
+ *   5 个模式按钮 36x24 y=284..308（环圆头最低点 y=282.7，留 1.3px）
+ *   电源开关 72x32  y=314..346   （离环圆头 ~47px）
  */
-#define AC_TEMP_R          114     /* 目标温度环外径（= 灯的外环）*/
+#define AC_TEMP_R          118     /* 目标温度环外径（灯是 128；这里受模式键限制）*/
 #define AC_TEMP_W           22
-#define AC_TEMP_GLOW_R     128
+#define AC_TEMP_GLOW_R     132     /* 光晕 106..132，同样露在环外 14px */
 #define AC_TEMP_GLOW_W      26
 #define AC_UNIT             10     /* 弧值单位：0.1°C */
-#define AC_ICON_Y          140     /* 模式图标 28x28 */
+#define AC_NAME_Y          134     /* 实体名（cjk16）：环心最上面一行（比灯高 14px）*/
+#define AC_NAME_W          120     /* ~7 个汉字；空调只有一条环，内孔比灯大，能多放一个字 */
+#define AC_ICON_Y          156     /* 模式图标 28x28（给上面的实体名让出 16px）*/
 #define AC_ICON_SIZE        28
-#define AC_TEMP_Y          170     /* 中间大号目标温度（montserrat_28）*/
-#define AC_ROOM_Y          206     /* 「室内 17.0°C」 */
-#define AC_FAN_Y           234     /* 风速按钮 */
+#define AC_TEMP_Y          186     /* 中间大号目标温度（montserrat_28）*/
+#define AC_ROOM_Y          218     /* 「室内 17.0°C」 */
+#define AC_FAN_Y           242     /* 风速按钮 */
 #define AC_FAN_W            92
 #define AC_FAN_H            26
 #define AC_MODE_Y          284     /* 5 个模式按钮：36 宽 + 4 间距 = 196，x 82..278 */
@@ -245,6 +279,9 @@ static char s_ac_mode_shown[AC_STATE_LEN];  /* 已经上过色的模式（避免
 static lv_color_t s_ac_accent;              /* 自绘图标读它（已过对比度处理）*/
 static int s_sw_geom = -1;                  /* 开关当前的尺寸形态：-1=未知 0=灯 1=空调 */
 static int8_t s_sw_on_shown = -1;           /* 开关上次画的开关状态（-1=未知）*/
+static bool s_sw_on_now;                    /* 开关此刻该显示"开"（含 6s 本地覆盖）*/
+static lv_color_t s_sw_track_shown;         /* 开关轨道上次刷的颜色（避免 500ms 重刷）*/
+static int8_t s_sw_style_shown = -1;        /* 开关上次刷的配色：-1=未知 0=关 1=开 */
 /* 标签文字缓存：lv_label_set_text 不做内容比较（每次都重新 malloc + 重绘），
    500ms 轮询下必须自己比一下，否则三个标签每秒各重排两次。 */
 static char s_ac_temp_txt[16];
@@ -257,6 +294,68 @@ static char s_ac_fan_local[HA_FAN_LEN];
 static uint32_t s_ac_fan_local_until;
 static int s_ac_override_t10;               /* 目标温度覆盖（0.1°C）*/
 static uint32_t s_ac_override_until;
+
+/* ---- 风扇详情页（同一个 s_detail，第三种形态，和灯 / 空调共用圆盘语言）----
+ *
+ * 几何和空调页完全一致（圆心 (180,196)、135°→45°、单环 + 光晕），只有颜色和
+ * 底部控件不同：外环 = 风速 1..100%（外径 118 / 线宽 22，光晕 106..132）。
+ *
+ * 为什么不是灯的 128：下面 y=284 那排 4 个预设键顶住了 R=128 的环圆头。
+ * 圆头 = 半径 R-11 处一个半径 11 的圆，R=128 时最低点 y=289.7，压进预设键
+ * （顶边 284）约 6px；R=118 时最低点 y=282.7，留 1.3px —— 和空调页同一个理由、
+ * 同一组数字。预设键 40x22 放在 x=91..269 / y=284..306（离环 1.3px、离屏幕圆边
+ * 25.8px）；摇头键 52x24 + 电源开关 62x28 并排放在 y=314..342 的缺口里，
+ * 这两个键最近的角离屏幕圆边还有 6.1px（验算见 FAN_* 宏和 build 日志）。
+ *
+ * 环色 = 当前预设的颜色（直吹青 / 自然绿 / 循环蓝 / 睡眠灰），没有预设就青；
+ * 页面底色 = 这个颜色压到很暗的一层（关掉就是纯黑），和空调页同一套做法。 */
+#define FAN_R              118     /* 风速环外径（灯 128 / 空调 118，和空调一致）*/
+#define FAN_W               22
+#define FAN_GLOW_R         132     /* 光晕 106..132，露在环外 14px */
+#define FAN_GLOW_W          26
+#define FAN_ICON_SIZE       24     /* 环心：自绘风扇（轮毂 + 3 片扇叶）*/
+#define FAN_ICON_Y         170
+#define FAN_PCT_Y          196     /* 大号百分比（montserrat_28），和灯同一行 */
+#define FAN_PRESET_Y       226     /* 当前预设（cjk16，次要文字）*/
+#define FAN_MODE_Y         284     /* 4 个预设键：40 宽 + 6 间距 = 178，x 91..269 */
+#define FAN_MODE_W          40
+#define FAN_MODE_H          22
+#define FAN_MODE_GAP         6
+#define FAN_MODE_COUNT       4     /* 直吹 / 自然 / 循环 / 睡眠 */
+#define FAN_OSC_W           52     /* 摇头键（在下方缺口里靠左）*/
+#define FAN_OSC_H           24
+#define FAN_OSC_Y          316
+#define FAN_OSC_DX         (-40)   /* 相对 TOP_MID 的横向偏移：和右边开关凑成一对 */
+#define FAN_SW_W            62     /* 电源开关（比空调的 72 窄，给摇头让位）*/
+#define FAN_SW_H            28
+#define FAN_SW_Y           314
+#define FAN_SW_DX           29     /* 开关中心 x = 209，摇头中心 x = 140 */
+#define FAN_PCT_STEP         5     /* 旋钮每格 5%（任务指定）*/
+
+static lv_obj_t *s_fan_arc;                  /* 风速环（可点可拖）*/
+static lv_obj_t *s_fan_glow;                 /* 同一条环的光晕 */
+static lv_obj_t *s_fan_icon;                 /* 中间：自绘风扇 */
+static lv_obj_t *s_fan_pct;                  /* 中间：大号百分比 */
+static lv_obj_t *s_fan_preset;               /* 中间：当前预设（次要文字）*/
+static lv_obj_t *s_fan_mode_btn[FAN_MODE_COUNT];   /* 4 个预设键 */
+static lv_obj_t *s_fan_mode_lbl[FAN_MODE_COUNT];
+static lv_obj_t *s_fan_osc_btn;              /* 摇头键 */
+static lv_obj_t *s_fan_osc_lbl;
+static bool s_detail_fan;                    /* 当前详情页开的是 fan.* */
+static lv_color_t s_fan_accent;              /* 自绘图标读它（已过对比度处理）*/
+/* 文字 / 配色缓存：500ms 轮询下没变就别再 set_text / 重绘。
+   s_fan_preset_shown 初值是 "\x01"（不可能是任何预设），保证进页面后第一次
+   一定会刷一遍颜色和预设键。 */
+static char s_fan_preset_shown[16];
+static char s_fan_preset_txt[16];
+static char s_fan_pct_txt[8];
+/* 本地覆盖：点了预设 / 摇头 / 转过旋钮之后先按本地值显示，HA 落定后交还（6s）*/
+static char s_fan_preset_local[16];
+static uint32_t s_fan_preset_local_until;
+static bool s_fan_osc_local;
+static uint32_t s_fan_osc_local_until;
+static int s_fan_pct_override;
+static uint32_t s_fan_pct_override_until;
 
 /* ---- 传感器折线图页 ---- */
 static lv_obj_t *s_chart_page;
@@ -283,11 +382,13 @@ static int s_chart_cache_n;
 static float s_chart_cache_min, s_chart_cache_max, s_chart_cache_avg;
 static uint32_t s_chart_cache_at;
 static char s_detail_entity[96];
+static char s_detail_name_shown[48];        /* 名字行当前文字（避免 500ms 轮询重复重排）*/
 /* 旋钮在灯详情页里调什么：默认亮度，点过色温环就切色温（换灯 / 重新进页时复位）。
    这个变量同时就是"哪个环有焦点"——焦点不需要第二个变量，它只是它的另一种画法。 */
 #define DETAIL_KNOB_BR        0
 #define DETAIL_KNOB_CT        1
 #define DETAIL_KNOB_TEMP      2        /* 空调页：目标温度（圆盘只有一个环，永远是焦点）*/
+#define DETAIL_KNOB_FAN       3        /* 风扇页：风速（同样只有一个环，永远是焦点）*/
 #define DETAIL_BR_STEP_PCT    5        /* 亮度每格 5% */
 #define DETAIL_CT_STEP_K    250        /* 色温每格 250K */
 #define DETAIL_KNOB_SEND_MS   100      /* 转动时网络命令最快 100ms 一条（更快的格子合并）*/
@@ -326,11 +427,13 @@ static bool s_detail_fg_dirty;      /* 重建 / 换实体后强制刷一次底�
 /* 子页函数的前置声明（refresh_timer_cb 里会用到） */
 static void detail_apply_entity(void);
 static void detail_apply_foreground(bool dark_text);
-static bool detail_light_on(const ha_entity_t *e);
+static bool detail_device_on(const ha_entity_t *e);
 static void detail_ct_range(const ha_entity_t *e, int *lo, int *hi);
 static void detail_update_ambience(void);
 static void detail_apply_dial_colors(void);
 static void detail_apply_focus(void);
+static void detail_marker_update(void);   /* 焦点环"当前值"小圆点（值一变就跟着挪）*/
+static lv_color_t detail_text_fg(void);   /* 主文字颜色：亮底黑 / 暗底白 */
 /* 空调那一路（定义在后面，前面算底色 / 配色时要先能看到） */
 static bool detail_is_climate(const ha_entity_t *e);
 static lv_color_t ac_mode_bg(const char *state);
@@ -341,6 +444,16 @@ static void ac_apply_entity(const ha_entity_t *e);
 static void ac_hide_all(bool hide);
 static void ac_refresh_chips(const ha_entity_t *e, const char *state);
 static void detail_hide_light(bool hide);
+/* 风扇那一路（定义在后面，前面算底色 / 配色 / 焦点时要先能看到） */
+static bool detail_is_fan(const ha_entity_t *e);
+static const char *fan_preset_now(const ha_entity_t *e);
+static lv_color_t fan_preset_color(const char *preset);
+static lv_color_t fan_ambient_bg(const char *preset, bool on);
+static void fan_apply_entity(const ha_entity_t *e);
+static void fan_hide_all(bool hide);
+static void fan_refresh_chips(const ha_entity_t *e, const char *preset);
+static void fan_refresh_osc(const ha_entity_t *e);
+static bool fan_knob_step(const ha_entity_t *e, int delta);
 static uint32_t s_last_gesture_ms;   /* 最近一次手势时间，用来吃掉误触 */
 static QueueHandle_t s_cmd_q;
 
@@ -775,6 +888,12 @@ static void tile_clicked_cb(lv_event_t *e)
        旧实现是单独一页 s_clim_page，旋钮在它上面还会翻页，现在统一了 */
     if (strncmp(w->entity, "climate.", 8) == 0) {
         ui_home_open_climate(w->entity);
+        return;
+    }
+
+    /* 风扇：和灯 / 空调走同一个详情页（风速弧 + 预设键 + 摇头 + 电源）*/
+    if (strncmp(w->entity, "fan.", 4) == 0) {
+        ui_home_open_detail(w->entity);
         return;
     }
 
@@ -2006,19 +2125,60 @@ static void power_icon_color(bool on)
     }
 }
 
-/** 开尔文转近似色（用于页面背景直观体现色温）。 */
-static lv_color_t kelvin_to_color(int kelvin)
+/** 黑体色（整数分段线性）：2700K 偏橙、4500K 暖白、6500K 冷白。
+ *  这是"理论色"，实际 LED 在墙上看到的样子要柔和得多，见下面的 kelvin_to_color。 */
+static lv_color_t kelvin_blackbody(int kelvin)
 {
-    /* 2700K 偏橙、4000K 暖白、6500K 偏冷白，简单线性插值 */
     if (kelvin < 3000) {
         return lv_color_make(255, 170, 90);
-    } else if (kelvin < 4500) {
-        const int t = (kelvin - 3000) * 100 / 1500;    /* 0..100 */
-        return lv_color_make(255, 170 + (245 - 170) * t / 100, 90 + (215 - 90) * t / 100);
-    } else {
-        const int t = (kelvin - 4500) * 100 / 2000;    /* 0..100 */
-        return lv_color_make(255 - (255 - 210) * t / 100, 245, 215 + (255 - 215) * t / 100);
     }
+    if (kelvin < 4500) {
+        int t = (kelvin - 3000) * 100 / 1500;              /* 0..100 */
+        if (t > 100) {
+            t = 100;
+        }
+        return lv_color_make(255, 170 + (245 - 170) * t / 100, 90 + (215 - 90) * t / 100);
+    }
+    int t = (kelvin - 4500) * 100 / 2000;                  /* 0..100（>6500 也夹住）*/
+    if (t > 100) {
+        t = 100;
+    }
+    return lv_color_make(255 - (255 - 210) * t / 100, 245, 215 + (255 - 215) * t / 100);
+}
+
+/** 往白里混的比例（0..255）：暖端混得多，冷端混得少。
+ *  2700..3000K ≈ 0.42、4000K ≈ 0.20、6500K ≈ 0.15——2700K 在真实灯下是奶白偏暖，
+ *  不是屏幕原来那种深橙；宁可往"不够黄"那边偏一点。
+ *  3000K 以下保持同一个系数：黑体基色本身在 3000K 以下是常数，这样 G/B 随色温单调。 */
+static int kelvin_desat(int kelvin)
+{
+    if (kelvin <= 3000) {
+        return 107;                                        /* 0.42 */
+    }
+    if (kelvin <= 4000) {
+        return 107 - (107 - 51) * (kelvin - 3000) / 1000;  /* 0.42 → 0.20 */
+    }
+    if (kelvin >= 6500) {
+        return 38;                                         /* 0.15 */
+    }
+    return 51 - (51 - 38) * (kelvin - 4000) / 2500;        /* 0.20 → 0.15 */
+}
+
+/** 开尔文转"屏幕上该显示的颜色"：黑体色再按上面比例往白里混。
+ *  页面底色、灯环、开关的开色、色温渐变全部走这一个函数，保证同一色温同一颜色。 */
+static lv_color_t kelvin_to_color(int kelvin)
+{
+    if (kelvin < 1000) {
+        kelvin = 1000;
+    }
+    if (kelvin > 12000) {
+        kelvin = 12000;
+    }
+    const lv_color_t c = kelvin_blackbody(kelvin);
+    const int f = kelvin_desat(kelvin);                    /* 0..255 */
+    return lv_color_make((uint8_t)(c.red + (255 - c.red) * f / 255),
+                         (uint8_t)(c.green + (255 - c.green) * f / 255),
+                         (uint8_t)(c.blue + (255 - c.blue) * f / 255));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2031,6 +2191,88 @@ static lv_color_t kelvin_to_color(int kelvin)
 static int detail_luma(lv_color_t c)
 {
     return (299 * c.red + 587 * c.green + 114 * c.blue) / 1000;
+}
+
+/* 指示色和页面底色之间至少要拉开的亮度差（0..255）：90/255 ≈ 35%，
+   约等于 WCAG 3:1（底色 0.23 / 指示色 0.85 时是 3.1:1）。
+   小号灰字（实体名）用低一档的 55：保持"次要文字"的观感，但也不会糊在底色里。 */
+#define DETAIL_MIN_LUMA_GAP   90
+#define DETAIL_MUTED_LUMA_GAP 55
+
+/** 把颜色整体压/提到指定的感知亮度（保留色相）。*/
+static lv_color_t detail_color_at_luma(lv_color_t c, int target)
+{
+    const int l = detail_luma(c);
+    if (target <= 0) {
+        return lv_color_black();
+    }
+    if (target >= 255) {
+        return lv_color_white();
+    }
+    if (l <= 0) {                    /* 纯黑没有色相可留：给等亮度灰 */
+        return lv_color_make((uint8_t)target, (uint8_t)target, (uint8_t)target);
+    }
+    if (target == l) {
+        return c;
+    }
+    if (target < l) {                /* 往黑压：等比缩，色相不变 */
+        return lv_color_make((uint8_t)(c.red * target / l),
+                             (uint8_t)(c.green * target / l),
+                             (uint8_t)(c.blue * target / l));
+    }
+    const int head = 255 - l;        /* 往白提：按比例插值到白 */
+    const int t = ((target - l) * 255) / head;
+    return lv_color_make((uint8_t)(c.red + (255 - c.red) * t / 255),
+                         (uint8_t)(c.green + (255 - c.green) * t / 255),
+                         (uint8_t)(c.blue + (255 - c.blue) * t / 255));
+}
+
+/**
+ * 把"想要的灯色"变成"在当前页底色上看得到"的颜色。
+ * 以前是 luma>=140 的硬阈值一刀切（亮底就 lv_color_darken(want, 110) 一步压到 43%），
+ * 亮度一过阈值整圈"啪"地变暗。现在改成按底色亮度连续处理：
+ *   1) 看 want 本来在底色的哪一侧（页面底色是灯色 × <=55%，所以基本是"更亮"那侧）；
+ *   2) 亮度差已经 >= DETAIL_MIN_LUMA_GAP：原样用（绝大多数情况颜色完全不变）；
+ *   3) 不够就把 want 朝远离底色的方向补到刚好差这个 gap，补的量随底色连续变化。
+ * 同一套规则被灯环 / 灯泡 / 色温渐变 / 开关的"开"色共用，所以不会在不同控件上
+ * 出现不同阈值的跳变。
+ */
+static lv_color_t detail_on_bg(lv_color_t want)
+{
+    const int lb = detail_luma(s_detail_bg_col);
+    const int lw = detail_luma(want);
+    const int dir = (lw > lb) ? 1 : (lw < lb) ? -1 : (lb < 128 ? 1 : -1);
+    if ((lw - lb) * dir >= DETAIL_MIN_LUMA_GAP) {
+        return want;
+    }
+    int target = lb + dir * DETAIL_MIN_LUMA_GAP;
+    if (target < 0) {
+        target = 0;
+    }
+    if (target > 255) {
+        target = 255;
+    }
+    return detail_color_at_luma(want, target);
+}
+
+/** 小号灰字（实体名）的对比度：只要 55 的亮度差，保持"弱化"但不至于糊掉。*/
+static lv_color_t detail_muted_on_bg(void)
+{
+    const lv_color_t c = COLOR_MUTED;            /* 0x8E8E93 */
+    const int lb = detail_luma(s_detail_bg_col);
+    const int lw = detail_luma(c);
+    const int dir = (lw >= lb) ? 1 : -1;
+    if ((lw - lb) * dir >= DETAIL_MUTED_LUMA_GAP) {
+        return c;
+    }
+    int target = lb + dir * DETAIL_MUTED_LUMA_GAP;
+    if (target < 0) {
+        target = 0;
+    }
+    if (target > 255) {
+        target = 255;
+    }
+    return detail_color_at_luma(c, target);
 }
 
 /** 实体给的范围不可信（0 / 反了 / 离谱）时退回 2000..6500。*/
@@ -2069,29 +2311,61 @@ static int detail_pct_now(const ha_entity_t *e)
     return pct;
 }
 
-/** 页面底色：关=纯黑，开=灯色 × 亮度（和原来的氛围色算法完全一致，只是抽出来复用）。*/
+/**
+ * 页面底色：关=纯黑；开=中性深灰 + 一点点灯色（"氛围"而不是"整页染成灯色"）。
+ *
+ * 以前是灯色 × 亮度系数：2700K 低亮度时 (255,205,159)×27% = (68,55,42)，
+ * 在 sRGB 里就是一块棕色。现在拆成两层：
+ *   1) 底色基座 = 0x0A0A0C → 0x121214（随亮度从 10 长到 18，始终中性、不偏色）；
+ *   2) 灯色先去饱和 70%（往自己的亮度灰靠），再按"染色量"混进基座：
+ *      染色量在 40% 亮度以下为 0，40% → 100% 线性从 0 长到 18%。
+ * 所以 2700K@1% ≈ 近黑中性色，2700K@100% 只是"偏暖的深色页面"，永远不会变棕。
+ */
+#define DETAIL_BG_BASE_LO     10     /* 0x0A0A0C：最暗的中性底（通道差 2）*/
+#define DETAIL_BG_BASE_HI     18     /* 0x121214：最亮的中性底 */
+#define DETAIL_BG_TINT_FROM   40     /* 这个亮度以下完全不染色 */
+#define DETAIL_BG_TINT_MAX    18     /* 满亮度最多混 18% 灯色 */
+#define DETAIL_BG_TINT_KEEP   30     /* 灯色只保留 30% 彩度（去饱和 70%）*/
+
 static lv_color_t detail_ambient_bg(void)
 {
     const ha_entity_t *e = ha_client_find(s_detail_entity);
+    if (s_detail_fan) {
+        /* 风扇页：预设色的极暗版，关掉纯黑（和空调页同一套，见 fan_ambient_bg）*/
+        return fan_ambient_bg(fan_preset_now(e), detail_device_on(e));
+    }
     if (s_detail_ac) {
         /* 空调页控件多，不能像灯那样把整页刷成灯色（亮底看不清小字）：
            只给一层很深的模式色，关掉就是纯黑。 */
         return ac_mode_bg(ac_state_now(e));
     }
-    if (e == NULL || !detail_light_on(e)) {
-        return COLOR_BG;
+    if (e == NULL || !detail_device_on(e)) {
+        return COLOR_BG;                 /* 关灯：纯黑，不带一点底色 */
     }
     const lv_color_t c = kelvin_to_color(detail_kelvin_now(e));
+    const int pct = detail_pct_now(e);
 
-    /* 整个页面的底色就是这只灯：色温决定颜色，亮度决定明暗。
-       视觉下限抬到 50%：最暗时页面也有半亮，最高才是纯白。 */
-    int pct_eff = 50 + (detail_pct_now(e) / 2);
-    if (pct_eff > 100) {
-        pct_eff = 100;
+    /* 中性基座：0x0A0A0C → 0x121214（B 比 R/G 大 2，冷一点的深灰）*/
+    const int base = DETAIL_BG_BASE_LO + (DETAIL_BG_BASE_HI - DETAIL_BG_BASE_LO) * pct / 100;
+    int r = base;
+    int g = base;
+    int b = base + 2;
+
+    int tint = 0;
+    if (pct > DETAIL_BG_TINT_FROM) {
+        tint = DETAIL_BG_TINT_MAX * (pct - DETAIL_BG_TINT_FROM)
+               / (100 - DETAIL_BG_TINT_FROM);
     }
-    return lv_color_make((uint8_t)(c.red * pct_eff / 100),
-                         (uint8_t)(c.green * pct_eff / 100),
-                         (uint8_t)(c.blue * pct_eff / 100));
+    if (tint > 0) {
+        const int l = detail_luma(c);
+        const int tr = l + (c.red - l) * DETAIL_BG_TINT_KEEP / 100;
+        const int tg = l + (c.green - l) * DETAIL_BG_TINT_KEEP / 100;
+        const int tb = l + (c.blue - l) * DETAIL_BG_TINT_KEEP / 100;
+        r += (tr - r) * tint / 100;
+        g += (tg - g) * tint / 100;
+        b += (tb - b) * tint / 100;
+    }
+    return lv_color_make((uint8_t)r, (uint8_t)g, (uint8_t)b);
 }
 
 /** 灯色：支持色温就按色温算，只有亮度的灯用强调蓝。*/
@@ -2104,34 +2378,22 @@ static lv_color_t detail_light_base(void)
     return COLOR_ACCENT;
 }
 
-/**
- * 把"想要的灯色"变成"在当前底色上看得见的颜色"。
- * 页面底色就是这只灯的颜色（满亮度时正好等于灯色），指示灯再用同一个颜色就会直接
- * 融进背景——圆屏上最容易踩的坑。亮底时压暗一档，暗底时保持原色。
- */
-static lv_color_t detail_on_bg(lv_color_t want)
+/** 色温渐变第 t% 的颜色：t 沿圆环从暖端(0)到冷端(100)，
+ *  直接映射到实体自己的 min..max 色温，再走 kelvin_to_color + 对比度保护，
+ *  这样渐变里的每个点都和"这个位置对应的色温"完全一致（同一个 helper）。*/
+static lv_color_t detail_grad_color(int t, int lo, int hi)
 {
-    if (detail_luma(s_detail_bg_col) >= 140) {
-        return lv_color_darken(want, 110);       /* 亮底：只留 ~43% 亮度 */
-    }
-    return want;
-}
-
-/** 色温渐变第 t% 的颜色（0 = 暖 0xFFB46B，100 = 冷 0xBFD8FF），同样过对比度。*/
-static lv_color_t detail_grad_color(int t)
-{
-    const lv_color_t warm = DETAIL_GRAD_WARM;
-    const lv_color_t cool = DETAIL_GRAD_COOL;
     if (t < 0) {
         t = 0;
     }
     if (t > 100) {
         t = 100;
     }
-    const int r = warm.red + (cool.red - warm.red) * t / 100;
-    const int g = warm.green + (cool.green - warm.green) * t / 100;
-    const int b = warm.blue + (cool.blue - warm.blue) * t / 100;
-    return detail_on_bg(lv_color_make((uint8_t)r, (uint8_t)g, (uint8_t)b));
+    if (hi <= lo) {
+        return detail_on_bg(kelvin_to_color(lo));
+    }
+    const int k = lo + (hi - lo) * t / 100;
+    return detail_on_bg(kelvin_to_color(k));
 }
 
 /** 色温文字的档位：<3000 暖光 / <4500 中性 / <5500 自然 / 其它 冷光。*/
@@ -2143,15 +2405,23 @@ static const char *detail_ct_word(int k)
     return "冷光";
 }
 
-/** 中间的百分比文字（旋钮 / 拖动 / 轮询三条路径都走它）。*/
+/** 中间的百分比文字（旋钮 / 拖动 / 轮询三条路径都走它）。
+ *  亮度下限是 1%：0% 会被 Home Assistant 当成"关灯"，开关才是唯一的电源控制。*/
 static void detail_set_br_text(int pct)
 {
     if (s_detail_br_value == NULL) {
         return;
     }
+    if (pct < 1) {
+        pct = 1;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
     char buf[8];
     snprintf(buf, sizeof(buf), "%d%%", pct);
     lv_label_set_text(s_detail_br_value, buf);
+    detail_marker_update();          /* 焦点值点跟着亮度环当前值走 */
 }
 
 /** 中间的「3500K 中性」文字。 */
@@ -2163,6 +2433,70 @@ static void detail_set_ct_text(int k)
     char buf[28];
     snprintf(buf, sizeof(buf), "%dK %s", k, detail_ct_word(k));
     lv_label_set_text(s_detail_ct_value, buf);
+    detail_marker_update();          /* 焦点值点跟着色温环当前值走 */
+}
+
+/**
+ * 环心最上面那一行：实体名。最多 14 个字（ha_entity_t.name 是 48 字节，
+ * 最多 15 个汉字 + 结束符），超了补一个"…"；宽度再由 LV_LABEL_LONG_DOT 按内孔
+ * 卡死。两道都留着：内容 cap 是"名字本来就该短"，宽度 cap 是"再长也不能压到环上"。
+ */
+#define DETAIL_NAME_CHARS 14
+
+static void detail_name_line(const char *name, char *out, size_t cap)
+{
+    size_t n = 0;
+    int chars = 0;
+    while (name[n] != '\0' && chars < DETAIL_NAME_CHARS) {
+        const unsigned char c = (unsigned char)name[n];
+        const size_t len = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+        if (n + len + 4 > cap) {          /* 末尾还要放得下 "…" + 结束符 */
+            break;
+        }
+        memcpy(out + n, name + n, len);
+        n += len;
+        chars++;
+    }
+    if (name[n] != '\0') {
+        memcpy(out + n, "…", 4);           /* 3 字节 + 结束符 */
+        n += 3;
+    }
+    out[n] = '\0';
+}
+
+/** 写/藏那一行名字：名字是空的就整行藏掉，屏幕顶部只留状态栏。*/
+static void detail_set_name(const char *name)
+{
+    if (s_detail_name == NULL) {
+        return;
+    }
+    if (name == NULL) {
+        name = "";
+    }
+    /* 500ms 轮询：文字没变就别再 set_text（每次都会重新 malloc + 重排）*/
+    if (strcmp(name, s_detail_name_shown) == 0) {
+        return;
+    }
+    snprintf(s_detail_name_shown, sizeof(s_detail_name_shown), "%.47s", name);   /* 显式精度，避免 -Wformat-truncation */
+    if (name[0] == '\0') {
+        lv_label_set_text(s_detail_name, "");
+        lv_obj_add_flag(s_detail_name, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    char line[48];
+    detail_name_line(name, line, sizeof(line));
+    lv_label_set_text(s_detail_name, line);
+    lv_obj_remove_flag(s_detail_name, LV_OBJ_FLAG_HIDDEN);
+}
+
+/** 名字行的位置 / 宽度跟着页面走：灯 y=148 宽 100，空调 y=134 宽 120。*/
+static void detail_place_name(bool ac)
+{
+    if (s_detail_name == NULL) {
+        return;
+    }
+    lv_obj_set_width(s_detail_name, ac ? AC_NAME_W : DETAIL_NAME_W);
+    lv_obj_align(s_detail_name, LV_ALIGN_TOP_MID, 0, ac ? AC_NAME_Y : DETAIL_NAME_Y);
 }
 
 static void detail_set_hidden(lv_obj_t *obj, bool hidden)
@@ -2177,10 +2511,75 @@ static void detail_set_hidden(lv_obj_t *obj, bool hidden)
     }
 }
 
+/**
+ * 详情页电源开关（灯 / 空调共用一个）的配色：
+ *   关：轨道 0x3A3A3C、滑块 0x8E8E93（和圆环底色同一套灰，全页没有一处蓝）
+ *   开：轨道 = 当前页强调色（灯 = 灯自己的颜色；空调 = 模式色；两者都过了
+ *       detail_on_bg 对比度处理，纯白灯也不会刷成白底白开关），滑块 0xF2F2F7
+ * 主题默认那圈蓝来自 LV_PART_INDICATOR + LV_STATE_CHECKED，所以两个 part 都刷；
+ * 调用点跟着灯色 / 模式色一起走（detail_apply_dial_colors），不是只在点开关时刷。
+ * 颜色没变就直接返回：500ms 轮询不该每帧重绘一次开关。
+ */
+static void detail_apply_switch_style(bool on)
+{
+    if (s_detail_power_sw == NULL) {
+        return;
+    }
+    const lv_color_t track = on ? (s_detail_fan ? s_fan_accent
+                                                : s_detail_ac ? s_ac_accent : s_detail_accent)
+                                : lv_color_hex(0x3A3A3C);
+    const int8_t shown = on ? 1 : 0;
+    if (s_sw_style_shown == shown && lv_color_eq(track, s_sw_track_shown)) {
+        return;
+    }
+    s_sw_style_shown = shown;
+    s_sw_track_shown = track;
+
+    /* 轨道：LVGL 9 的开关把"开"的底色画在 INDICATOR 上，MAIN 也一起刷，
+       这样过渡动画的两端都是同一套颜色（不会闪一下主题蓝）。 */
+    lv_obj_set_style_bg_color(s_detail_power_sw, track, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_detail_power_sw, track, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_detail_power_sw, track,
+                              (lv_style_selector_t)(LV_PART_INDICATOR | LV_STATE_CHECKED));
+    /* 滑块：关 = 中灰、开 = 近白 */
+    lv_obj_set_style_bg_color(s_detail_power_sw,
+                              on ? lv_color_hex(0xF2F2F7) : lv_color_hex(0x8E8E93),
+                              LV_PART_KNOB);
+}
+
 /** 环 / 光晕 / 灯泡的颜色：先按底色做对比度处理，再刷到样式上。*/
 static void detail_apply_dial_colors(void)
 {
     const ha_entity_t *e = ha_client_find(s_detail_entity);
+    if (s_detail_fan) {
+        /* ---- 风扇：只有一条环，颜色 = 当前预设 ----
+           预设没变就不碰样式（500ms 轮询不该每帧重绘）；换预设 / 换实体才刷。 */
+        if (e == NULL) {
+            return;
+        }
+        const char *preset = fan_preset_now(e);
+        s_fan_accent = detail_on_bg(fan_preset_color(preset));
+        /* 开关的"开"色 = 预设色：放在判重之前，颜色变了能跟着刷 */
+        detail_apply_switch_style(s_sw_on_now);
+        if (strcmp(preset, s_fan_preset_shown) == 0) {
+            return;
+        }
+        snprintf(s_fan_preset_shown, sizeof(s_fan_preset_shown), "%.15s", preset);
+        if (s_fan_arc) {
+            lv_obj_set_style_arc_color(s_fan_arc, s_fan_accent, LV_PART_INDICATOR);
+        }
+        if (s_fan_glow) {
+            lv_obj_set_style_arc_color(s_fan_glow, s_fan_accent, LV_PART_INDICATOR);
+        }
+        if (s_fan_icon) {
+            lv_obj_invalidate(s_fan_icon);       /* 自绘图标：颜色变了得手动失效 */
+        }
+        /* 预设键的高亮 / 显示哪些键跟着预设走；能力（preset_modes）每台不同，
+           所以和"预设真的变了"一起刷，500ms 轮询不会再把 4 个键重绘一遍。 */
+        fan_refresh_chips(e, preset);
+        fan_refresh_osc(e);                      /* 摇头的开色跟着预设色走 */
+        return;
+    }
     if (s_detail_ac) {
         /* ---- 空调：只有一条环，颜色 = 当前 hvac 模式 ----
            模式没变就不碰样式（500ms 轮询不该每帧重绘），只有换模式 / 换实体才刷。 */
@@ -2189,6 +2588,8 @@ static void detail_apply_dial_colors(void)
         }
         const char *st = ac_state_now(e);
         s_ac_accent = detail_on_bg(ac_mode_color(st));
+        /* 开关的"开"色 = 模式色：放在模式判重之前，颜色变了能跟着刷 */
+        detail_apply_switch_style(s_sw_on_now);
         if (strcmp(st, s_ac_mode_shown) == 0) {
             return;
         }
@@ -2211,7 +2612,7 @@ static void detail_apply_dial_colors(void)
     if (s_detail_br_arc == NULL) {
         return;
     }
-    const bool on = detail_light_on(e);
+    const bool on = detail_device_on(e);
 
     /* 外环 = 亮度：灯的当前颜色；不知道色温（只有亮度）的灯用强调蓝 */
     s_detail_accent = detail_on_bg(on ? detail_light_base() : COLOR_ACCENT);
@@ -2219,6 +2620,8 @@ static void detail_apply_dial_colors(void)
     if (s_detail_br_glow) {
         lv_obj_set_style_arc_color(s_detail_br_glow, s_detail_accent, LV_PART_INDICATOR);
     }
+    /* 开关的"开"色 = 灯色（和亮度环同色）：色温/亮度变了跟着刷 */
+    detail_apply_switch_style(s_sw_on_now);
     if (s_detail_ct_glow) {
         /* 色温环的光晕就用当前灯色，看着像"这一圈在发光" */
         lv_obj_set_style_arc_color(s_detail_ct_glow,
@@ -2230,36 +2633,173 @@ static void detail_apply_dial_colors(void)
     if (s_detail_icon)   lv_obj_invalidate(s_detail_icon);
 }
 
+/** 环是不是正显示着（对象在、没被藏）。*/
+static bool detail_ring_visible(lv_obj_t *ring)
+{
+    return ring != NULL && !lv_obj_is_hidden(ring);
+}
+
+/** 环心下面那行小字：「旋钮：亮度 / 旋钮：色温」。text = NULL 就藏掉。*/
+static void detail_set_hint(const char *text)
+{
+    if (s_detail_hint == NULL) {
+        return;
+    }
+    if (text == NULL || text[0] == '\0') {
+        lv_obj_add_flag(s_detail_hint, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (strcmp(text, s_detail_hint_shown) != 0) {    /* 文字没变就别重排 */
+        snprintf(s_detail_hint_shown, sizeof(s_detail_hint_shown), "%.15s", text);
+        lv_label_set_text(s_detail_hint, text);
+    }
+    lv_obj_set_style_text_color(s_detail_hint, detail_muted_on_bg(), 0);
+    lv_obj_remove_flag(s_detail_hint, LV_OBJ_FLAG_HIDDEN);
+}
+
 /**
- * 焦点只影响"看起来哪个环是活的"：旋钮调的那个环 指示灯全亮 + 一道光晕 +
- * 中间对应的数字全亮；另一个环压到 60%、光晕关掉。
+ * 焦点环"当前值"位置的小圆点：角度 = 值在 [min,max] 里的比例 × 270°（135° 起），
+ * 半径取该环描边的中线。纯整数三角（lv_trigo_*），不建定时器、不做动画，
+ * 只在值 / 焦点变化时挪一下；环被藏起来（关灯 / 切页 / 空调关机）就一起藏掉。
+ * 只碰静态对象指针（每次 build 重新赋值），没有跨页残留的引用。
+ */
+static void detail_marker_update(void)
+{
+    if (s_detail_marker == NULL) {
+        return;
+    }
+
+    lv_obj_t *ring = NULL;
+    int radius = 0;
+    lv_color_t col = COLOR_TEXT;
+
+    if (s_detail_fan) {
+        const ha_entity_t *e = ha_client_find(s_detail_entity);
+        ring = detail_device_on(e) ? s_fan_arc : NULL;   /* 关着：环是暗的，不露值点 */
+        radius = FAN_R - FAN_W / 2;
+        col = s_fan_accent;
+    } else if (s_detail_ac) {
+        const ha_entity_t *e = ha_client_find(s_detail_entity);
+        const bool on = (e != NULL) && !ac_state_is_off(ac_state_now(e));
+        ring = on ? s_ac_arc : NULL;          /* 关机：环是暗的，不露值点 */
+        radius = AC_TEMP_R - AC_TEMP_W / 2;
+        col = s_ac_accent;
+    } else {
+        const ha_entity_t *e = ha_client_find(s_detail_entity);
+        const bool br = (s_detail_knob_target != DETAIL_KNOB_CT);
+        ring = br ? s_detail_br_arc : s_detail_ct_arc;
+        radius = br ? (DETAIL_BR_R - DETAIL_BR_W / 2) : (DETAIL_CT_R - DETAIL_CT_W / 2);
+        col = br ? s_detail_accent : detail_on_bg(kelvin_to_color(detail_kelvin_now(e)));
+        if (!detail_device_on(e)) {
+            ring = NULL;                      /* 关灯：整组圆盘是藏着的 */
+        }
+    }
+
+    if (!detail_ring_visible(ring)) {
+        lv_obj_add_flag(s_detail_marker, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    const int32_t vmin = lv_arc_get_min_value(ring);
+    const int32_t vmax = lv_arc_get_max_value(ring);
+    const int32_t v = lv_arc_get_value(ring);
+    int t = 0;                                /* 0..1000 */
+    if (vmax > vmin) {
+        t = (int)(((int64_t)(v - vmin) * 1000) / (vmax - vmin));
+        if (t < 0) {
+            t = 0;
+        }
+        if (t > 1000) {
+            t = 1000;
+        }
+    }
+    const int deg = (DETAIL_ANG_START + DETAIL_ANG_SWEEP * t / 1000) % 360;
+    const int mx = DETAIL_CX + (int)(((int32_t)radius * lv_trigo_cos((int16_t)deg)) >> LV_TRIGO_SHIFT);
+    const int my = DETAIL_CY + (int)(((int32_t)radius * lv_trigo_sin((int16_t)deg)) >> LV_TRIGO_SHIFT);
+    lv_obj_set_pos(s_detail_marker, mx - DETAIL_MARKER_SIZE / 2, my - DETAIL_MARKER_SIZE / 2);
+    lv_obj_set_style_bg_color(s_detail_marker, col, 0);
+    lv_obj_remove_flag(s_detail_marker, LV_OBJ_FLAG_HIDDEN);
+}
+
+/**
+ * 焦点：让"旋钮现在调的是哪个环"一眼就能看出来。四路提示全在这一个函数里刷，
+ * 所以永远不会互相矛盾：
+ *   1) 焦点环指示灯 100% + 描边加粗 2px + 光晕；另一个环 ~35%、细描边、光晕关；
+ *   2) 焦点环"当前值"位置一颗 10px 小圆点（跟值走，见 detail_marker_update）；
+ *   3) 环心下面一行小字：旋钮：亮度 / 旋钮：色温（空调页单环，不出）；
+ *   4) 焦点那个数字全亮、另一个压暗并转成灰色。
  * 焦点没有独立变量——s_detail_knob_target 既是旋钮目标，也是焦点。
  */
 static void detail_apply_focus(void)
 {
+    const lv_color_t fg = detail_text_fg();
+    const lv_color_t muted = detail_muted_on_bg();
+
+    if (s_detail_fan) {
+        /* 风扇也只有一个环：它永远是焦点。开着才有光晕 / 值点 / 提示；
+           关掉时环压暗、并且**不可点**——fan.set_percentage 会顺带开机，
+           而电源只归开关管（视线里那圈刻度还在，只是拨不动）。 */
+        const ha_entity_t *e = ha_client_find(s_detail_entity);
+        const bool on = detail_device_on(e);
+        if (s_fan_arc) {
+            lv_obj_set_style_arc_width(s_fan_arc, FAN_W + 2, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(s_fan_arc, on ? LV_OPA_COVER : DETAIL_DIM_OPA,
+                                     LV_PART_INDICATOR);
+            /* 轨道（没填满那圈）：焦点环亮一档，关机时再暗一档 */
+            lv_obj_set_style_arc_opa(s_fan_arc, on ? DETAIL_TRACK_OPA : DETAIL_TRACK_DIM_OPA,
+                                     LV_PART_MAIN);
+            lv_obj_set_clickable(s_fan_arc, on);
+        }
+        if (s_fan_glow) {
+            lv_obj_set_style_arc_opa(s_fan_glow, on ? DETAIL_GLOW_OPA : LV_OPA_TRANSP,
+                                     LV_PART_INDICATOR);
+        }
+        if (s_fan_pct) {
+            lv_obj_set_style_text_opa(s_fan_pct, on ? LV_OPA_COVER : DETAIL_DIM_OPA, 0);
+            lv_obj_set_style_text_color(s_fan_pct, on ? fg : muted, 0);
+        }
+        if (s_fan_preset) {
+            lv_obj_set_style_text_color(s_fan_preset, detail_muted_on_bg(), 0);
+        }
+        detail_set_hint(on ? "旋钮：风速" : NULL);
+        detail_marker_update();
+        return;
+    }
+
     if (s_detail_ac) {
         /* 空调只有一个环：它永远是焦点。开着才有光晕，关掉连光晕都收掉。 */
         const ha_entity_t *e = ha_client_find(s_detail_entity);
         const bool on = (e != NULL) && !ac_state_is_off(ac_state_now(e));
         if (s_ac_arc) {
-            lv_obj_set_style_arc_opa(s_ac_arc,
-                                     on ? LV_OPA_COVER : DETAIL_DIM_OPA, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_width(s_ac_arc, AC_TEMP_W + 2, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(s_ac_arc, on ? LV_OPA_COVER : DETAIL_DIM_OPA,
+                                     LV_PART_INDICATOR);
+            /* 轨道（没填满那圈）：焦点环亮一档，关机时再暗一档 */
+            lv_obj_set_style_arc_opa(s_ac_arc, on ? DETAIL_TRACK_OPA : DETAIL_TRACK_DIM_OPA,
+                                     LV_PART_MAIN);
         }
         if (s_ac_glow) {
-            lv_obj_set_style_arc_opa(s_ac_glow,
-                                     on ? DETAIL_GLOW_OPA : LV_OPA_TRANSP, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(s_ac_glow, on ? DETAIL_GLOW_OPA : LV_OPA_TRANSP,
+                                     LV_PART_INDICATOR);
         }
         if (s_ac_temp_value) {
-            lv_obj_set_style_text_opa(s_ac_temp_value,
-                                      on ? LV_OPA_COVER : DETAIL_DIM_OPA, 0);
+            lv_obj_set_style_text_opa(s_ac_temp_value, on ? LV_OPA_COVER : DETAIL_DIM_OPA, 0);
+            lv_obj_set_style_text_color(s_ac_temp_value, on ? fg : muted, 0);
         }
+        detail_set_hint(NULL);            /* 单环：没有"选哪个"的问题 */
+        detail_marker_update();
         return;
     }
 
     const bool br = (s_detail_knob_target == DETAIL_KNOB_BR);
     if (s_detail_br_arc) {
+        lv_obj_set_style_arc_width(s_detail_br_arc, br ? DETAIL_BR_W + 2 : DETAIL_BR_W,
+                                   LV_PART_INDICATOR);
         lv_obj_set_style_arc_opa(s_detail_br_arc, br ? LV_OPA_COVER : DETAIL_DIM_OPA,
                                  LV_PART_INDICATOR);
+        /* 轨道：只有焦点环能看到一圈"刻度"（70%），另一个压到 45% */
+        lv_obj_set_style_arc_opa(s_detail_br_arc, br ? DETAIL_TRACK_OPA : DETAIL_TRACK_DIM_OPA,
+                                 LV_PART_MAIN);
     }
     if (s_detail_br_glow) {
         lv_obj_set_style_arc_opa(s_detail_br_glow, br ? DETAIL_GLOW_OPA : LV_OPA_TRANSP,
@@ -2270,21 +2810,44 @@ static void detail_apply_focus(void)
                                  LV_PART_INDICATOR);
     }
     if (s_detail_ct_arc) {
-        /* 色温环的渐变是自绘的，透明度在自绘回调里按焦点算 → 只要重画 */
+        /* 轨道同理，只是焦点方向相反 */
+        lv_obj_set_style_arc_opa(s_detail_ct_arc, br ? DETAIL_TRACK_DIM_OPA : DETAIL_TRACK_OPA,
+                                 LV_PART_MAIN);
+        /* 色温环的渐变是自绘的：宽度/透明度都在回调里按焦点算 → 重画即可 */
         lv_obj_invalidate(s_detail_ct_arc);
     }
     if (s_detail_br_value) {
         lv_obj_set_style_text_opa(s_detail_br_value, br ? LV_OPA_COVER : DETAIL_DIM_OPA, 0);
+        lv_obj_set_style_text_color(s_detail_br_value, br ? fg : muted, 0);
     }
     if (s_detail_ct_value) {
         lv_obj_set_style_text_opa(s_detail_ct_value, br ? DETAIL_DIM_OPA : LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(s_detail_ct_value, br ? muted : fg, 0);
     }
+
+    /* 小字提示 + 值点：只有灯开着、焦点环真的在屏幕上才露出来 */
+    const bool on = detail_device_on(ha_client_find(s_detail_entity));
+    const bool ring_on_screen = detail_ring_visible(br ? s_detail_br_arc : s_detail_ct_arc);
+    if (on && ring_on_screen) {
+        detail_set_hint(br ? "旋钮：亮度" : "旋钮：色温");
+    } else {
+        detail_set_hint(NULL);
+    }
+    detail_marker_update();
 }
 
 /**
  * 色温环的自绘渐变：从起点画到当前值，沿角度由暖到冷逐段画。
  * LVGL 9.6 的 lv_arc 只支持纯色指示灯，所以渐变只能自己按角度分段画；
  * 角步长 4°，270° 最多 68 段，红色那段圆弧本来就只有十几个像素，足够细。
+ *
+ * 注意：扫角必须自己按"值 / 范围"算，不能读 lv_arc_get_angle_end()。
+ * LVGL 的 arc 会把角度归一化到 0..360（lv_arc_set_angles 里 while(end > 360) end -= 360），
+ * 所以值一旦越过 83.3% 的位置（2000..6500 的机器约 5750K，某些 2xxx..5xxx 的机器
+ * 正好在 5200K 附近）终点角就回绕成 45°，和起点 135° 一比被当成"空环"直接 return，
+ * 整段渐变色消失——这就是"色温大于 ~5200 圈上颜色就没了"的原因。
+ * 这里用 135° + 270° × (v-min)/(max-min) 得到 135..405 的"未回绕"角度，
+ * 画的时候照常交给 lv_draw_arc（它内部会做 >=360 的归一化）。
  */
 static void detail_ct_grad_draw_cb(lv_event_t *e)
 {
@@ -2294,11 +2857,18 @@ static void detail_ct_grad_draw_cb(lv_event_t *e)
         return;
     }
 
-    const lv_value_precise_t a0 = lv_arc_get_angle_start(obj);
-    const lv_value_precise_t a1 = lv_arc_get_angle_end(obj);
-    if (a1 <= a0) {
-        return;                       /* 值为 0：只有底环 */
+    const int32_t v = (int32_t)lv_arc_get_value(obj);
+    const int32_t vmin = (int32_t)lv_arc_get_min_value(obj);
+    const int32_t vmax = (int32_t)lv_arc_get_max_value(obj);
+    if (vmax <= vmin || v <= vmin) {
+        return;                       /* 值为最小：只剩底环 */
     }
+    const int a0 = DETAIL_ANG_START;
+    int a1 = a0 + (int)(((int64_t)(v - vmin) * DETAIL_ANG_SWEEP) / (vmax - vmin));   /* 135..405 */
+
+    /* 渐变的暖/冷端 = 这台机器自己的色温范围（只查一次，别在 68 段里反复查实体）*/
+    int klo = 2000, khi = 6500;
+    detail_ct_range(ha_client_find(s_detail_entity), &klo, &khi);
 
     lv_area_t area;
     lv_obj_get_coords(obj, &area);
@@ -2308,22 +2878,23 @@ static void detail_ct_grad_draw_cb(lv_event_t *e)
 
     lv_draw_arc_dsc_t d;
     lv_draw_arc_dsc_init(&d);
-    d.width = DETAIL_CT_W;
     d.radius = (uint16_t)r;
     d.center.x = area.x1 + r;
     d.center.y = area.y1 + r;
     d.opa = (s_detail_knob_target == DETAIL_KNOB_CT) ? LV_OPA_COVER : DETAIL_DIM_OPA;
+    /* 焦点环的指示灯加粗 2px（和亮度环的规则一致），没焦点时保持细描边 */
+    d.width = DETAIL_CT_W + ((s_detail_knob_target == DETAIL_KNOB_CT) ? 2 : 0);
 
-    for (int seg = (int)a0; seg < (int)a1; seg += DETAIL_GRAD_STEP) {
+    for (int seg = a0; seg < a1; seg += DETAIL_GRAD_STEP) {
         int seg_end = seg + DETAIL_GRAD_STEP;
-        if (seg_end > (int)a1) {
-            seg_end = (int)a1;
+        if (seg_end > a1) {
+            seg_end = a1;
         }
-        d.color = detail_grad_color((seg - DETAIL_ANG_START) * 100 / DETAIL_ANG_SWEEP);
+        d.color = detail_grad_color((seg - a0) * 100 / DETAIL_ANG_SWEEP, klo, khi);
         d.start_angle = seg;
         d.end_angle = seg_end;
         /* 只有两端做圆头：每段都圆头会画成一串珠子 */
-        d.rounded = (seg == (int)a0) || (seg_end == (int)a1);
+        d.rounded = (seg == a0) || (seg_end == a1);
         lv_draw_arc(layer, &d);
     }
 }
@@ -2359,26 +2930,28 @@ static void detail_bulb_draw_cb(lv_event_t *e)
     lv_draw_rect(layer, &d, &base);
 }
 
+/** 主文字颜色：亮底黑字、暗底白字（和 detail_on_bg 用同一套亮度判据）。*/
+static lv_color_t detail_text_fg(void)
+{
+    return (detail_luma(s_detail_bg_col) >= 150) ? lv_color_black() : lv_color_white();
+}
+
 /** 根据背景亮度切换文字颜色，保证可读。 */
 static void detail_apply_foreground(bool dark_text)
 {
     const lv_color_t fg = dark_text ? lv_color_black() : lv_color_white();
     const lv_color_t muted = dark_text ? lv_color_hex(0x3A3A3C) : COLOR_MUTED;
-    if (s_detail_title)    lv_obj_set_style_text_color(s_detail_title, fg, 0);
-    if (s_back_label)      lv_obj_set_style_text_color(s_back_label, fg, 0);
-    if (s_detail_br_value) lv_obj_set_style_text_color(s_detail_br_value, fg, 0);
-    if (s_detail_ct_value) lv_obj_set_style_text_color(s_detail_ct_value, fg, 0);
+    /* 实体名是小灰字：过一遍"弱化色"的对比度保护（见 detail_muted_on_bg），
+       不然底色一亮它就糊进背景里。 */
+    if (s_detail_name) lv_obj_set_style_text_color(s_detail_name, detail_muted_on_bg(), 0);
     if (s_detail_off_hint) lv_obj_set_style_text_color(s_detail_off_hint, muted, 0);
+    /* 两个数值文字的颜色由 detail_apply_focus 按焦点刷（焦点那个亮、另一个灰），
+       这里不抢，否则每次底色刷新都会把焦点提示盖掉。 */
     /* 空调页那组（和灯同一容器，只有一组可见）*/
     if (s_ac_temp_value)   lv_obj_set_style_text_color(s_ac_temp_value, fg, 0);
     if (s_ac_room)         lv_obj_set_style_text_color(s_ac_room, muted, 0);
     if (s_ac_fan_label)    lv_obj_set_style_text_color(s_ac_fan_label, fg, 0);
-    /* 返回键底色跟着反色，避免在纯白背景上看不见 */
-    if (s_back_label && lv_obj_get_parent(s_back_label)) {
-        lv_obj_set_style_bg_color(lv_obj_get_parent(s_back_label),
-                                  dark_text ? lv_color_hex(0xE5E5EA) : lv_color_hex(0x2C2C2E), 0);
-        lv_obj_set_style_bg_opa(lv_obj_get_parent(s_back_label), LV_OPA_70, 0);
-    }
+    if (s_fan_preset)      lv_obj_set_style_text_color(s_fan_preset, detail_muted_on_bg(), 0);
 }
 
 /** 背景氛围：按"关=黑、开=灯色 × 亮度"更新子页底色，顺便把圆盘配色跟着刷新。 */
@@ -2397,7 +2970,7 @@ static void detail_update_ambience(void)
         lv_obj_set_style_bg_opa(s_detail, LV_OPA_COVER, 0);
 
         /* 背景亮就用黑字，背景暗就用白字 */
-        detail_apply_foreground(detail_luma(s_detail_bg_col) < 150);   /* true = 深色文字 */
+        detail_apply_foreground(detail_luma(s_detail_bg_col) >= 150);  /* true = 深色文字 */
     }
     detail_apply_dial_colors();                                    /* 环 / 光晕 / 灯泡跟着底色 */
 }
@@ -2408,18 +2981,23 @@ static void detail_close_done_cb(lv_anim_t *a);
 static void detail_apply_entity(void)
 {
     const ha_entity_t *e = ha_client_find(s_detail_entity);
+    /* 名字行先摆好：实体还没拉到时 s_detail_ac 已经由 ui_home_open_detail 按
+       实体 id 前缀定过，位置照样是对的；名字是空的就整行藏掉，不留上一页的残字。 */
+    if (e != NULL) {
+        s_detail_ac = detail_is_climate(e);
+        s_detail_fan = detail_is_fan(e);
+    }
+    detail_place_name(s_detail_ac);
+    detail_set_name(e != NULL ? e->name : NULL);
     if (e == NULL) {
         return;
     }
     /* 同一个 s_detail 容器，两种页面：灯（亮度/色温两条环）和空调（温度一条环）。
        s_detail_ac 是"现在开的是哪一种"的唯一真相，旋钮/焦点/补发/配色全看它。 */
-    s_detail_ac = detail_is_climate(e);
-    ESP_LOGD(TAG, "detail attrs: %s br=%d tint=%d k=%d range=%d-%d state=%s",
-             s_detail_ac ? "climate" : "light",
-             e->has_brightness, e->has_tint, e->color_temp_k, e->min_k, e->max_k, e->state);
-    if (s_detail_title != NULL) {
-        lv_label_set_text(s_detail_title, e->name);
-    }
+    ESP_LOGD(TAG, "detail attrs: %s br=%d tint=%d k=%d range=%d-%d pct=%d preset=%s osc=%d state=%s",
+             s_detail_ac ? "climate" : (s_detail_fan ? "fan" : "light"),
+             e->has_brightness, e->has_tint, e->color_temp_k, e->min_k, e->max_k,
+             e->percentage, e->preset_mode, (int)e->oscillating, e->state);
 
     /* 电源开关（两类共用）：HA 原始状态 + 6s 本地覆盖。
        climate.* 的 state 是 auto/cool/heat/.../off，没有 "on"，所以单独判断。 */
@@ -2433,16 +3011,27 @@ static void detail_apply_entity(void)
     } else {
         s_sw_override_until = 0;
     }
+    /* 记住开关此刻该显示的状态：开关配色（detail_apply_switch_style）在
+       detail_apply_dial_colors 里跟着灯色/模式色一起刷，要读它。 */
+    s_sw_on_now = on;
     if (s_detail_power_sw != NULL) {
-        /* 空调页底部那排更挤，开关换成窄一点的（灯的 96x46 放不下 5 个模式键）*/
-        const int geom = s_detail_ac ? 1 : 0;
+        /* 底部那一行一页比一页挤：灯 96x46 / 空调 72x32 / 风扇 62x28（还要给摇头让位）*/
+        const int geom = s_detail_ac ? 1 : (s_detail_fan ? 2 : 0);
         if (s_sw_geom != geom) {
             s_sw_geom = geom;
-            lv_obj_set_size(s_detail_power_sw,
-                            s_detail_ac ? AC_SW_W : 96, s_detail_ac ? AC_SW_H : 46);
-            lv_obj_align(s_detail_power_sw, LV_ALIGN_TOP_MID, 0, s_detail_ac ? AC_SW_Y : 273);
+            if (geom == 1) {
+                lv_obj_set_size(s_detail_power_sw, AC_SW_W, AC_SW_H);
+                lv_obj_align(s_detail_power_sw, LV_ALIGN_TOP_MID, 0, AC_SW_Y);
+            } else if (geom == 2) {
+                lv_obj_set_size(s_detail_power_sw, FAN_SW_W, FAN_SW_H);
+                lv_obj_align(s_detail_power_sw, LV_ALIGN_TOP_MID, FAN_SW_DX, FAN_SW_Y);
+            } else {
+                lv_obj_set_size(s_detail_power_sw, 96, 46);
+                lv_obj_align(s_detail_power_sw, LV_ALIGN_TOP_MID, 0, 273);
+            }
         }
-        /* 开关的视觉只在状态真的变了时刷（500ms 轮询不该每帧重绘）*/
+        /* CHECKED 状态只在真的变了时切；配色走 detail_apply_switch_style
+           （那里自己判重，所以颜色变化不用等下一次开关动作）。 */
         const int8_t shown = on ? 1 : 0;
         if (s_sw_on_shown != shown) {
             s_sw_on_shown = shown;
@@ -2451,11 +3040,7 @@ static void detail_apply_entity(void)
             } else {
                 lv_obj_remove_state(s_detail_power_sw, LV_STATE_CHECKED);
             }
-            lv_obj_set_style_bg_color(s_detail_power_sw,
-                                      on ? lv_color_white() : lv_color_hex(0x151517),
-                                      LV_PART_MAIN);
-            lv_obj_set_style_bg_color(s_detail_power_sw,
-                                      on ? lv_color_black() : lv_color_white(), LV_PART_KNOB);
+            detail_apply_switch_style(on);
         }
     }
     if (s_detail_ac) {
@@ -2470,7 +3055,20 @@ static void detail_apply_entity(void)
         return;
     }
 
+    if (s_detail_fan) {
+        /* 风扇：灯 / 空调那两组都藏起来，这一组显示出来。顺序同空调：
+           先显示整组，再算底色 / 配色（里面会按 preset_modes 藏掉不支持的预设键） */
+        detail_hide_light(true);
+        ac_hide_all(true);
+        fan_hide_all(false);
+        detail_update_ambience();
+        fan_apply_entity(e);
+        detail_apply_focus();                 /* 开着才有光晕 / 值点 / 提示 */
+        return;
+    }
+
     ac_hide_all(true);                        /* 空调那组藏起来 */
+    fan_hide_all(true);                       /* 风扇那组藏起来 */
     detail_update_ambience();
     /* 圆盘：灯关着就整组藏起来、只留「已关闭」；不支持的能力也藏。
        值仍然照常写进去（哪怕藏着），开灯后第一帧就是对的。 */
@@ -2481,8 +3079,8 @@ static void detail_apply_entity(void)
         } else {
             s_br_override_until = 0;
         }
-        if (pct < 0) {
-            pct = 0;
+        if (pct < 1) {
+            pct = 1;                          /* 亮度环的下限是 1%：0% 会被 HA 当成关灯 */
         }
         if (pct > 100) {
             pct = 100;
@@ -2509,6 +3107,13 @@ static void detail_apply_entity(void)
             k = s_ct_override;
         } else {
             s_ct_override_until = 0;
+        }
+        /* 换灯 / 脏覆盖值：色温必须夹进这台机器自己的范围，绝不把越界值塞进 arc */
+        if (k < lo) {
+            k = lo;
+        }
+        if (k > hi) {
+            k = hi;
         }
         lv_arc_set_value(s_detail_ct_arc, k);
         if (s_detail_ct_glow) {
@@ -2714,11 +3319,11 @@ static void ac_set_temp_text(int t10, int step_t10)
     char buf[16];
     ac_fmt_temp(num, sizeof(num), t10, step_t10);
     snprintf(buf, sizeof(buf), "%s°", num);
-    if (strcmp(buf, s_ac_temp_txt) == 0) {
-        return;
+    if (strcmp(buf, s_ac_temp_txt) != 0) {
+        snprintf(s_ac_temp_txt, sizeof(s_ac_temp_txt), "%s", buf);
+        lv_label_set_text(s_ac_temp_value, buf);
     }
-    snprintf(s_ac_temp_txt, sizeof(s_ac_temp_txt), "%s", buf);
-    lv_label_set_text(s_ac_temp_value, buf);
+    detail_marker_update();   /* 文字没变（四舍五入到同一步）时值点也要跟上 */
 }
 
 /** 「室内 17.0°C」；没有 current_temperature 就显示 --。 */
@@ -3077,12 +3682,387 @@ static void ac_fan_cb(lv_event_t *e)
     xQueueSend(s_cmd_q, &cmd, 0);
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* 风扇详情页：和灯 / 空调共用 s_detail 与同一套圆盘（外环 = 风速）             */
+/* ------------------------------------------------------------------------- */
+
+/* 4 个预设的固定顺序：raw = 发给 HA 的原样字符串（和这台风扇 preset_modes 里的
+   写法一致），label = 屏幕上两个字的简称，rgb = 这个预设的环色。
+   都是静态常量，按钮建一次就够，不占实体内存，也不用每次开页重建。 */
+typedef struct {
+    const char *raw;
+    const char *label;
+    uint32_t rgb;
+} fan_preset_def_t;
+
+static const fan_preset_def_t k_fan_presets[FAN_MODE_COUNT] = {
+    {"直吹风", "直吹", 0x2DD4BF},   /* 青：直吹 */
+    {"自然风", "自然", 0x30D158},   /* 绿：自然 */
+    {"循环风", "循环", 0x3B82F6},   /* 蓝：循环 */
+    {"睡眠",   "睡眠", 0x8E8E93},   /* 灰：睡眠 */
+};
+
+static bool detail_is_fan(const ha_entity_t *e)
+{
+    return e != NULL && strncmp(e->entity_id, "fan.", 4) == 0;
+}
+
+/** 当前该按哪个预设显示：本地覆盖优先（点了预设先变色），HA 跟上就交还。 */
+static const char *fan_preset_now(const ha_entity_t *e)
+{
+    if (e == NULL) {
+        return "";
+    }
+    if (s_fan_preset_local_until > lv_tick_get()) {
+        if (strcmp(s_fan_preset_local, e->preset_mode) == 0) {
+            s_fan_preset_local_until = 0;     /* HA 已跟上 */
+        } else {
+            return s_fan_preset_local;
+        }
+    }
+    return e->preset_mode;
+}
+
+/** 预设 -> 环色（不认识的预设按直吹青处理）。 */
+static lv_color_t fan_preset_color(const char *preset)
+{
+    if (preset != NULL) {
+        for (int i = 0; i < FAN_MODE_COUNT; i++) {
+            if (strcmp(preset, k_fan_presets[i].raw) == 0) {
+                return lv_color_hex(k_fan_presets[i].rgb);
+            }
+        }
+    }
+    return lv_color_hex(0x2DD4BF);
+}
+
+/**
+ * 风扇页底色：预设色压到很暗的一层，关掉纯黑（和空调页 ac_mode_bg 同一套做法）。
+ * 不把整页染成预设色：底色一亮，中间的小字和预设键的对比度就保不住了。
+ * 青 -> (0x07,0x21,0x1E)、绿 -> (0x07,0x20,0x0D)、蓝 -> (0x09,0x14,0x26)、
+ * 灰 -> (0x16,0x16,0x17)，感知亮度都在 30 以下，白字照样拉得开。
+ */
+static lv_color_t fan_ambient_bg(const char *preset, bool on)
+{
+    if (!on) {
+        return COLOR_BG;
+    }
+    const lv_color_t c = fan_preset_color(preset);
+    return lv_color_make((uint8_t)(c.red * 40 / 255),
+                         (uint8_t)(c.green * 40 / 255),
+                         (uint8_t)(c.blue * 40 / 255));
+}
+
+/** 当前该显示 / 该用的风速百分比：本地覆盖优先，其次实体值，最后按 100%。
+ *  下限 1%：0% 会被 Home Assistant 当成"关"，电源只归开关管（同灯的亮度）。 */
+static int fan_pct_now(const ha_entity_t *e)
+{
+    int pct = 100;
+    if (s_fan_pct_override_until > lv_tick_get()) {
+        pct = s_fan_pct_override;
+    } else if (e != NULL && e->has_percentage) {
+        pct = e->percentage;
+    }
+    if (pct < 1) {
+        pct = 1;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    return pct;
+}
+
+/** 中间的大号百分比（旋钮 / 拖动 / 轮询三条路径都走它）。 */
+static void fan_set_pct_text(int pct)
+{
+    if (s_fan_pct == NULL) {
+        return;
+    }
+    if (pct < 1) {
+        pct = 1;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", pct);
+    if (strcmp(buf, s_fan_pct_txt) != 0) {
+        snprintf(s_fan_pct_txt, sizeof(s_fan_pct_txt), "%s", buf);
+        lv_label_set_text(s_fan_pct, buf);
+    }
+    detail_marker_update();          /* 焦点值点跟着风速环当前值走 */
+}
+
+/** 中间第二行：当前预设（原样中文，如「自然风」）；没有就 --。 */
+static void fan_set_preset_text(const char *preset)
+{
+    if (s_fan_preset == NULL) {
+        return;
+    }
+    const char *txt = (preset != NULL && preset[0] != '\0') ? preset : "--";
+    if (strcmp(txt, s_fan_preset_txt) == 0) {
+        return;
+    }
+    snprintf(s_fan_preset_txt, sizeof(s_fan_preset_txt), "%.15s", txt);
+    lv_label_set_text(s_fan_preset, txt);
+}
+
+/** 预设键高亮：当前预设用该预设的颜色填充，其余保持深灰。
+ *  实体 preset_modes 里没有的键先藏掉（还没拉到列表时先全显示，别让整行消失）。 */
+static void fan_refresh_chips(const ha_entity_t *e, const char *preset)
+{
+    for (int i = 0; i < FAN_MODE_COUNT; i++) {
+        lv_obj_t *btn = s_fan_mode_btn[i];
+        lv_obj_t *lbl = s_fan_mode_lbl[i];
+        if (btn == NULL) {
+            continue;
+        }
+        const bool active = (preset != NULL) && (preset[0] != '\0') &&
+                            (strcmp(preset, k_fan_presets[i].raw) == 0);
+        const lv_color_t fill = active ? detail_on_bg(lv_color_hex(k_fan_presets[i].rgb))
+                                       : lv_color_hex(0x24262B);
+        lv_obj_set_style_bg_color(btn, fill, 0);
+        lv_obj_set_style_bg_opa(btn, active ? LV_OPA_COVER : LV_OPA_80, 0);
+        if (lbl != NULL) {
+            lv_obj_set_style_text_color(lbl, active ? (detail_luma(fill) >= 140 ? lv_color_black()
+                                                                                : lv_color_white())
+                                                    : COLOR_TEXT, 0);
+        }
+        bool supported = (e == NULL) || (e->preset_mode_count == 0);
+        if (e != NULL) {
+            for (int k = 0; k < e->preset_mode_count && k < HA_FAN_PRESET_MAX; k++) {
+                if (strcmp(e->preset_modes[k], k_fan_presets[i].raw) == 0) {
+                    supported = true;
+                }
+            }
+        }
+        detail_set_hidden(btn, !supported);
+    }
+}
+
+/** 摇头键：反映实体 oscillating（含 6s 本地覆盖）。开 = 预设色填充，关 = 深灰。 */
+static void fan_refresh_osc(const ha_entity_t *e)
+{
+    if (s_fan_osc_btn == NULL) {
+        return;
+    }
+    bool osc = (e != NULL) && e->oscillating;
+    if (s_fan_osc_local_until > lv_tick_get()) {
+        if (e != NULL && e->oscillating == s_fan_osc_local) {
+            s_fan_osc_local_until = 0;            /* HA 已跟上 */
+        } else {
+            osc = s_fan_osc_local;
+        }
+    }
+    const lv_color_t fill = osc ? s_fan_accent : lv_color_hex(0x24262B);
+    lv_obj_set_style_bg_color(s_fan_osc_btn, fill, 0);
+    lv_obj_set_style_bg_opa(s_fan_osc_btn, osc ? LV_OPA_COVER : LV_OPA_80, 0);
+    lv_obj_set_style_border_color(s_fan_osc_btn,
+                                  osc ? fill : lv_color_hex(0x3A3A3C), 0);
+    if (s_fan_osc_lbl != NULL) {
+        lv_obj_set_style_text_color(s_fan_osc_lbl,
+                                    osc ? (detail_luma(fill) >= 140 ? lv_color_black()
+                                                                    : lv_color_white())
+                                        : COLOR_TEXT, 0);
+    }
+}
+
+/** 把实体状态刷到风扇页的所有控件上（500ms 轮询也走这里）。 */
+static void fan_apply_entity(const ha_entity_t *e)
+{
+    const int pct = fan_pct_now(e);
+    if (s_fan_arc != NULL) {
+        lv_arc_set_value(s_fan_arc, pct);
+    }
+    if (s_fan_glow != NULL) {
+        lv_arc_set_value(s_fan_glow, pct);
+    }
+    fan_set_pct_text(pct);
+    fan_set_preset_text(fan_preset_now(e));
+    fan_refresh_osc(e);
+    /* 环一直显示（关着只是压暗、不可点，刻度还在），和空调页一致。 */
+}
+
+/** 风扇那组控件全部显示 / 隐藏（切到灯 / 空调页时整组藏起来）。
+ *  显示时不在这里放预设键：哪些键该显示由 fan_refresh_chips 按 preset_modes
+ *  决定，否则每 500ms 会把不支持的键又放出来。 */
+static void fan_hide_all(bool hide)
+{
+    detail_set_hidden(s_fan_arc, hide);
+    detail_set_hidden(s_fan_glow, hide);
+    detail_set_hidden(s_fan_icon, hide);
+    detail_set_hidden(s_fan_pct, hide);
+    detail_set_hidden(s_fan_preset, hide);
+    detail_set_hidden(s_fan_osc_btn, hide);
+    if (hide) {
+        for (int i = 0; i < FAN_MODE_COUNT; i++) {
+            detail_set_hidden(s_fan_mode_btn[i], true);
+        }
+    }
+}
+
+/** 圆盘中间那台风扇：轮毂 + 3 片扇叶（0° / 120° / 240°）+ 一道护网细弧。 */
+static void fan_icon_draw_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if (obj == NULL || layer == NULL) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const int cx = (a.x1 + a.x2) / 2;
+    const int cy = (a.y1 + a.y2) / 2;
+    const lv_color_t c = s_fan_accent;
+
+    ac_dr_arc(layer, cx, cy, 10, 2, 0, 360, c);      /* 护网 */
+    for (int i = 0; i < 12; i += 4) {                /* 0° / 120° / 240°（每 30° 一格）*/
+        int x1, y1, x2, y2;
+        ac_dir_point(cx, cy, i, 1, &x1, &y1);
+        ac_dir_point(cx, cy, i, 7, &x2, &y2);
+        ac_dr_line(layer, x1, y1, x2, y2, 4, c);
+        /* 每片叶尖一小段弧，看起来是"弯"的，不像三根直棍 */
+        ac_dr_arc(layer, cx, cy, 7, 3, i * 30 - 25, i * 30 + 5, c);
+    }
+    ac_dr_dot(layer, cx, cy, 3, c);                  /* 轮毂 */
+}
+
+/** 旋钮在风扇页上调风速：每格 5%（任务指定），值域 1..100。 */
+static bool fan_knob_step(const ha_entity_t *e, int delta)
+{
+    if (s_fan_arc == NULL || e == NULL) {
+        return false;
+    }
+    if (!detail_device_on(e)) {
+        return false;                     /* 关着：旋钮什么也不做（电源只归开关） */
+    }
+    const int cur = (int)lv_arc_get_value(s_fan_arc);
+    int v = cur + delta * FAN_PCT_STEP;
+    if (v < 1) {
+        v = 1;
+    }
+    if (v > 100) {
+        v = 100;
+    }
+    if (v == cur) {
+        return true;                      /* 已经到头：吃掉这一格，不发命令 */
+    }
+    /* 1) 立刻更新界面（环 + 光晕 + 大号百分比），不等网络 */
+    lv_arc_set_value(s_fan_arc, v);
+    if (s_fan_glow) {
+        lv_arc_set_value(s_fan_glow, v);
+    }
+    fan_set_pct_text(v);
+    s_fan_pct_override = v;
+    s_fan_pct_override_until = lv_tick_get() + OVERRIDE_MS;
+
+    /* 2) 网络命令：复用灯那套 100ms 限流 + 50ms 补发 + 合并 */
+    const uint32_t now = lv_tick_get();
+    s_knob_dirty = true;
+    s_knob_pending_target = DETAIL_KNOB_FAN;
+    s_knob_pending_value = v;
+    s_knob_last_change = now;
+    if ((uint32_t)(now - s_knob_last_send) >= DETAIL_KNOB_SEND_MS) {
+        detail_knob_queue_pending();
+    }
+    if (s_knob_dirty) {
+        detail_knob_timer_wake();
+    }
+    return true;
+}
+
+/** 命令里必须是实体报上来的原样字符串（不是屏幕上的简称）：
+ *  先按名字在实体的 preset_modes 里找同一个，找不到才退回静态表的写法。 */
+static const char *fan_preset_raw(const ha_entity_t *e, const fan_preset_def_t *def)
+{
+    if (e != NULL) {
+        for (int i = 0; i < e->preset_mode_count && i < HA_FAN_PRESET_MAX; i++) {
+            if (strcmp(e->preset_modes[i], def->raw) == 0) {
+                return e->preset_modes[i];
+            }
+        }
+    }
+    return def->raw;
+}
+
+/** 点预设键：立刻本地高亮（环色 / 底色 / 图标跟着换），命令走队列。 */
+static void fan_preset_cb(lv_event_t *ev)
+{
+    const fan_preset_def_t *def = (const fan_preset_def_t *)lv_event_get_user_data(ev);
+    if (def == NULL || s_cmd_q == NULL || s_detail_entity[0] == '\0') {
+        return;
+    }
+    const ha_entity_t *ent = ha_client_find(s_detail_entity);
+    snprintf(s_fan_preset_local, sizeof(s_fan_preset_local), "%s", def->raw);
+    s_fan_preset_local_until = lv_tick_get() + OVERRIDE_MS;
+    /* 选预设 = 想要这种风：开关也立刻跟着亮（HA 跟上后自动交还） */
+    s_sw_override_on = true;
+    s_sw_override_until = lv_tick_get() + OVERRIDE_MS;
+    s_sw_on_shown = -1;
+    fan_refresh_chips(ent, def->raw);
+    if (strcmp(def->raw, s_fan_preset_shown) != 0) {
+        snprintf(s_fan_preset_shown, sizeof(s_fan_preset_shown), "%s", def->raw);
+        s_fan_accent = detail_on_bg(lv_color_hex(def->rgb));
+        if (s_fan_arc) {
+            lv_obj_set_style_arc_color(s_fan_arc, s_fan_accent, LV_PART_INDICATOR);
+        }
+        if (s_fan_glow) {
+            lv_obj_set_style_arc_color(s_fan_glow, s_fan_accent, LV_PART_INDICATOR);
+        }
+        if (s_fan_icon) {
+            lv_obj_invalidate(s_fan_icon);
+        }
+        fan_refresh_osc(ent);                /* 摇头的开色跟着预设色走 */
+    }
+    fan_set_preset_text(def->raw);
+    s_detail_fg_dirty = true;                /* 底色要跟着预设换 */
+    detail_update_ambience();
+    detail_apply_focus();
+
+    cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    snprintf(cmd.entity, sizeof(cmd.entity), "%s", s_detail_entity);
+    snprintf(cmd.service, sizeof(cmd.service), "set_preset_mode");
+    snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"preset_mode\":\"%s\"}", fan_preset_raw(ent, def));
+    xQueueSend(s_cmd_q, &cmd, 0);
+}
+
+/** 摇头键：乐观翻转，命令走队列；HA 落定后由轮询 / WS 交还。 */
+static void fan_osc_cb(lv_event_t *ev)
+{
+    (void)ev;
+    if (s_cmd_q == NULL || s_detail_entity[0] == '\0') {
+        return;
+    }
+    const ha_entity_t *ent = ha_client_find(s_detail_entity);
+    bool cur = (ent != NULL) && ent->oscillating;
+    if (s_fan_osc_local_until > lv_tick_get()) {
+        cur = s_fan_osc_local;
+    }
+    const bool next = !cur;
+    s_fan_osc_local = next;
+    s_fan_osc_local_until = lv_tick_get() + OVERRIDE_MS;
+    fan_refresh_osc(ent);
+
+    cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    snprintf(cmd.entity, sizeof(cmd.entity), "%s", s_detail_entity);
+    snprintf(cmd.service, sizeof(cmd.service), "set_oscillating");
+    snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"oscillating\":%s}", next ? "true" : "false");
+    xQueueSend(s_cmd_q, &cmd, 0);
+    ESP_LOGI(TAG, "摇头 -> %s", next ? "开" : "关");
+}
+
+/* ------------------------------------------------------------------------- */
+
 /* ------------------------------------------------------------------------- */
 /* 灯详情页：旋钮调亮度 / 色温                                                */
 /* ------------------------------------------------------------------------- */
 
-/** 这只灯现在算不算"开着"（和 detail_apply_entity 的判断一致，含本地开关覆盖）*/
-static bool detail_light_on(const ha_entity_t *e)
+/** 这只灯 / 这台风扇现在算不算"开着"（HA 状态 + 6s 本地开关覆盖）。
+ *  灯的"关着 ⇒ 旋钮不动"规则现在对风扇同样成立：关着就返回 false。*/
+static bool detail_device_on(const ha_entity_t *e)
 {
     if (e == NULL) {
         return false;
@@ -3111,6 +4091,25 @@ static int detail_knob_target_for(const ha_entity_t *e)
     return -1;
 }
 
+/**
+ * 队列满时的丢弃日志（1s 最多一条）。
+ * 连续转动时如果 HA 慢了，队列会满；这里只丢这一次的值（UI 已经显示最新值，
+ * 50ms 定时器之后还会补最后一条），绝不能阻塞 LVGL 任务去等空位。
+ */
+static void detail_knob_log_drop(int target, int value)
+{
+    static uint32_t last_ms;
+    const uint32_t now = lv_tick_get();
+    if (last_ms != 0 && (uint32_t)(now - last_ms) < 1000) {
+        return;
+    }
+    last_ms = now;
+    const char *what = (target == DETAIL_KNOB_TEMP) ? "温度"
+                       : (target == DETAIL_KNOB_CT) ? "色温"
+                       : (target == DETAIL_KNOB_FAN) ? "风速" : "亮度";
+    ESP_LOGW(TAG, "旋钮命令队列满：丢掉这次 %s=%d（UI 已显示，HA 会慢一拍）", what, value);
+}
+
 /** 把"当前旋钮值"排进命令队列（不阻塞：真正的 HA 调用在 worker 任务里）。 */
 static bool detail_knob_send(int target, int value)
 {
@@ -3134,28 +4133,66 @@ static bool detail_knob_send(int target, int value)
             snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"temperature\":%s%d.%d}",
                      neg ? "-" : "", a / AC_UNIT, a % AC_UNIT);
         }
-        return xQueueSend(s_cmd_q, &cmd, 0) == pdTRUE;
+        if (xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+            detail_knob_log_drop(target, value);
+            return false;
+        }
+        return true;
+    }
+    if (target == DETAIL_KNOB_FAN) {
+        /* 风扇风速：fan.set_percentage。和灯一样下限 1%：
+           percentage=0 会被 Home Assistant 当成"关"，而电源只归开关管。
+           这里是风速唯一的发送口（旋钮 / 补发 / 关页补发都从这出去）。 */
+        int pct = value;
+        if (pct < 1) {
+            pct = 1;
+        } else if (pct > 100) {
+            pct = 100;
+        }
+        snprintf(cmd.service, sizeof(cmd.service), "set_percentage");
+        snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"percentage\":%d}", pct);
+        if (xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+            detail_knob_log_drop(target, value);
+            return false;
+        }
+        return true;
     }
     snprintf(cmd.service, sizeof(cmd.service), "turn_on");
     if (target == DETAIL_KNOB_CT) {
         snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"color_temp_kelvin\":%d}", value);
     } else {
-        snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"brightness_pct\":%d}", value);
+        /* 亮度必须 >= 1%：Home Assistant 把 brightness_pct=0 当成"关灯"，
+           而电源只归开关管。这里是亮度唯一的发送口，再夹一道当兜底
+           （旋钮 / 补发 / 关页补发 都从这里出去）。 */
+        int pct = value;
+        if (pct < 1) {
+            pct = 1;
+        } else if (pct > 100) {
+            pct = 100;
+        }
+        snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"brightness_pct\":%d}", pct);
     }
-    return xQueueSend(s_cmd_q, &cmd, 0) == pdTRUE;
+    if (xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+        detail_knob_log_drop(target, value);
+        return false;
+    }
+    return true;
 }
 
-/** 旋钮值还要不要发出去：灯关着就不发（不能把它重新点亮）；空调关着也允许
- *  预先设目标温度（HA 的 set_temperature 不会开机）。*/
+/** 旋钮值还要不要发出去：灯 / 风扇关着就不发（不能把它重新点亮 / 开机）；
+ *  空调关着也允许预先设目标温度（HA 的 set_temperature 不会开机）。*/
 static bool detail_knob_can_send(const ha_entity_t *e)
 {
     if (e == NULL) {
         return false;
     }
+    if (s_detail_fan) {
+        return detail_device_on(e);       /* 风扇关着：电源只归开关，旋钮不发 */
+    }
     if (s_knob_pending_target == DETAIL_KNOB_TEMP || detail_is_climate(e)) {
         return true;
     }
-    return detail_light_on(e);
+    return detail_device_on(e);
 }
 
 /** 有脏值时唤醒 50ms 补发定时器（已经在跑就什么也不做）。*/
@@ -3202,12 +4239,13 @@ static bool detail_knob_queue_pending(void)
 }
 
 /**
- * 旋钮在详情页里调值（灯：亮度/色温；空调：目标温度）。
+ * 旋钮在详情页里调值（灯：亮度/色温；空调：目标温度；风扇：风速，每格 5%）。
  * 返回 true 表示"这次旋转被详情页吃掉了，并且真的调了值"（调用方响一下触觉）；
- * 返回 false 表示没消费（详情页没开 / 灯是关的 / 这只灯不支持 / 手指正按着圆盘），
+ * 返回 false 表示没消费（详情页没开 / 设备是关的 / 这个实体不支持 / 手指正按着圆盘），
  * 调用方据此决定要不要翻页 + 震动。
  *
- * 路由：s_detail 是灯和空调共用的一个容器，s_detail_ac 决定这次落到哪一组控件上。
+ * 路由：s_detail 是灯 / 空调 / 风扇共用的一个容器，s_detail_ac / s_detail_fan
+ * 决定这次落到哪一组控件上。风扇和灯同一条规矩：关着 ⇒ 旋钮什么也不做。
  */
 bool ui_home_detail_knob(int delta)
 {
@@ -3224,8 +4262,11 @@ bool ui_home_detail_knob(int delta)
     if (s_detail_ac) {
         return ac_knob_step(e, delta); /* 空调：整格 = 这台机器的 temp_step */
     }
-    if (!detail_light_on(e)) {
-        return false;                  /* 灯关着：旋钮什么也不做（也不翻页）*/
+    if (s_detail_fan) {
+        return fan_knob_step(e, delta); /* 风扇：每格 5%（关着返回 false）*/
+    }
+    if (!detail_device_on(e)) {
+        return false;                  /* 灯 / 风扇关着：旋钮什么也不做（也不翻页）*/
     }
     const int target = detail_knob_target_for(e);
     if (target < 0) {
@@ -3282,6 +4323,21 @@ bool ui_home_detail_knob(int delta)
     }
     if (s_knob_dirty) {
         detail_knob_timer_wake();
+    }
+
+    /* 诊断：连续转 100 格打一行状态。真机上再"转着转着死机"时，
+       这行能直接看出是队列堆住了还是 LVGL/系统堆在漏。 */
+    static uint32_t s_detent_count;
+    if (++s_detent_count >= 100) {
+        s_detent_count = 0;
+        lv_mem_monitor_t mon;
+        lv_mem_monitor(&mon);
+        ESP_LOGI(TAG, "旋钮 100 格：target=%d dirty=%d inflight=%d 队列空位=%u，"
+                      "LVGL 空闲=%u 峰值=%u，系统最小堆=%u",
+                 (int)s_knob_pending_target, (int)s_knob_dirty, (int)s_knob_inflight,
+                 (unsigned)(s_cmd_q ? uxQueueSpacesAvailable(s_cmd_q) : 0u),
+                 (unsigned)mon.free_size, (unsigned)mon.max_used,
+                 (unsigned)esp_get_minimum_free_heap_size());
     }
     return true;
 }
@@ -3368,6 +4424,8 @@ static void detail_dial_pressed_cb(lv_event_t *e)
         s_detail_knob_target = DETAIL_KNOB_BR;
     } else if (dial == s_ac_arc) {
         s_detail_knob_target = DETAIL_KNOB_TEMP;   /* 空调只有一个环 */
+    } else if (dial == s_fan_arc) {
+        s_detail_knob_target = DETAIL_KNOB_FAN;    /* 风扇只有一个环 */
     }
     detail_apply_focus();
 }
@@ -3385,6 +4443,41 @@ static void detail_focus_ct_cb(lv_event_t *e)
 {
     (void)e;
     s_detail_knob_target = DETAIL_KNOB_CT;
+    detail_apply_focus();
+}
+
+/**
+ * 圆盘按"区域"切焦点，不用精确戳到那圈细线上：
+ *   r <= DETAIL_REGION_R(82px)  环心那颗孔（图标/数字所在）→ 色温
+ *   r >  DETAIL_REGION_R        环带 / 环外                      → 亮度
+ * 只处理"什么都没打中"的按压：判据是事件 target 必须就是 s_detail 本身。
+ * 开关 / 两个数字标签 / 环 / 空调的模式·风速键都有自己的回调或命中区，
+ * 它们的事件 bubbling 上来时 target 是子对象 → 这里直接跳过，决不会抢走它们。
+ * 空调只有一个环（永远是焦点）：中间随便点不改焦点、也不发任何值。
+ */
+static void detail_region_pressed_cb(lv_event_t *e)
+{
+    if (s_detail == NULL || lv_event_get_target(e) != s_detail) {
+        return;                          /* 打中了子控件：让它自己处理（冒泡上来的事件）*/
+    }
+    if (s_detail_ac || s_detail_fan) {
+        return;                          /* 空调 / 风扇：单环，中间区域不做任何事 */
+    }
+    lv_indev_t *indev = lv_indev_active();
+    if (indev == NULL) {
+        return;
+    }
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    const int dx = (int)p.x - DETAIL_CX;
+    const int dy = (int)p.y - DETAIL_CY;
+    const int r2 = dx * dx + dy * dy;    /* 比平方，省一个开方 */
+    const int target = (r2 <= DETAIL_REGION_R * DETAIL_REGION_R)
+                       ? DETAIL_KNOB_CT : DETAIL_KNOB_BR;
+    if (target == s_detail_knob_target) {
+        return;
+    }
+    s_detail_knob_target = target;
     detail_apply_focus();
 }
 
@@ -3433,8 +4526,45 @@ static void detail_dial_changed_cb(lv_event_t *e)
         return;
     }
 
+    /* ---- 风扇：风速环。拖动只更新显示，松手才发 set_percentage ---- */
+    if (dial == s_fan_arc) {
+        int fv = (int)lv_arc_get_value(dial);
+        if (fv < 1) {
+            fv = 1;                        /* 0% = 关，电源只归开关 */
+        }
+        if (fv > 100) {
+            fv = 100;
+        }
+        if (s_fan_glow) {
+            lv_arc_set_value(s_fan_glow, fv);
+        }
+        fan_set_pct_text(fv);
+        s_fan_pct_override = fv;
+        s_fan_pct_override_until = lv_tick_get() + OVERRIDE_MS;
+        if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) {
+            return;                        /* 拖动中只更新显示，松手才发命令 */
+        }
+        ESP_LOGI(TAG, "风速圆盘松手: %d%%", fv);
+        if (s_detail_entity[0] == '\0' || s_cmd_q == NULL) {
+            return;
+        }
+        if (!detail_device_on(ha_client_find(s_detail_entity))) {
+            return;                        /* 关着：环本来就不该能拖（兜底不发）*/
+        }
+        cmd_t fc;
+        memset(&fc, 0, sizeof(fc));
+        snprintf(fc.entity, sizeof(fc.entity), "%s", s_detail_entity);
+        snprintf(fc.service, sizeof(fc.service), "set_percentage");
+        snprintf(fc.attrs, sizeof(fc.attrs), "{\"percentage\":%d}", fv);
+        xQueueSend(s_cmd_q, &fc, 0);
+        return;
+    }
+
     const bool is_ct = (dial == s_detail_ct_arc);
-    const int v = (int)lv_arc_get_value(dial);
+    int v = (int)lv_arc_get_value(dial);
+    if (!is_ct && v < 1) {
+        v = 1;          /* 亮度下限 1%：环的范围已经是 1..100，这里再兜一道 */
+    }
 
     /* 光晕是独立对象：值要手动跟一遍，扫角才对得上 */
     lv_obj_t *glow = is_ct ? s_detail_ct_glow : s_detail_br_glow;
@@ -3485,10 +4615,14 @@ static void detail_power_changed_cb(lv_event_t *e)
     /* 开关自身的视觉已经切换：记住它，别让轮询立刻拉回去 */
     s_sw_override_on = want_on;
     s_sw_override_until = lv_tick_get() + OVERRIDE_MS;
-    s_sw_on_shown = -1;               /* 底色/滑块颜色立刻按新状态重刷 */
+    s_sw_on_shown = -1;               /* CHECKED 状态交给下一次 detail_apply_entity 对齐 */
+    s_sw_on_now = want_on;
+    /* 轨道/滑块颜色立刻按新状态刷，不等 500ms 轮询（配色规则见 detail_apply_switch_style）*/
+    detail_apply_switch_style(want_on);
 
     if (!want_on) {
-        /* 关掉：丢掉还没补发的旋钮值，别让它在关机后又发一条 turn_on */
+        /* 关掉：丢掉还没补发的旋钮值（灯 / 风扇都一样：别让关机后补发的
+           brightness_pct / percentage 又把它打开）*/
         s_knob_dirty = false;
         detail_knob_timer_park();
         if (s_detail_ac) {
@@ -3516,12 +4650,6 @@ static void detail_power_changed_cb(lv_event_t *e)
     xQueueSend(s_cmd_q, &cmd, 0);
 }
 
-static void detail_back_cb(lv_event_t *e)
-{
-    (void)e;
-    ui_home_close_detail();
-}
-
 /**
  * 建一条 270° 圆弧（135° 起、缺口朝下）：
  *   halo=true  光晕：不要底环、不接收触摸，只当聚焦时的一层柔光；
@@ -3544,9 +4672,11 @@ static lv_obj_t *detail_make_arc(lv_obj_t *parent, int radius, int width, bool h
     lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(arc, 0, LV_PART_MAIN);
 
-    /* 轨道：深灰 0x2C2C2E、圆头、270° */
+    /* 轨道（没填满的那段）：0x1A1A1C @70%，比原来的 0x2C2C2E 深一档也淡一档，
+       不再像一条明显的灰带；焦点环 70% / 非焦点环 45% 由 detail_apply_focus 刷。 */
     lv_obj_set_style_arc_width(arc, width, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(arc, COLOR_BORDER, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, DETAIL_TRACK_COLOR, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(arc, DETAIL_TRACK_OPA, LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(arc, true, LV_PART_MAIN);
 
     /* 指示灯：颜色由 detail_apply_dial_colors / 自绘回调决定 */
@@ -3599,19 +4729,23 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_remove_flag(s_detail, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
 
+    /* 区域点击：环心（r<=72）= 色温、环带/环外 = 亮度；
+       子控件自己的事件冒泡上来时 target 不是容器，会被这个回调忽略。 */
+    lv_obj_add_event_cb(s_detail, detail_region_pressed_cb, LV_EVENT_PRESSED, NULL);
+
     /* ---- 圆盘：先光晕（在下面），再圆环（在上面）---- */
     s_detail_br_glow = detail_make_arc(s_detail, DETAIL_BR_GLOW_R, DETAIL_BR_GLOW_W, true);
-    lv_arc_set_range(s_detail_br_glow, 0, 100);
-    lv_arc_set_value(s_detail_br_glow, 0);
+    lv_arc_set_range(s_detail_br_glow, 1, 100);
+    lv_arc_set_value(s_detail_br_glow, 1);
 
     s_detail_ct_glow = detail_make_arc(s_detail, DETAIL_CT_GLOW_R, DETAIL_CT_GLOW_W, true);
     lv_arc_set_range(s_detail_ct_glow, 2000, 6500);
     lv_arc_set_value(s_detail_ct_glow, 4000);
 
-    /* 外环 = 亮度：0..100%（和原来滑条同一套百分比）*/
+    /* 外环 = 亮度：1..100%（0% 会被 HA 当成关灯，电源只归开关管）*/
     s_detail_br_arc = detail_make_arc(s_detail, DETAIL_BR_R, DETAIL_BR_W, false);
-    lv_arc_set_range(s_detail_br_arc, 0, 100);
-    lv_arc_set_value(s_detail_br_arc, 0);
+    lv_arc_set_range(s_detail_br_arc, 1, 100);
+    lv_arc_set_value(s_detail_br_arc, 1);
     lv_obj_add_event_cb(s_detail_br_arc, detail_dial_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_detail_br_arc, detail_dial_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_detail_br_arc, detail_dial_changed_cb, LV_EVENT_RELEASED, NULL);
@@ -3627,28 +4761,26 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_add_event_cb(s_detail_ct_arc, detail_dial_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_detail_ct_arc, detail_dial_changed_cb, LV_EVENT_RELEASED, NULL);
 
-    /* ---- 返回键 + 标题（建在圆环之后：聚焦时的光晕不会盖住标题）---- */
-    lv_obj_t *back = lv_button_create(s_detail);
-    lv_obj_set_size(back, 36, 36);
-    lv_obj_align(back, LV_ALIGN_TOP_MID, 0, 10);   /* 顶部中间：圆屏这里才看得见 */
-    lv_obj_set_style_bg_opa(back, LV_OPA_20, 0);
-    lv_obj_set_style_radius(back, LV_RADIUS_CIRCLE, 0);
-    lv_obj_add_event_cb(back, detail_back_cb, LV_EVENT_CLICKED, NULL);
-    s_back_label = lv_label_create(back);
-    lv_label_set_text(s_back_label, LV_SYMBOL_LEFT);
-    lv_obj_center(s_back_label);
+    /* 顶上那个 36x36 返回键已经删掉：退出详情页走"从左边缘右滑"（swipe_cb 的
+       边缘返回手势），所以顶部带里只剩状态栏。 */
 
-    s_detail_title = lv_label_create(s_detail);
-    lv_label_set_text(s_detail_title, "--");
-    lv_obj_set_style_text_font(s_detail_title, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_detail_title, COLOR_TEXT, 0);
-    lv_obj_align(s_detail_title, LV_ALIGN_TOP_MID, 0, 58);
+    /* ---- 中间堆栈：实体名 / 灯泡 / 大号百分比 / 色温文字 ----
+       名字建在圆环之后：聚焦时的光晕不会盖住它；它同时也是原来 y=58 那个标题，
+       现在整行搬进环心最上面（顶部带不再画任何东西）。 */
+    s_detail_name = lv_label_create(s_detail);
+    lv_label_set_text(s_detail_name, "");
+    lv_obj_set_style_text_font(s_detail_name, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_detail_name, COLOR_MUTED, 0);   /* 0x8E8E93 */
+    lv_label_set_long_mode(s_detail_name, LV_LABEL_LONG_DOT);     /* 再长也"…"，压不到环上 */
+    lv_obj_set_style_text_align(s_detail_name, LV_TEXT_ALIGN_CENTER, 0);  /* 定宽 + 居中 */
+    lv_obj_set_width(s_detail_name, DETAIL_NAME_W);
+    lv_obj_align(s_detail_name, LV_ALIGN_TOP_MID, 0, DETAIL_NAME_Y);
+    lv_obj_add_flag(s_detail_name, LV_OBJ_FLAG_HIDDEN);           /* 还没拿到名字：整行不画 */
 
-    /* ---- 中间堆栈：灯泡 / 大号百分比 / 色温文字 ---- */
     s_detail_icon = lv_obj_create(s_detail);
     lv_obj_remove_style_all(s_detail_icon);
     lv_obj_set_size(s_detail_icon, 24, 24);
-    lv_obj_set_pos(s_detail_icon, DETAIL_CX - 12, 150);
+    lv_obj_set_pos(s_detail_icon, DETAIL_CX - 12, 170);
     lv_obj_remove_flag(s_detail_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_detail_icon, detail_bulb_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
 
@@ -3657,7 +4789,7 @@ static void build_detail_view(lv_obj_t *scr)
     /* 项目里已经编进来的最大号字（montserrat_28），不新增字体 */
     lv_obj_set_style_text_font(s_detail_br_value, DETAIL_PCT_FONT, 0);
     lv_obj_set_style_text_color(s_detail_br_value, COLOR_TEXT, 0);
-    lv_obj_align(s_detail_br_value, LV_ALIGN_TOP_MID, 0, 180);
+    lv_obj_align(s_detail_br_value, LV_ALIGN_TOP_MID, 0, 196);
     lv_obj_add_flag(s_detail_br_value, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_detail_br_value, detail_focus_br_cb, LV_EVENT_CLICKED, NULL);
 
@@ -3665,7 +4797,7 @@ static void build_detail_view(lv_obj_t *scr)
     lv_label_set_text(s_detail_ct_value, "--");
     lv_obj_set_style_text_font(s_detail_ct_value, &lv_font_cjk16, 0);
     lv_obj_set_style_text_color(s_detail_ct_value, COLOR_TEXT, 0);
-    lv_obj_align(s_detail_ct_value, LV_ALIGN_TOP_MID, 0, 212);
+    lv_obj_align(s_detail_ct_value, LV_ALIGN_TOP_MID, 0, 226);   /* 给下面的焦点提示让 2px */
     lv_obj_add_flag(s_detail_ct_value, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_detail_ct_value, detail_focus_ct_cb, LV_EVENT_CLICKED, NULL);
 
@@ -3677,8 +4809,8 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_align(s_detail_off_hint, LV_ALIGN_TOP_MID, 0, 190);
 
     /* ---------------- 空调那一组（同一个容器，默认全藏） ----------------
-       几何见文件头的 AC_* 宏：环 114/22 + 光晕；中间堆栈（图标 / 大号温度 /
-       室内温度）都在半径 92 以内；底部三行按"越往下越宽的缺口楔形"排。 */
+       几何见文件头的 AC_* 宏：环 114/22 + 光晕；中间堆栈（实体名 / 图标 /
+       大号温度 / 室内温度 / 风速钮）都在内孔里；底部三行按"越往下越宽的缺口楔形"排。 */
     s_ac_glow = detail_make_arc(s_detail, AC_TEMP_GLOW_R, AC_TEMP_GLOW_W, true);
     lv_arc_set_range(s_ac_glow, AC_UNIT * 16, AC_UNIT * 30);
     lv_arc_set_value(s_ac_glow, AC_UNIT * 25);
@@ -3752,38 +4884,161 @@ static void build_detail_view(lv_obj_t *scr)
         lv_obj_center(lbl);
     }
 
+    /* ---------------- 风扇那一组（同一个容器，默认全藏） ----------------
+       几何见文件头的 FAN_* 宏：环 118/22 + 光晕；中间（实体名 / 风扇图标 /
+       大号百分比 / 当前预设）都在内孔里；底部是 4 个预设键 + 摇头 + 电源开关。 */
+    s_fan_glow = detail_make_arc(s_detail, FAN_GLOW_R, FAN_GLOW_W, true);
+    lv_arc_set_range(s_fan_glow, 1, 100);
+    lv_arc_set_value(s_fan_glow, 60);
+
+    s_fan_arc = detail_make_arc(s_detail, FAN_R, FAN_W, false);
+    lv_arc_set_range(s_fan_arc, 1, 100);
+    lv_arc_set_value(s_fan_arc, 60);
+    lv_obj_add_event_cb(s_fan_arc, detail_dial_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_fan_arc, detail_dial_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_fan_arc, detail_dial_changed_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(s_fan_arc, detail_dial_changed_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    /* 中间：风扇图标（自绘，颜色跟预设走；形状固定，不跑定时器）*/
+    s_fan_icon = lv_obj_create(s_detail);
+    lv_obj_remove_style_all(s_fan_icon);
+    lv_obj_set_size(s_fan_icon, FAN_ICON_SIZE, FAN_ICON_SIZE);
+    lv_obj_set_pos(s_fan_icon, DETAIL_CX - FAN_ICON_SIZE / 2, FAN_ICON_Y);
+    lv_obj_remove_flag(s_fan_icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_fan_icon, fan_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    /* 中间：大号百分比 */
+    s_fan_pct = lv_label_create(s_detail);
+    lv_label_set_text(s_fan_pct, "--");
+    lv_obj_set_style_text_font(s_fan_pct, DETAIL_PCT_FONT, 0);
+    lv_obj_set_style_text_color(s_fan_pct, COLOR_TEXT, 0);
+    lv_obj_align(s_fan_pct, LV_ALIGN_TOP_MID, 0, FAN_PCT_Y);
+
+    /* 中间：当前预设（次要文字，弱化色）*/
+    s_fan_preset = lv_label_create(s_detail);
+    lv_label_set_text(s_fan_preset, "--");
+    lv_obj_set_style_text_font(s_fan_preset, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_fan_preset, COLOR_MUTED, 0);
+    lv_obj_align(s_fan_preset, LV_ALIGN_TOP_MID, 0, FAN_PRESET_Y);
+
+    /* 4 个预设键：固定顺序 直吹 / 自然 / 循环 / 睡眠，命令发原样中文 */
+    for (int i = 0; i < FAN_MODE_COUNT; i++) {
+        const int fx = DETAIL_CX - (FAN_MODE_COUNT * FAN_MODE_W + (FAN_MODE_COUNT - 1) * FAN_MODE_GAP) / 2
+                       + i * (FAN_MODE_W + FAN_MODE_GAP);
+        lv_obj_t *btn = lv_button_create(s_detail);
+        s_fan_mode_btn[i] = btn;
+        lv_obj_set_size(btn, FAN_MODE_W, FAN_MODE_H);
+        lv_obj_set_pos(btn, fx, FAN_MODE_Y);
+        lv_obj_set_style_radius(btn, FAN_MODE_H / 2, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x24262B), 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_80, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_add_event_cb(btn, fan_preset_cb, LV_EVENT_CLICKED, (void *)&k_fan_presets[i]);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        s_fan_mode_lbl[i] = lbl;
+        lv_label_set_text(lbl, k_fan_presets[i].label);
+        lv_obj_set_style_text_font(lbl, &lv_font_cjk16, 0);
+        lv_obj_set_style_text_color(lbl, COLOR_TEXT, 0);
+        lv_obj_center(lbl);
+    }
+
+    /* 摇头：小圆角键，开 = 预设色填充（和预设键同一套"亮起来"的语言）*/
+    s_fan_osc_btn = lv_button_create(s_detail);
+    lv_obj_set_size(s_fan_osc_btn, FAN_OSC_W, FAN_OSC_H);
+    lv_obj_align(s_fan_osc_btn, LV_ALIGN_TOP_MID, FAN_OSC_DX, FAN_OSC_Y);
+    lv_obj_set_style_radius(s_fan_osc_btn, FAN_OSC_H / 2, 0);
+    lv_obj_set_style_bg_color(s_fan_osc_btn, lv_color_hex(0x24262B), 0);
+    lv_obj_set_style_bg_opa(s_fan_osc_btn, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_fan_osc_btn, 1, 0);
+    lv_obj_set_style_border_color(s_fan_osc_btn, lv_color_hex(0x3A3A3C), 0);
+    lv_obj_set_style_pad_all(s_fan_osc_btn, 0, 0);
+    lv_obj_add_event_cb(s_fan_osc_btn, fan_osc_cb, LV_EVENT_CLICKED, NULL);
+    s_fan_osc_lbl = lv_label_create(s_fan_osc_btn);
+    lv_label_set_text(s_fan_osc_lbl, "摇头");
+    lv_obj_set_style_text_font(s_fan_osc_lbl, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_fan_osc_lbl, COLOR_TEXT, 0);
+    lv_obj_center(s_fan_osc_lbl);
+
+    /* 焦点提示两件套：环上"当前值"小圆点 + 环心下面一行小字。
+       建在所有环之后 → 小圆点压在环的描边上（不然会被环自己盖住）。
+       两者都不是可点对象，不参与命中；没有定时器 / 动画引用它们，
+       每次 build 重新创建、指到新对象上，不会留悬空指针。 */
+    s_detail_marker = lv_obj_create(s_detail);
+    lv_obj_remove_style_all(s_detail_marker);
+    lv_obj_set_size(s_detail_marker, DETAIL_MARKER_SIZE, DETAIL_MARKER_SIZE);
+    lv_obj_set_style_radius(s_detail_marker, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(s_detail_marker, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_detail_marker, COLOR_TEXT, 0);
+    lv_obj_remove_flag(s_detail_marker, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_detail_marker, LV_OBJ_FLAG_HIDDEN);
+
+    s_detail_hint = lv_label_create(s_detail);
+    lv_label_set_text(s_detail_hint, "");
+    lv_obj_set_style_text_font(s_detail_hint, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_detail_hint, COLOR_MUTED, 0);
+    lv_obj_set_style_text_align(s_detail_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_detail_hint, 100);
+    lv_obj_align(s_detail_hint, LV_ALIGN_TOP_MID, 0, DETAIL_HINT_Y);
+    lv_obj_add_flag(s_detail_hint, LV_OBJ_FLAG_HIDDEN);
+
     /* 开关：仍在（开关逻辑一个字没改），挪到圆环下方 45°..135° 的空缺口里。
        96x46 放在 (132..228, 273..319)，两个圆环的圆头都在它两侧，互不遮挡；
-       空调页那一行更挤，detail_apply_entity 会把它改成 72x32 放到 y=314。
-       它建在最后 = 在最上层，角落不会被子对象的命中区抢走。 */
+       空调页那一行更挤，detail_apply_entity 会把它改成 72x32 放到 y=314；
+       风扇页再窄一档（62x28 放到 x=178..240 / y=314），左边让给摇头键。
+       它建在最后 = 在最上层，角落不会被子对象的命中区抢走。
+       配色不用主题默认（那圈蓝在 LV_PART_INDICATOR|CHECKED 上）：轨道/指示器/
+       滑块全部本地接管，关=灰、开=当前页强调色，见 detail_apply_switch_style。 */
     s_detail_power_sw = lv_switch_create(s_detail);
     lv_obj_set_size(s_detail_power_sw, 96, 46);
     lv_obj_align(s_detail_power_sw, LV_ALIGN_TOP_MID, 0, 273);
-    lv_obj_set_style_radius(s_detail_power_sw, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_detail_power_sw, lv_color_hex(0x151517), LV_PART_MAIN);
+    lv_obj_set_style_radius(s_detail_power_sw, 16, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_detail_power_sw, lv_color_hex(0x3A3A3C), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_detail_power_sw, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_detail_power_sw, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(s_detail_power_sw, lv_color_hex(0x3A3A3C), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_detail_power_sw, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_border_width(s_detail_power_sw, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(s_detail_power_sw, 0, LV_PART_MAIN);
+    lv_obj_set_style_outline_width(s_detail_power_sw, 0, LV_PART_MAIN);
+    /* 蓝色来自这里：默认主题给 INDICATOR + CHECKED 上了主色，必须一起接管 */
+    lv_obj_set_style_radius(s_detail_power_sw, 16, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_detail_power_sw, lv_color_hex(0x3A3A3C), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_detail_power_sw, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_border_width(s_detail_power_sw, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_shadow_width(s_detail_power_sw, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_outline_width(s_detail_power_sw, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_detail_power_sw, lv_color_hex(0x8E8E93), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(s_detail_power_sw, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_border_width(s_detail_power_sw, 0, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(s_detail_power_sw, 0, LV_PART_KNOB);
     lv_obj_add_event_cb(s_detail_power_sw, detail_power_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     /* 新容器：默认按"灯页"显示，空调那组先整组藏起来（要先置脏，
        否则 detail_update_ambience 会以为底色没变，新容器上还是空样式）*/
     s_detail_ac = false;
+    s_detail_fan = false;
     s_ac_mode_shown[0] = '\0';
     s_detail_fg_dirty = true;
     s_sw_geom = -1;
     s_sw_on_shown = -1;
+    s_sw_style_shown = -1;           /* 新开关：配色缓存作废，下一帧按当前状态重刷 */
+    s_sw_on_now = false;
     s_ac_temp_txt[0] = '\0';
     s_ac_room_txt[0] = '\0';
     s_ac_fan_txt[0] = '\0';
+    s_detail_name_shown[0] = '\0';   /* 新容器上的名字行还是空的：清掉缓存才会真的写进去 */
+    s_detail_hint_shown[0] = '\0';   /* 提示行的文字缓存同理 */
+    s_fan_preset_shown[0] = '\x01';  /* 不可能是任何预设：进页面后强制刷一遍颜色 */
+    s_fan_preset_txt[0] = '\0';
+    s_fan_pct_txt[0] = '\0';
+    s_fan_accent = lv_color_hex(0x2DD4BF);
     ac_hide_all(true);
+    fan_hide_all(true);
     detail_apply_focus();
     detail_update_ambience();       /* 底色 / 环色 / 自绘图标都先落到一个确定状态 */
 
     ESP_LOGI(TAG, "详情页建好：%d 个对象（灯：2 环 + 2 光晕 + 灯泡 + 百分比 + 色温 + 已关闭；"
                   "空调：温度环 + 光晕 + 模式图标 + 大号温度 + 室内 + 风速 + 5 模式键；"
-                  "共用：开关 + 标题 + 返回键）",
+                  "风扇：风速环 + 光晕 + 风扇图标 + 大号百分比 + 预设 + 4 预设键 + 摇头；"
+                  "共用：开关 + 环心实体名 + 焦点值点/提示；无返回键，退出靠左边缘右滑）",
              detail_count_objs(s_detail));
 }
 
@@ -3798,10 +5053,12 @@ void ui_home_open_detail(const char *entity_id)
     /* 先按 entity_id 前缀定页面类型：实体还没拉到（ha_client_find 返回 NULL）时，
        至少显示对的那一组控件，而不是上一页的残留。 */
     s_detail_ac = (strncmp(entity_id, "climate.", 8) == 0);
-    /* 每次进页面都以默认焦点开始：灯 = 亮度环，空调 = 温度环
-       （灯/空调看实体 id，不看上一次开的是哪一页）*/
-    const ha_entity_t *ent = ha_client_find(s_detail_entity);
-    s_detail_knob_target = detail_is_climate(ent) ? DETAIL_KNOB_TEMP : DETAIL_KNOB_BR;
+    s_detail_fan = (strncmp(entity_id, "fan.", 4) == 0);
+    /* 每次进页面都以默认焦点开始：灯 = 亮度环，空调 = 温度环，风扇 = 风速环
+       （看实体 id 前缀，不看上一次开的是哪一页；实体还没拉到时也照样对）*/
+    s_detail_knob_target = s_detail_ac ? DETAIL_KNOB_TEMP
+                         : s_detail_fan ? DETAIL_KNOB_FAN
+                                        : DETAIL_KNOB_BR;
     /* 新页面从干净状态开始：上一页的待发值 / 覆盖值（关页时已补发过）不再带进来 */
     s_knob_dirty = false;
     s_knob_pending_target = DETAIL_KNOB_BR;
@@ -3813,6 +5070,12 @@ void ui_home_open_detail(const char *entity_id)
     s_ac_temp_txt[0] = '\0';
     s_ac_room_txt[0] = '\0';
     s_ac_fan_txt[0] = '\0';
+    s_fan_preset_local_until = 0;
+    s_fan_osc_local_until = 0;
+    s_fan_pct_override_until = 0;
+    s_fan_preset_shown[0] = '\x01';     /* 换实体：颜色/预设键必须重刷一遍 */
+    s_fan_preset_txt[0] = '\0';
+    s_fan_pct_txt[0] = '\0';
     s_detail_fg_dirty = true;
     detail_apply_entity();
     s_detail_visible = true;
@@ -4380,9 +5643,10 @@ static void build_ui(void)
                  built, s_page_count);
     }
 
-    build_detail_view(scr);      /* 灯 + 空调共用的详情页 */
+    build_detail_view(scr);      /* 灯 + 空调 + 风扇共用的详情页 */
     s_detail_visible = false;
     s_detail_ac = false;
+    s_detail_fan = false;
     s_detail_entity[0] = '\0';   /* 重建后旧实体作废：不要把上一轮的旋钮目标带进来 */
     build_chart_view(scr);
     s_chart_visible = false;

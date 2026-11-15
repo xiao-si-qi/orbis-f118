@@ -1,4 +1,4 @@
-/*
+﻿/*
  * orbis-f118 · 360×360 圆屏（ESP32-S31 / JC3636F118）
  *
  * 硬件初始化沿用原来的写法（背光 / LCD / LVGL / 触摸 / 编码器 / 触觉 / 电池 / 网络）。
@@ -389,6 +389,25 @@ static volatile bool s_log_on;       /* 串口日志是否同时推 MQTT */
 static volatile bool s_audio_test_busy;  /* 音频自检任务是否在跑 */
 static int64_t s_last_diag_us;       /* 错误摘要限流（60s） */
 
+/* 旋钮震动节流：haptic_click() 是阻塞 I2C（最长 50 ms）+ 马达驱动，
+   连续转旋钮时每格都触发会造成长时间阻塞甚至欠压复位。
+   这里限制最快 4 次/秒（250 ms 一次），并统计被跳过的次数。 */
+static void knob_haptic(void)
+{
+    static int64_t last_us;
+    static uint32_t skipped;
+    const int64_t now = esp_timer_get_time();
+    if (now - last_us < 250000) {
+        skipped++;
+        return;
+    }
+    last_us = now;
+    if (skipped > 0) {
+        ESP_LOGD(TAG, "震动节流跳过 %u 次", (unsigned)skipped);
+        skipped = 0;
+    }
+    haptic_click();
+}
 static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
@@ -404,10 +423,10 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
             ESP_LOGD(TAG, "旋钮: diff=%d 顺时针方向=%d 调值=%d", diff, dir, (int)adjusting);
         }
         if (adjusting) {
-            haptic_click();
+            knob_haptic();
         } else if (!ui_home_detail_open()) {
             ui_home_page_step(dir);
-            haptic_click();
+            knob_haptic();
         }
     }
     data->enc_diff = 0;              /* 不交给 LVGL 组导航（ui_home 没有键盘组） */

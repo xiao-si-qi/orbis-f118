@@ -302,6 +302,36 @@ static bool json_int_in(const char *start, const char *end, const char *key, int
     return true;
 }
 
+/** 找 "key": true / false（JSON 布尔）。*/
+static bool json_bool_in(const char *start, const char *end, const char *key, bool *out)
+{
+    if (start == NULL || out == NULL) {
+        return false;
+    }
+    if (end == NULL) {
+        end = start + strlen(start);
+    }
+    char pattern[40];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strstr(start, pattern);
+    if (p == NULL || p >= end) {
+        return false;
+    }
+    p += strlen(pattern);
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    if (p + 4 <= end && memcmp(p, "true", 4) == 0) {
+        *out = true;
+        return true;
+    }
+    if (p + 5 <= end && memcmp(p, "false", 5) == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 /** 找 "key": 1.23（浮点） */
 static bool json_float_in(const char *start, const char *end, const char *key, float *out)
 {
@@ -617,6 +647,32 @@ static void apply_attributes(ha_entity_t *e, const char *obj_start, const char *
             }
         }
         e->preset_mask = mask;
+    }
+
+    /* 风扇：percentage / preset_mode / preset_modes / oscillating。
+       HA 在风扇关着时可能不报 percentage / preset_mode，所以只在新值合法时覆盖，
+       别在关机那一帧把页面上的数字清成 0 / 空。 */
+    if (strncmp(e->entity_id, "fan.", 4) == 0) {
+        int pv = 0;
+        if (json_int_in(obj_start, obj_end, "percentage", &pv) && pv >= 0 && pv <= 100) {
+            e->percentage = pv;
+            e->has_percentage = true;
+        }
+        char pm[16] = {0};
+        if (json_str_in(obj_start, obj_end, "preset_mode", pm, sizeof(pm))) {
+            str_copy(e->preset_mode, sizeof(e->preset_mode), pm);
+        }
+        bool osc = false;
+        if (json_bool_in(obj_start, obj_end, "oscillating", &osc)) {
+            e->oscillating = osc;
+        }
+        /* 列表按 HA 报上来的顺序存（和空调的 hvac_modes 同一套定长数组），
+           界面按固定顺序挑自己认识的那 4 个，命令里回传这里的原样字符串。 */
+        const int np = json_str_list_in(obj_start, obj_end, "preset_modes",
+                                        e->preset_modes, HA_FAN_PRESET_MAX);
+        if (np > 0) {
+            e->preset_mode_count = (uint8_t)np;
+        }
     }
 }
 
