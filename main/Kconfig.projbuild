@@ -19,4 +19,15 @@ menu "Orbis panel"
             With it disabled, changing WiFi/HA settings requires editing secrets.h
             and reflashing.
 
+    config APP_VOICE_ENABLED
+        bool "Enable the XiaoZhi voice assistant"
+        default n
+        help
+            Builds and starts the XiaoZhi voice client (WebSocket to the voice server,
+            Opus encode/decode, PDM microphone capture) and shows the white assistant
+            page as the last page.
+            Disabled by default: the audio path is still unstable on this board and a
+            tap on the assistant page can reset the device. With it off the panel is a
+            pure Home Assistant control screen and none of the voice code runs.
+
 endmenu

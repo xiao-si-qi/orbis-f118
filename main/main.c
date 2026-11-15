@@ -463,6 +463,9 @@ static void apply_cfg(const char *json)
 
     /* 小智语音：开关和服务端地址都来自布局的 voice 段（switchyard 下发），
        这是唯一正式来源；MQTT 的 {"cmd":"voice"} 只是调试覆盖。 */
+#if !CONFIG_APP_VOICE_ENABLED
+    lay->voice_enabled = false;      /* 语音功能条件编译关闭 */
+#endif
     xiaozhi_client_configure(lay->voice_enabled, lay->voice_endpoint);
     ESP_LOGI(TAG, "小智语音：%s%s%s", lay->voice_enabled ? "启用" : "未启用",
              lay->voice_enabled ? "，endpoint=" : "",
@@ -718,7 +721,10 @@ void app_main(void)
     if (has_layout) {
         register_layout_entities(lay);
         /* 开机就按上次下发的布局恢复小智语音（没启用则什么都不做） */
-        xiaozhi_client_configure(lay->voice_enabled, lay->voice_endpoint);
+    #if !CONFIG_APP_VOICE_ENABLED
+    lay->voice_enabled = false;      /* 语音功能条件编译关闭 */
+#endif
+    xiaozhi_client_configure(lay->voice_enabled, lay->voice_endpoint);
         ESP_LOGI(TAG, "已从 NVS 恢复布局：%d 页（语音 %s）", lay->page_count,
                  lay->voice_enabled ? "启用" : "未启用");
     } else {

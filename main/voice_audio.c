@@ -43,19 +43,58 @@ static const char *TAG = "voice_audio";
 #define VOICE_RX_RATE_DEFAULT 16000
 #define VOICE_TX_RATE_DEFAULT 24000
 
-/* 每次 read/write 的切片，避免一次阻塞太久 */
-#define VOICE_CHUNK_TIMEOUT_MS 200
+/* ---- 阻塞上限（看门狗防线）------------------------------------------------
+ * 以前录音和播放共用一把 s_lock，而且等待用的是 portMAX_DELAY：播放（24 kHz TX）
+ * 一堵，录音（16 kHz RX）就跟着无限期等——上行任务就是这样被拖死的。
+ * 现在两条通路各有自己的控制锁，锁只护"建/删通道"，绝不跨 i2s_channel_read /
+ * i2s_channel_write 持有；所有等待都有上限，到点就返回短读。
+ */
+#define VOICE_CHUNK_TIMEOUT_MS 200   /* 单次 i2s_channel_read 的上限 */
+#define VOICE_REC_MARGIN_MS    100   /* 一帧之外最多再等这么久，到点就返回短读 */
+#define VOICE_TX_MARGIN_MS     200   /* 播放写完一帧之外允许的余量 */
+#define VOICE_CTRL_TIMEOUT_MS   50   /* 控制锁的有界等待：绝不用 portMAX_DELAY */
+#define VOICE_SLOW_LOG_US  1000000   /* "录音/播放慢"日志最多每秒一条，别刷屏 */
 
 static i2s_chan_handle_t s_rx;
 static i2s_chan_handle_t s_tx;
 static int s_rx_rate;
 static int s_tx_rate;
+static bool s_rx_enabled;
+static bool s_tx_enabled;
 static bool s_ready;
-static SemaphoreHandle_t s_lock;   /* 串行化 record/play，避免两个任务抢同一条通道 */
+/* 录音、播放各一把：谁也不用等谁（共用一个锁会互相拖死） */
+static SemaphoreHandle_t s_rx_ctrl;
+static SemaphoreHandle_t s_tx_ctrl;
+/* 正在通道上读写的人数（受对应控制锁保护）：有人在用就绝不重建通道 */
+static volatile int s_rx_users;
+static volatile int s_tx_users;
+static int64_t s_slow_log_at;      /* 上一条"慢调用"日志的时间戳（us） */
+
+/**
+ * 使能一条通道。**必须**在控制锁外面调用：i2s_channel_enable() 要等 DMA 转起来，
+ * 耗时不定，拿着锁做会让另一条通路（播放）白等一截。
+ */
+static esp_err_t chan_start(i2s_chan_handle_t ch, bool *flag, const char *who)
+{
+    if (ch == NULL || (flag != NULL && *flag)) {
+        return ESP_OK;
+    }
+    const esp_err_t err = i2s_channel_enable(ch);
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        /* INVALID_STATE = 已经开过（重复使能）：当成成功，别当错误处理 */
+        if (flag != NULL) {
+            *flag = true;
+        }
+        return ESP_OK;
+    }
+    ESP_LOGE(TAG, "%s使能失败: %s", who, esp_err_to_name(err));
+    return err;
+}
 
 /* ------------------------------ 麦克风（PDM RX） ------------------------------ */
 
-static esp_err_t mic_init(int sample_rate)
+/** 只建通道、不使能（使能交给 chan_start 在锁外做）。调用方必须持有 s_rx_ctrl。 */
+static esp_err_t mic_create(int sample_rate)
 {
     if (s_rx != NULL) {
         return ESP_OK;
@@ -88,15 +127,9 @@ static esp_err_t mic_init(int sample_rate)
         s_rx = NULL;
         return err;
     }
-    err = i2s_channel_enable(s_rx);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "麦克风使能失败: %s", esp_err_to_name(err));
-        i2s_del_channel(s_rx);
-        s_rx = NULL;
-        return err;
-    }
     s_rx_rate = sample_rate;
-    ESP_LOGI(TAG, "麦克风就绪（PDM SCK=%d DATA=%d, %d Hz, DSR_16S）",
+    s_rx_enabled = false;           /* 通道建好了但还没开：第一次录音时在锁外使能 */
+    ESP_LOGI(TAG, "麦克风通道就绪（PDM SCK=%d DATA=%d, %d Hz, DSR_16S）",
              PDM_SCK_GPIO, PDM_DATA_GPIO, sample_rate);
     return ESP_OK;
 }
@@ -106,25 +139,72 @@ static void mic_release(void)
     if (s_rx == NULL) {
         return;
     }
-    i2s_channel_disable(s_rx);
+    if (s_rx_enabled) {
+        i2s_channel_disable(s_rx);
+        s_rx_enabled = false;
+    }
     i2s_del_channel(s_rx);
     s_rx = NULL;
     s_rx_rate = 0;
 }
 
-/** 保证录音通道按 rate 就绪（采样率变了就重建）。 */
-static esp_err_t mic_ensure(int sample_rate)
+/** 归还录音通道（只减在册计数，立刻返回）。 */
+static void rx_release(void)
 {
-    if (s_rx != NULL && s_rx_rate == sample_rate) {
-        return ESP_OK;
+    if (s_rx_ctrl == NULL) {
+        return;
     }
-    mic_release();
-    return mic_init(sample_rate);
+    if (xSemaphoreTake(s_rx_ctrl, pdMS_TO_TICKS(VOICE_CTRL_TIMEOUT_MS)) != pdTRUE) {
+        return;
+    }
+    if (s_rx_users > 0) {
+        s_rx_users--;
+    }
+    xSemaphoreGive(s_rx_ctrl);
+}
+
+/**
+ * 领用录音通道：有界等待，绝不死等。
+ *
+ * 控制锁只护"建/删通道"和在册计数，**不跨 i2s_channel_read 持有**；使能也放在
+ * 锁外做。领不到（50 ms 内抢不到，或有人在读时采样率对不上）就返回错误，
+ * 调用方直接丢这一帧——宁可丢帧，也别在这儿把上行任务堵成看门狗。
+ */
+static esp_err_t rx_acquire(int sample_rate)
+{
+    if (s_rx_ctrl == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_rx_ctrl, pdMS_TO_TICKS(VOICE_CTRL_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    if (s_rx == NULL || s_rx_rate != sample_rate) {
+        if (s_rx_users > 0) {
+            err = ESP_ERR_INVALID_STATE;   /* 有人正在读：绝不在他脚下拆通道 */
+        } else {
+            mic_release();
+            err = mic_create(sample_rate);
+        }
+    }
+    if (err == ESP_OK) {
+        s_rx_users++;
+    }
+    xSemaphoreGive(s_rx_ctrl);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = chan_start(s_rx, &s_rx_enabled, "麦克风");   /* 锁外使能 */
+    if (err != ESP_OK) {
+        rx_release();
+    }
+    return err;
 }
 
 /* ------------------------------ 喇叭（I2S STD TX） ------------------------------ */
 
-static esp_err_t spk_init(int sample_rate)
+/** 只建通道、不使能（使能交给 chan_start 在锁外做）。调用方必须持有 s_tx_ctrl。 */
+static esp_err_t spk_create(int sample_rate)
 {
     if (s_tx != NULL) {
         return ESP_OK;
@@ -176,15 +256,9 @@ static esp_err_t spk_init(int sample_rate)
         s_tx = NULL;
         return err;
     }
-    err = i2s_channel_enable(s_tx);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "喇叭使能失败: %s", esp_err_to_name(err));
-        i2s_del_channel(s_tx);
-        s_tx = NULL;
-        return err;
-    }
     s_tx_rate = sample_rate;
-    ESP_LOGI(TAG, "喇叭就绪（PCM5100A BCK=%d DIN=%d LRCK=%d, %d Hz）",
+    s_tx_enabled = false;           /* 通道建好了但还没开：第一次播放时在锁外使能 */
+    ESP_LOGI(TAG, "喇叭通道就绪（PCM5100A BCK=%d DIN=%d LRCK=%d, %d Hz）",
              DAC_BCLK_GPIO, DAC_DIN_GPIO, DAC_LRCK_GPIO, sample_rate);
     return ESP_OK;
 }
@@ -194,20 +268,60 @@ static void spk_release(void)
     if (s_tx == NULL) {
         return;
     }
-    i2s_channel_disable(s_tx);
+    if (s_tx_enabled) {
+        i2s_channel_disable(s_tx);
+        s_tx_enabled = false;
+    }
     i2s_del_channel(s_tx);
     s_tx = NULL;
     s_tx_rate = 0;
 }
 
-/** 保证播放通道按 rate 就绪（采样率变了就重建）。 */
-static esp_err_t spk_ensure(int sample_rate)
+/** 归还播放通道（只减在册计数，立刻返回）。 */
+static void tx_release(void)
 {
-    if (s_tx != NULL && s_tx_rate == sample_rate) {
-        return ESP_OK;
+    if (s_tx_ctrl == NULL) {
+        return;
     }
-    spk_release();
-    return spk_init(sample_rate);
+    if (xSemaphoreTake(s_tx_ctrl, pdMS_TO_TICKS(VOICE_CTRL_TIMEOUT_MS)) != pdTRUE) {
+        return;
+    }
+    if (s_tx_users > 0) {
+        s_tx_users--;
+    }
+    xSemaphoreGive(s_tx_ctrl);
+}
+
+/** 领用播放通道：和录音分开锁、分开通道，播放再堵也不会拖住上行。 */
+static esp_err_t tx_acquire(int sample_rate)
+{
+    if (s_tx_ctrl == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_tx_ctrl, pdMS_TO_TICKS(VOICE_CTRL_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    if (s_tx == NULL || s_tx_rate != sample_rate) {
+        if (s_tx_users > 0) {
+            err = ESP_ERR_INVALID_STATE;   /* 有人正在写：绝不在他脚下拆通道 */
+        } else {
+            spk_release();
+            err = spk_create(sample_rate);
+        }
+    }
+    if (err == ESP_OK) {
+        s_tx_users++;
+    }
+    xSemaphoreGive(s_tx_ctrl);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = chan_start(s_tx, &s_tx_enabled, "喇叭");     /* 锁外使能 */
+    if (err != ESP_OK) {
+        tx_release();
+    }
+    return err;
 }
 
 /* -------------------------------- 对外接口 -------------------------------- */
@@ -217,18 +331,43 @@ int voice_audio_init(void)
     if (s_ready) {
         return 0;
     }
-    if (s_lock == NULL) {
-        s_lock = xSemaphoreCreateMutex();
-        if (s_lock == NULL) {
-            ESP_LOGE(TAG, "音频互斥锁创建失败");
-            return -1;
-        }
+    if (s_rx_ctrl == NULL) {
+        s_rx_ctrl = xSemaphoreCreateMutex();
     }
-    if (mic_init(VOICE_RX_RATE_DEFAULT) != ESP_OK) {
+    if (s_tx_ctrl == NULL) {
+        s_tx_ctrl = xSemaphoreCreateMutex();
+    }
+    if (s_rx_ctrl == NULL || s_tx_ctrl == NULL) {
+        ESP_LOGE(TAG, "音频控制锁创建失败");
         return -1;
     }
-    if (spk_init(VOICE_TX_RATE_DEFAULT) != ESP_OK) {
+
+    /* 建通道都在各自控制锁里做（很短），使能一律在锁外做 */
+    esp_err_t err = ESP_OK;
+    if (xSemaphoreTake(s_rx_ctrl, pdMS_TO_TICKS(VOICE_CTRL_TIMEOUT_MS)) != pdTRUE) {
+        return -1;
+    }
+    err = mic_create(VOICE_RX_RATE_DEFAULT);
+    xSemaphoreGive(s_rx_ctrl);
+    if (err != ESP_OK) {
+        return -1;
+    }
+
+    if (xSemaphoreTake(s_tx_ctrl, pdMS_TO_TICKS(VOICE_CTRL_TIMEOUT_MS)) != pdTRUE) {
         mic_release();
+        return -1;
+    }
+    err = spk_create(VOICE_TX_RATE_DEFAULT);
+    xSemaphoreGive(s_tx_ctrl);
+    if (err != ESP_OK) {
+        mic_release();
+        return -1;
+    }
+
+    if (chan_start(s_rx, &s_rx_enabled, "麦克风") != ESP_OK ||
+            chan_start(s_tx, &s_tx_enabled, "喇叭") != ESP_OK) {
+        mic_release();
+        spk_release();
         return -1;
     }
     s_ready = true;
@@ -247,6 +386,31 @@ void voice_audio_mute(int on)
     (void)on;
 }
 
+/**
+ * 录音耗时上报：超过帧长就记一条（每秒最多一条），超过 1 秒单独用
+ * 「录音卡住 N ms（看门狗风险）」的措辞——现场就靠这条判断是不是看门狗。
+ */
+static void note_record_slow(int64_t t0, int frame_ms, int got, int want)
+{
+    const int64_t now = esp_timer_get_time();
+    const int elapsed_ms = (int)((now - t0) / 1000);
+    if (elapsed_ms <= frame_ms) {
+        return;                    /* 正常：60 ms 的帧 60 ms 内取完，不刷日志 */
+    }
+    if (now - s_slow_log_at < VOICE_SLOW_LOG_US) {
+        return;                    /* 每秒最多一条 */
+    }
+    s_slow_log_at = now;
+    const unsigned free_kb = (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    if (elapsed_ms > 1000) {
+        ESP_LOGE(TAG, "录音卡住 %d ms（看门狗风险）：帧长 %d ms，取到 %d/%d，内部 RAM %u KB",
+                 elapsed_ms, frame_ms, got, want, free_kb);
+    } else {
+        ESP_LOGW(TAG, "录音耗时 %d ms（帧长 %d ms，取到 %d/%d），内部 RAM %u KB",
+                 elapsed_ms, frame_ms, got, want, free_kb);
+    }
+}
+
 int voice_audio_record(int16_t *buf, int max_samples, int sample_rate, int ms)
 {
     if (!s_ready || buf == NULL || max_samples <= 0 || ms <= 0) {
@@ -256,54 +420,71 @@ int voice_audio_record(int16_t *buf, int max_samples, int sample_rate, int ms)
         sample_rate = VOICE_RX_RATE_DEFAULT;
     }
 
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    int ret = -1;
-    do {
-        if (mic_ensure(sample_rate) != ESP_OK) {
-            break;
-        }
+    int want = (int)((int64_t)sample_rate * ms / 1000);
+    if (want > max_samples) {
+        want = max_samples;
+    }
+    if (want <= 0) {
+        return -1;
+    }
 
-        int want = (int)((int64_t)sample_rate * ms / 1000);
-        if (want > max_samples) {
-            want = max_samples;
-        }
-        if (want <= 0) {
-            break;
-        }
+    /* 整个调用（含领通道、丢旧数据、读一帧）共用一个起点：总耗时有硬上限 */
+    const int64_t t0 = esp_timer_get_time();
 
-        /* 丢掉 DMA 里上一次残留的几十毫秒旧数据 */
-        {
-            uint8_t trash[256];
-            size_t got = 0;
-            for (int i = 0; i < 8; i++) {
-                if (i2s_channel_read(s_rx, trash, sizeof(trash), &got, 0) != ESP_OK || got == 0) {
-                    break;
-                }
-            }
-        }
+    /* 领通道：最多等 VOICE_CTRL_TIMEOUT_MS，领不到就返回 -1，让上层丢这一帧。
+       绝不在这儿死等——上行任务一停，看门狗就来了。 */
+    if (rx_acquire(sample_rate) != ESP_OK) {
+        note_record_slow(t0, ms, 0, want);
+        return -1;
+    }
 
-        const size_t want_bytes = (size_t)want * sizeof(int16_t);
-        size_t total = 0;
-        const int64_t deadline = esp_timer_get_time() + (int64_t)(ms + 2000) * 1000;
-        while (total < want_bytes && esp_timer_get_time() < deadline) {
-            size_t got = 0;
-            const size_t left = want_bytes - total;
-            const esp_err_t err = i2s_channel_read(s_rx, (uint8_t *)buf + total, left, &got,
-                                                   pdMS_TO_TICKS(VOICE_CHUNK_TIMEOUT_MS));
-            if (got > 0) {
-                total += got;
-            }
-            if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
-                ESP_LOGW(TAG, "录音失败: %s", esp_err_to_name(err));
+    /* 丢掉 DMA 里上一次残留的几十毫秒旧数据（0 超时 = 非阻塞，立刻返回） */
+    {
+        uint8_t trash[256];
+        size_t got = 0;
+        for (int i = 0; i < 8; i++) {
+            if (i2s_channel_read(s_rx, trash, sizeof(trash), &got, 0) != ESP_OK || got == 0) {
                 break;
             }
         }
-        ret = (int)(total / sizeof(int16_t));
-        if (ret < want) {
-            ESP_LOGW(TAG, "录音只取到 %d/%d 采样点", ret, want);
+    }
+
+    /* 读一帧：期限 = 帧长 + 100 ms（以前是 帧长 + 2000 ms，单片又等 200 ms，
+       麦克风一没数据就能把上行任务按在这儿 2 秒多）。到点就返回短读，
+       短读由上层按"录音丢帧"统计，比卡死好。 */
+    const size_t want_bytes = (size_t)want * sizeof(int16_t);
+    size_t total = 0;
+    const int64_t deadline = t0 + (int64_t)(ms + VOICE_REC_MARGIN_MS) * 1000;
+    while (total < want_bytes) {
+        const int64_t left_us = deadline - esp_timer_get_time();
+        if (left_us <= 0) {
+            break;                  /* 到点收手：宁可短读，也不堵住任务 */
         }
-    } while (0);
-    xSemaphoreGive(s_lock);
+        int chunk_ms = (int)(left_us / 1000);
+        if (chunk_ms > VOICE_CHUNK_TIMEOUT_MS) {
+            chunk_ms = VOICE_CHUNK_TIMEOUT_MS;
+        }
+        if (chunk_ms < 1) {
+            chunk_ms = 1;
+        }
+        size_t got = 0;
+        const size_t left = want_bytes - total;
+        /* 注意：IDF 6.x 的 i2s_channel_read() 最后一个参数是**毫秒**（uint32_t timeout_ms），
+           不是 tick —— 这里直接给毫秒，别再套 pdMS_TO_TICKS()。 */
+        const esp_err_t err = i2s_channel_read(s_rx, (uint8_t *)buf + total, left, &got,
+                                               (uint32_t)chunk_ms);
+        if (got > 0) {
+            total += got;
+        }
+        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "录音失败: %s", esp_err_to_name(err));
+            break;
+        }
+    }
+    rx_release();                   /* 通道还回去：锁没有跨上面任何一次读 */
+
+    const int ret = (int)(total / sizeof(int16_t));
+    note_record_slow(t0, ms, ret, want);
     return ret;
 }
 
@@ -316,25 +497,43 @@ int voice_audio_play(const int16_t *buf, int samples, int sample_rate)
         sample_rate = VOICE_TX_RATE_DEFAULT;
     }
 
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const int64_t t0 = esp_timer_get_time();
+    if (tx_acquire(sample_rate) != ESP_OK) {
+        return -1;
+    }
+
     int ret = -1;
-    if (spk_ensure(sample_rate) == ESP_OK) {
-        voice_audio_mute(0);   /* 本板无静音脚，仅保留调用点 */
-        const size_t want = (size_t)samples * sizeof(int16_t);
-        size_t written = 0;
-        const TickType_t timeout = pdMS_TO_TICKS(samples * 1000 / sample_rate + 2000);
-        const esp_err_t err = i2s_channel_write(s_tx, buf, want, &written, timeout);
-        voice_audio_mute(1);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "播放失败: %s", esp_err_to_name(err));
-        } else {
-            ret = (int)(written / sizeof(int16_t));
-            if (written < want) {
-                ESP_LOGW(TAG, "播放只写入 %d/%d 采样点", ret, samples);
-            }
+    int play_ms = (int)((int64_t)samples * 1000 / sample_rate);
+    if (play_ms <= 0) {
+        play_ms = 1;
+    }
+    voice_audio_mute(0);            /* 本板无静音脚，仅保留调用点 */
+    const size_t want = (size_t)samples * sizeof(int16_t);
+    size_t written = 0;
+    /* 写超时 = 本帧播放时长 + 200 ms（以前写死 +2000 ms：TX 一堵，等锁的人全跟着堵）。
+       同上：i2s_channel_write() 这个参数是毫秒，不是 tick。 */
+    const esp_err_t err = i2s_channel_write(s_tx, buf, want, &written,
+                                            (uint32_t)(play_ms + VOICE_TX_MARGIN_MS));
+    voice_audio_mute(1);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "播放失败: %s（本帧 %d 采样 / %d ms）", esp_err_to_name(err), samples, play_ms);
+    } else {
+        ret = (int)(written / sizeof(int16_t));
+        if (written < want) {
+            ESP_LOGW(TAG, "播放只写入 %d/%d 采样点", ret, samples);
         }
     }
-    xSemaphoreGive(s_lock);
+    tx_release();
+
+    /* 播放慢也记一条（和录音共用每秒一条的限流）：TX 堵会听得见，也能看出是下行在拖 */
+    const int64_t now = esp_timer_get_time();
+    const int elapsed_ms = (int)((now - t0) / 1000);
+    if (elapsed_ms > play_ms + VOICE_TX_MARGIN_MS / 2 && (now - s_slow_log_at) >= VOICE_SLOW_LOG_US) {
+        s_slow_log_at = now;
+        ESP_LOGW(TAG, "播放耗时 %d ms（本帧 %d ms，写入 %d/%d），内部 RAM %u KB",
+                 elapsed_ms, play_ms, (int)(written / sizeof(int16_t)), samples,
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    }
     return ret;
 }
 

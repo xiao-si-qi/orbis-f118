@@ -248,7 +248,12 @@ static const lv_font_t *title_font_for(const char *text)
 /* 小智助手页：只有布局里 voice.enabled=true（见 layout.c 的 voice 段）时才会建这一页，
    并且永远是最后一页（第 N+1 页）。服务端地址同样来自布局，由 main.c 的 apply_cfg()
    交给 xiaozhi_client_configure()。 */
+/* 语音功能条件编译：CONFIG_APP_VOICE_ENABLED 关闭时整个小智页不建 */
+#ifdef CONFIG_APP_VOICE_ENABLED
 #define UI_ASSISTANT_PAGE 1
+#else
+#define UI_ASSISTANT_PAGE 0
+#endif
 
 static bool is_assistant_page(int page)
 {

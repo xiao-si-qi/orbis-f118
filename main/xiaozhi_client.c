@@ -845,6 +845,7 @@ static void xz_sender_task(void *arg)
     uint32_t stat_err = 0;      /* 编码/发送失败（每秒清一次）*/
     uint32_t stat_drop = 0;     /* 录音不足丢帧（每秒清一次）：以前混进"编码错误"，会误诊 */
     int enc_fail_streak = 0;    /* 连续编码失败：句柄可能已经坏了 */
+    int nodata_streak = 0;      /* 连续录不到任何采样点的帧数：麦克风那一路真没数据 */
     int enc_reopen_left = 1;    /* 一次流生命周期里只允许就地重开一次编码器 */
     bool hw_logged = false;
     int64_t stat_at = esp_timer_get_time();
@@ -891,6 +892,17 @@ static void xz_sender_task(void *arg)
 
         if (s_uplink && s_ready && s_ws != NULL) {
             const int n = voice_audio_record(pcm, XZ_IN_SAMPLES, XZ_IN_RATE, XZ_FRAME_MS);
+            /* 一个采样点都取不到的连续帧数：硬件/驱动那一路真没数据了。
+               连续 3 次就干净退出这条上行任务，绝不在这儿空转（空转 = 看门狗）。
+               退出走 out：关编码器、放缓冲、清 s_uplink/alive，下次轻触重建整条流。 */
+            if (n <= 0) {
+                if (++nodata_streak >= 3) {
+                    ESP_LOGE(TAG, "上行无麦克风数据，停止");
+                    goto out;
+                }
+            } else {
+                nodata_streak = 0;
+            }
             if (n < XZ_IN_SAMPLES) {
                 stat_drop++;
                 if (stat_drop == 1) {
@@ -956,6 +968,7 @@ static void xz_sender_task(void *arg)
                 }
             }
         } else {
+            nodata_streak = 0;                /* 没在录：连续计数清零，下次开麦重新数 */
             vTaskDelay(pdMS_TO_TICKS(20));    /* 空闲/半双工等待：不录不编 */
         }
 
