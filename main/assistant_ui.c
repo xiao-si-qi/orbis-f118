@@ -28,6 +28,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"   /* esp_rom_printf：裸 UART0 标记，先于任何日志/格式化解码 */
 #include "lvgl.h"
 
 #include "assistant_ui.h"
@@ -100,9 +101,122 @@ static char s_sub_src[SUB_MAX];   /* 副标题原文：没变就不用重新排�
 static lv_point_t s_press;
 static bool s_swiped;
 
+/* 防御用的"只报一次"标志：50ms/500ms 定时器里出错不能每帧刷一条日志。 */
+static bool s_log_stale_page;         /* 页面指针失效（不在活动屏幕下）*/
+static bool s_log_no_parent;          /* 建控件时 parent 为 NULL */
+static bool s_log_no_label;           /* 文字控件是 NULL */
+static bool s_log_no_sub;             /* 副标题控件是 NULL */
+static bool s_log_null_activation;    /* xiaozhi_activation_code() 返回 NULL */
+static bool s_log_null_last;          /* xiaozhi_last_text() 返回 NULL */
+static bool s_log_null_tts;           /* xiaozhi_last_tts_text() 返回 NULL */
+static bool s_log_null_status;        /* xiaozhi_client_status_text() 返回 NULL */
+
 /* ------------------------------------------------------------------------- */
 /* 小工具                                                                     */
 /* ------------------------------------------------------------------------- */
+
+/** 同一种失败只记一条日志：日志链本身有开销，定时器里更不能刷屏。 */
+static void log_once(bool *flag, const char *what)
+{
+    if (flag == NULL || *flag) {
+        return;
+    }
+    *flag = true;
+    ESP_LOGW(TAG, "%s", what);           /* what 永远是字符串常量 */
+}
+
+/**
+ * 上游（xiaozhi_client / LVGL）给的字符串一律过这一道：NULL 当空串用。
+ * 绝不能把 NULL 交给 snprintf("%s") / lv_label_set_text()：LV_USE_ASSERT_* 全关时，
+ * 那就是 ROM 里 strlen/memcpy/vsnprintf 的一次 Load access fault
+ * （现场 MEPC 落在 ROM、A2/A3/A4 全 0 就是这个形状）。
+ */
+static const char *str_or_empty(const char *s, bool *warned, const char *who)
+{
+    if (s != NULL) {
+        return s;
+    }
+    log_once(warned, who);
+    return "";
+}
+
+/**
+ * 把整张脸的状态清干净（指针全部置 NULL + 停掉动画定时器）。
+ * page_delete_cb / build 失败 / build 开始时都走这里，保证不会有"半旧半新"的指针。
+ * why 非 NULL 时顺带记一条日志（只在指针还都有效时调用它）。
+ */
+static void reset_face(const char *why)
+{
+    s_page = NULL;
+    s_dot = NULL;
+    s_eye[0] = NULL;
+    s_eye[1] = NULL;
+    s_mouth_smile = NULL;
+    s_mouth_o = NULL;
+    s_mouth_line = NULL;
+    s_think_arc = NULL;
+    s_status = NULL;
+    s_sub = NULL;
+    s_hint = NULL;
+    s_visible = false;
+    s_need_sync = false;
+    s_face = (xz_state_t)-1;
+    s_txt_status[0] = '\0';
+    s_txt_sub[0] = '\0';
+    s_txt_hint[0] = '\0';
+    s_sub_src[0] = '\0';
+    if (s_anim_timer != NULL) {
+        lv_timer_pause(s_anim_timer);    /* 定时器不在对象树里，留着下次复用 */
+    }
+    if (why != NULL) {
+        ESP_LOGW(TAG, "%s", why);
+    }
+}
+
+/**
+ * 在控件树里找 target（只比较指针，**不解引用 target**）。深度有限，代价可控。
+ * 这样就算 future 的 ui_home 把页面多包一层容器，也不会误判成"页面已销毁"。
+ */
+static bool obj_in_tree(lv_obj_t *root, const lv_obj_t *target, int depth)
+{
+    if (root == NULL || depth < 0) {
+        return false;
+    }
+    if (root == target) {
+        return true;
+    }
+    const uint32_t n = lv_obj_get_child_count(root);
+    for (uint32_t i = 0; i < n; i++) {
+        if (obj_in_tree(lv_obj_get_child(root, i), target, depth - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * 当前页面是否还挂在活动屏幕上。ui_home 的页都是 lv_screen_active() 下面的对象，
+ * 这里只遍历控件树里的指针、不解引用 s_page，所以就算 s_page 已经是指向
+ * 已释放内存的野指针也是安全的（这正是 500ms 定时器最怕的情况）。
+ * 发现页面已经没了就顺手清状态：后面所有 lv_* 调用都会被 NULL 挡掉。
+ */
+static bool page_alive(void)
+{
+    if (s_page == NULL) {
+        return false;
+    }
+    lv_obj_t *scr = lv_screen_active();
+    if (scr == NULL) {
+        return false;
+    }
+    if (obj_in_tree(scr, s_page, 3)) {
+        return true;
+    }
+    log_once(&s_log_stale_page,
+             "小智页指针已失效（不在活动屏幕下），清空表情/文字状态，等下次 build 重建");
+    reset_face(NULL);
+    return false;
+}
 
 static const char *face_name(xz_state_t st)
 {
@@ -132,6 +246,10 @@ static const char *face_text(xz_state_t st, bool ready)
 static lv_obj_t *make_block(lv_obj_t *parent, lv_coord_t w, lv_coord_t h,
                             lv_color_t color, lv_coord_t radius)
 {
+    if (parent == NULL) {              /* 页面已经销毁：别再往下建 */
+        log_once(&s_log_no_parent, "小智脸：parent 为 NULL，跳过控件创建");
+        return NULL;
+    }
     lv_obj_t *o = lv_obj_create(parent);
     if (o == NULL) {
         ESP_LOGE(TAG, "小智脸：控件创建失败（LVGL 内存不足）");
@@ -152,6 +270,10 @@ static lv_obj_t *make_block(lv_obj_t *parent, lv_coord_t w, lv_coord_t h,
 static lv_obj_t *make_label(lv_obj_t *parent, lv_color_t color, lv_coord_t width,
                             lv_coord_t height)
 {
+    if (parent == NULL) {
+        log_once(&s_log_no_parent, "小智脸：parent 为 NULL，跳过文字控件创建");
+        return NULL;
+    }
     lv_obj_t *l = lv_label_create(parent);
     if (l == NULL) {
         ESP_LOGE(TAG, "小智脸：文字控件创建失败（LVGL 内存不足）");
@@ -176,10 +298,13 @@ static void set_eyes(lv_coord_t w, lv_coord_t h)
     if (h < 6) {
         h = 6;
     }
-    if (s_eye[0] == NULL) {
-        return;
+    if (w <= 0) {
+        w = 36;
     }
     for (int i = 0; i < 2; i++) {
+        if (s_eye[i] == NULL) {      /* 半张脸（创建失败/页面已销毁）：跳过，绝不把 NULL 交给 LVGL */
+            continue;
+        }
         const lv_coord_t cx = (i == 0) ? EYE_CX_L : EYE_CX_R;
         lv_obj_set_size(s_eye[i], w, h);
         lv_obj_set_pos(s_eye[i], cx - w / 2, EYE_CY - h / 2);
@@ -189,7 +314,14 @@ static void set_eyes(lv_coord_t w, lv_coord_t h)
 static void set_text_if(lv_obj_t *label, char *cache, size_t cap, const char *text)
 {
     if (label == NULL) {
+        log_once(&s_log_no_label, "文字控件是 NULL（没建出来或页面已销毁），跳过这次文字刷新");
         return;
+    }
+    if (cache == NULL || cap == 0) {
+        return;
+    }
+    if (text == NULL) {              /* 兜底：任何空指针都不许进 snprintf("%s") */
+        text = "";
     }
     if (strcmp(cache, text) == 0) {
         return;
@@ -210,6 +342,9 @@ static void fit_lines(char *dst, size_t cap, const char *src, lv_coord_t width, 
     }
     dst[0] = '\0';
     if (src == NULL || src[0] == '\0') {
+        return;
+    }
+    if (width <= 0 || lines <= 0) {   /* 参数不合法：宁可空着，也不要拿负宽度去排版 */
         return;
     }
 
@@ -383,14 +518,23 @@ static void refresh_text(void)
     }
     const xz_state_t st = s_face;
     const bool ready = xiaozhi_client_ready();
-    const char *code = xiaozhi_activation_code();
-    const char *last = xiaozhi_last_text();
-    const char *tts = xiaozhi_last_tts_text();
+    /* 这四个 API 按约定"永远非 NULL"，但它们返回的是语音客户端内部的快照指针，
+       而且客户端正在被改：这里一律当可能为 NULL 处理，绝不把 NULL 送进
+       snprintf("%s") / lv_label_set_text()（那是 ROM 里 strlen/vsnprintf 的
+       Load access fault，现场 MEPC 落在 ROM、A2/A3/A4 全 0 就是这个形状）。 */
+    const char *code = str_or_empty(xiaozhi_activation_code(), &s_log_null_activation,
+                                    "xiaozhi_activation_code() 返回 NULL，按空串处理");
+    const char *last = str_or_empty(xiaozhi_last_text(), &s_log_null_last,
+                                    "xiaozhi_last_text() 返回 NULL，按空串处理");
+    const char *tts = str_or_empty(xiaozhi_last_tts_text(), &s_log_null_tts,
+                                   "xiaozhi_last_tts_text() 返回 NULL，按空串处理");
+    const char *stext = str_or_empty(xiaozhi_client_status_text(), &s_log_null_status,
+                                     "xiaozhi_client_status_text() 返回 NULL，按空串处理");
     const char *sub_src = "";
     char hint[32] = "";
 
     if (st == XZ_ERROR) {
-        sub_src = xiaozhi_client_status_text();
+        sub_src = stext;                  /* 出错：显示服务端给的原因 */
     } else if (st == XZ_SPEAKING && tts[0] != '\0') {
         sub_src = tts;                    /* 正在说话：显示小智这句 TTS 字幕 */
     } else if (last[0] != '\0') {
@@ -419,6 +563,8 @@ static void refresh_text(void)
         fit_lines(s_txt_sub, sizeof(s_txt_sub), sub_src, SUB_W, SUB_LINES);
         if (s_sub != NULL) {
             lv_label_set_text(s_sub, s_txt_sub);
+        } else {
+            log_once(&s_log_no_sub, "副标题控件是 NULL，跳过 TTS 字幕刷新");
         }
     }
 
@@ -427,7 +573,7 @@ static void refresh_text(void)
 
 static void refresh(void)
 {
-    if (!s_visible || s_page == NULL) {
+    if (!s_visible || !face_ready()) {   /* 页面已销毁 / 脸没建全：一个 LVGL 对象都不碰 */
         return;
     }
     const xz_state_t st = xiaozhi_state();
@@ -443,6 +589,16 @@ static void refresh(void)
 
 static void handle_tap(void)
 {
+    esp_rom_printf("[as] raw: tap\n");
+
+    /* ↑ 裸串口标记：必须是第一行，而且只有 "\n"——先于任何 ESP_LOG / 格式化输出。
+       现场判读：看到 [as] raw: tap 却看不到 [xz] raw: listen_start，说明卡在下面
+       的状态判断/日志链；连这条都没有，说明 LVGL 的 CLICKED 都没派到本模块
+       （问题在 ui_home 的控件树/事件绑定，不在这里）。 */
+    if (!page_alive()) {
+        return;                     /* 页面已经不在控件树里：一个对象都不碰 */
+    }
+
     const xz_state_t st = xiaozhi_state();
     if (st == XZ_LISTENING) {
         xiaozhi_listen_stop();
@@ -450,22 +606,33 @@ static void handle_tap(void)
         return;
     }
     if (st != XZ_IDLE) {
+        ESP_LOGD(TAG, "轻触：状态 %s，忽略（思考/说话/连接中不打断）", face_name(st));
         return;                     /* 思考/说话/连接中：轻触不打断 */
     }
     if (!xiaozhi_client_ready()) {
-        ESP_LOGW(TAG, "轻触：小智还没连上服务端（%s）", xiaozhi_client_status_text());
+        /* 状态文字同样可能没准备好：NULL 当空串，绝不交给 %s */
+        const char *why = str_or_empty(xiaozhi_client_status_text(), &s_log_null_status,
+                                       "xiaozhi_client_status_text() 返回 NULL，按空串处理");
+        ESP_LOGW(TAG, "轻触：未连接，忽略（%s）", why);
         return;
     }
     if (xiaozhi_listen_start()) {
         ESP_LOGI(TAG, "轻触：开始聆听");
+    } else {
+        ESP_LOGW(TAG, "轻触：开麦请求被拒绝（详情见 xiaozhi 日志）");
     }
 }
 
 static void page_event_cb(lv_event_t *e)
 {
+    esp_rom_printf("[as] raw: page\n");
+
+    /* ↑ 裸串口标记：区分"LVGL 回调进来了但 target 不是这一页"和"根本没进来"。
+       每下轻触会打 1~3 条（按下/抬起/点击），只写 UART0，不走日志链。 */
     /* ui_home 给整棵控件树开了事件冒泡：只认落在页面/脸本身的触摸，
-       忽略"音频自检"按钮等子对象冒上来的事件（否则点按钮会顺手开麦）。 */
-    if (lv_event_get_target(e) != s_page) {
+       忽略"音频自检"按钮等子对象冒上来的事件（否则点按钮会顺手开麦）。
+       s_page 为 NULL（页面已销毁）时这里必然成立，直接返回。 */
+    if (s_page == NULL || lv_event_get_target(e) != s_page) {
         return;
     }
     const lv_event_code_t code = lv_event_get_code(e);
@@ -503,35 +670,24 @@ static void page_event_cb(lv_event_t *e)
 
 static void page_delete_cb(lv_event_t *e)
 {
-    (void)e;
-    /* ui_home 重建界面时整棵控件树被删掉：指针必须清空，否则下次会踩野指针 */
-    s_page = NULL;
-    s_dot = NULL;
-    s_eye[0] = NULL;
-    s_eye[1] = NULL;
-    s_mouth_smile = NULL;
-    s_mouth_o = NULL;
-    s_mouth_line = NULL;
-    s_think_arc = NULL;
-    s_status = NULL;
-    s_sub = NULL;
-    s_hint = NULL;
-    s_visible = false;
-    s_face = (xz_state_t)-1;
-    s_txt_status[0] = '\0';
-    s_txt_sub[0] = '\0';
-    s_txt_hint[0] = '\0';
-    s_sub_src[0] = '\0';
-    if (s_anim_timer != NULL) {
-        lv_timer_pause(s_anim_timer);   /* 定时器不在对象树里，留着下次复用 */
+    /* ui_home 重建界面时整棵控件树被删掉：指针必须清空，否则下次会踩野指针。
+       先认一下这是不是"当前这一页"：万一某个旧页面的 DELETE 晚到了（重建时没解绑
+       成功），绝不能让它把新页面的指针/可见性一起清掉。 */
+    lv_obj_t *dead = lv_event_get_target(e);
+    if (dead != NULL && s_page != NULL && dead != s_page) {
+        ESP_LOGW(TAG, "小智页：收到旧页面的删除事件（%p != 当前 %p），忽略",
+                 (void *)dead, (void *)s_page);
+        return;
     }
-    ESP_LOGW(TAG, "小智页被界面重建移除（下次 build 会重新创建）");
+    reset_face("小智页被界面重建移除（下次 build 会重新创建）");
 }
 
 static void anim_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    if (!s_visible || !face_ready()) {
+    /* 页面不可见 / 脸没建全 / 页面已被销毁：直接返回，绝不碰任何控件指针。
+       （page_alive() 只遍历控件树指针、不解引用 s_page，发现页面没了会顺手清状态。） */
+    if (!s_visible || !face_ready() || !page_alive()) {
         return;
     }
 
@@ -569,12 +725,20 @@ void assistant_ui_build(lv_obj_t *parent)
         ESP_LOGE(TAG, "小智页创建失败：parent 为空");
         return;
     }
-    if (s_page == parent) {
-        return;                     /* 同一页重复构建：什么都不用做 */
+    if (s_page == parent && face_ready()) {
+        return;                     /* 同一页重复构建、脸也齐了：什么都不用做 */
     }
     if (s_page != NULL) {
-        ESP_LOGW(TAG, "小智页：旧页面还没销毁就重建，先解绑（指针以新页为准）");
+        /* 旧页面居然还活着：先把我们的删除回调从旧页摘掉再换指针。
+           否则旧页以后被删时 page_delete_cb 还会跑，把**新页**的指针和可见性
+           一并清空（症状：翻到小智页却是空白/表情不动）。注释里说的"先解绑"
+           以前只是写着，代码里并没有真的解绑。 */
+        lv_obj_remove_event_cb(s_page, page_delete_cb);
+        ESP_LOGW(TAG, "小智页：旧页面还没销毁就重建，已从旧页解绑（指针以新页为准）");
     }
+    /* 关键：先把所有指针清空，再从零建。任何一个控件创建失败都不会留下
+       上一次 build 的野指针（ui_home 每次收到 cfg 都会重建整棵控件树）。 */
+    reset_face(NULL);
     s_page = parent;
 
     /* 父对象归我们布置：纯白底、正好 360x360、铺满、整页接触摸 */
@@ -588,6 +752,10 @@ void assistant_ui_build(lv_obj_t *parent)
     lv_obj_set_style_pad_all(parent, 0, 0);
     lv_obj_set_scrollable(parent, false);
     lv_obj_set_clickable(parent, true);          /* 整页接轻触/滑动 */
+    /* 幂等：同一页重复 build（首建失败后再建、或以后 ui_home 原地重建）时，
+       先把本模块自己的回调摘掉，避免一次轻触触发两遍 handle_tap()。 */
+    lv_obj_remove_event_cb(parent, page_event_cb);
+    lv_obj_remove_event_cb(parent, page_delete_cb);
     lv_obj_add_event_cb(parent, page_event_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(parent, page_event_cb, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(parent, page_event_cb, LV_EVENT_CLICKED, NULL);
@@ -705,24 +873,8 @@ void assistant_ui_build(lv_obj_t *parent)
 fail:
     /* 建到一半失败（LVGL 内存不足）：把指针全部清掉，本模块就当没启用。
        这一页还剩一块白底，不影响翻页和其它页面。 */
-    s_page = NULL;
-    s_dot = NULL;
-    s_eye[0] = NULL;
-    s_eye[1] = NULL;
-    s_mouth_smile = NULL;
-    s_mouth_o = NULL;
-    s_mouth_line = NULL;
-    s_think_arc = NULL;
-    s_status = NULL;
-    s_sub = NULL;
-    s_hint = NULL;
-    s_visible = false;
-    s_need_sync = false;
-    s_face = (xz_state_t)-1;
-    if (s_anim_timer != NULL) {
-        lv_timer_pause(s_anim_timer);
-    }
     ESP_LOGE(TAG, "小智页创建失败（LVGL 内存不足），表情/文字停用（其它页面不受影响）");
+    reset_face(NULL);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -731,7 +883,7 @@ fail:
 
 void assistant_ui_open(void)
 {
-    if (s_page == NULL) {
+    if (!page_alive()) {
         ESP_LOGW(TAG, "小智页还没建好（布局未就绪或 voice.enabled=false），忽略打开命令");
         return;
     }
@@ -741,7 +893,7 @@ void assistant_ui_open(void)
 
 void assistant_ui_close(void)
 {
-    if (s_page == NULL) {
+    if (!page_alive()) {
         ESP_LOGW(TAG, "小智页还没建好，忽略关闭命令");
         return;
     }
@@ -756,12 +908,13 @@ void assistant_ui_close(void)
 
 bool assistant_ui_is_open(void)
 {
-    return s_visible;
+    return s_visible && page_alive();
 }
 
 void assistant_ui_set_visible(bool visible)
 {
-    if (s_page == NULL) {
+    if (!page_alive()) {
+        /* 页面已被销毁（或指针已失效）：无条件当不可见，一个 LVGL 对象都不碰 */
         s_visible = false;
         s_need_sync = false;
         return;
@@ -794,7 +947,13 @@ void assistant_ui_set_visible(bool visible)
 
 void assistant_ui_tick(void)
 {
-    if (s_page == NULL) {
+    esp_rom_printf("[as] raw: tick\n");
+
+    /* ↑ 裸串口标记：必须是第一行——这条来自 ui_home 的 500ms 刷新定时器，
+       和 handle_tap() 里的 [as] raw: tap 配对，一眼就能看出崩在哪条路径上。 */
+    /* 页面被 ui_home 重建/销毁后照样会被调用：这里先确认页面还在活动屏幕上，
+       不在就只清状态（page_alive 内部做），绝不 lv_obj_is_hidden() 野指针。 */
+    if (!page_alive()) {
         return;
     }
 

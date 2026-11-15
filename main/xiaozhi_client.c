@@ -5,13 +5,17 @@
  * 线程约定：
  *   - 发现/连接在独立任务（xz_task）里做，不阻塞 LVGL 和 MQTT；
  *   - 音频流另起两个任务：xz_send（麦克风→opus→二进制帧）和 xz_play（二进制帧→opus→喇叭），
- *     都 >= 8192 字节栈，且不碰 LVGL（状态只写静态字符串，界面自己轮询）；
+ *     栈放内部 RAM，且不碰 LVGL（状态只写静态字符串，界面自己轮询）；
  *   - WebSocket 回调里只做"拷一帧进播放队列"这种短活，解码和播放都在 xz_play 里做。
  *
  * 内存约定：
  *   - 发现用一次 HTTPS（esp_http_client），完成后立刻释放；响应缓冲放 PSRAM；
  *   - 码流缓冲（PCM、编码输出、解码输出、播放队列）全部 heap_caps_malloc(MALLOC_CAP_SPIRAM)，
  *     任务栈上只放几个指针和几十字节的结构体。
+ *   - 【硬性】两条音频任务的栈必须用 xTaskCreate 放内部 RAM，绝不能用 xTaskCreateWithCaps
+ *     放 PSRAM：音频跑起来时 WiFi/TLS 还在并发读写 flash，flash cache 一停，
+ *     CPU 就取不到 PSRAM 栈里的指令，现场是 "Instruction access fault / Illegal instruction"
+ *     的 Guru（rst:0xc）。缓冲仍在 PSRAM，只有栈在内部 RAM。
  *
  * 协议（与 xiaozhi-esp32/main/protocols/websocket_protocol.cc 对齐）：
  *   - 文本帧：JSON 控制消息（hello / listen / tts / stt / llm / abort）；
@@ -43,6 +47,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_rom_sys.h"        /* esp_rom_printf()：诊断用的裸串口标记（绕开 esp_log 钩子链）*/
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 
@@ -76,10 +81,11 @@ static const char *TAG = "xiaozhi";
 #define XZ_PLAY_SLOTS    8                                    /* 播放队列槽数（约 480ms）*/
 #define XZ_PLAY_MAX      640                                  /* 单帧 opus 上限（60ms 远小于此）*/
 #define XZ_BIN_MAX       1024                                 /* 二进制帧累积上限 */
-#define XZ_TASK_STACK 24576   /* Opus CELT 编码器很吃栈；实际分配到 PSRAM */
-#define XZ_PLAY_STACK 16384                                 /* 编/解码任务栈 */
+#define XZ_TASK_STACK 16384   /* 上行任务栈：内部 RAM（PSRAM 栈会 Instruction access fault；12KB 实测栈溢出）*/
+#define XZ_PLAY_STACK 10240                                 /* 下行任务栈：同样必须在内部 RAM */
 #define XZ_WS_TASK_STACK 8192                                 /* WebSocket 任务栈（TLS 在这条任务上）*/
 #define XZ_PROTO_VER     2                                    /* 声明的二进制协议版本 */
+#define XZ_THINK_MS      8000                                 /* "思考中/正在说话"的兜底超时（毫秒）*/
 
 /* 播放队列槽。整块放 PSRAM，任务栈上只放索引。 */
 typedef struct {
@@ -106,7 +112,7 @@ static esp_websocket_client_handle_t s_ws;
 /* ---- 给界面看的高阶状态（不参与音频流程，只读派生）---- */
 static volatile bool s_error;          /* 发现/连接出错（界面画 ERROR 脸）*/
 static volatile bool s_thinking;       /* 上行停了、下行还没开始 */
-static volatile int64_t s_thinking_at; /* thinking 起点（8 秒兜底，避免一直转圈）*/
+static volatile int64_t s_thinking_at; /* "思考/正在说话"的起点：8 秒兜底，避免界面一直转圈 */
 static volatile int s_listen_req;      /* 界面手动请求：1=start 2=stop，上行任务消费 */
 
 /* 最近一次 stt 文字：WS 回调写、LVGL 线程读，用临界区护一下，
@@ -177,6 +183,11 @@ static void xz_set_state(int st)
         return;
     }
     s_state = st;
+    if (st == XZ_ST_THINK) {
+        /* 进"正在说话"也要记起点：服务端只说 tts start 却不给音频时，
+           xiaozhi_state() 靠这个时间戳兜底收回，脸不能一直卡在"思考"。 */
+        s_thinking_at = esp_timer_get_time();
+    }
     switch (st) {
     case XZ_ST_LISTEN: set_status("正在聆听"); break;
     case XZ_ST_THINK:  set_status("正在说话"); break;
@@ -396,7 +407,13 @@ static bool discover_ws_url(void)
 
 /* --------------------------- 2) 播放队列 --------------------------- */
 
-/** 一次性把队列/锁建好（PSRAM，5 KB 左右，之后不再释放）。 */
+/**
+ * 一次性把队列/锁建好（PSRAM，5 KB 左右，之后不再释放）。
+ *
+ * 调用方必须看返回值：返回 false 时下面四个指针里至少有一个是 NULL，
+ * 拿 NULL 去 xSemaphoreTake() 会直接 Load access fault（现场那种 ROM 里的 panic），
+ * 所以 xiaozhi_listen_start()/stream_start() 进门都要再查一遍。
+ */
 static bool ensure_stream_buffers(void)
 {
     if (s_q_lock == NULL) {
@@ -412,7 +429,12 @@ static bool ensure_stream_buffers(void)
         s_q = xz_psram_alloc(sizeof(xz_slot_t) * XZ_PLAY_SLOTS);
     }
     if (s_q == NULL || s_q_lock == NULL || s_send_lock == NULL || s_stream_lock == NULL) {
-        ESP_LOGE(TAG, "音频流缓冲/锁创建失败（内存不足）");
+        ESP_LOGE(TAG, "音频流缓冲/锁创建失败（内存不足）：队列 %d / q锁 %d / 发送锁 %d / 流锁 %d，"
+                 "内部 RAM %u KB / PSRAM %u KB",
+                 (int)(s_q != NULL), (int)(s_q_lock != NULL), (int)(s_send_lock != NULL),
+                 (int)(s_stream_lock != NULL),
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
         return false;
     }
     return true;
@@ -573,48 +595,140 @@ static bool send_listen(const char *state, bool with_mode)
     return stream_send_text(msg) > 0;
 }
 
-/** 每帧判一次"是否该退出"：和 stream_start 在同一把锁里，避免抢跑。 */
-static bool stream_keep_running(volatile bool *alive)
+/**
+ * 每帧判一次"是否该退出"：和 stream_start 在同一把锁里，避免抢跑。
+ *
+ * 注意：这里只读 s_stream_stop，不再顺手清 alive——alive 只由任务自己的收尾
+ * （stream_mark_exited）清。否则会出现"标志已经清了、Opus 句柄还开着"的窗口：
+ * 界面紧接着再点一次，就会在旧任务还没放完句柄的时候又起一条任务、再开一个编码器。
+ * 内部 RAM 只剩几十 KB，第二个编码器开不出来，上行就拿着一个坏句柄一直编码（编码错误）。
+ */
+static bool stream_keep_running(void)
 {
     if (s_stream_lock == NULL) {
         return false;
     }
     xSemaphoreTake(s_stream_lock, portMAX_DELAY);
     const bool stop = s_stream_stop;
-    if (stop && alive != NULL) {
-        *alive = false;
-    }
     xSemaphoreGive(s_stream_lock);
     return !stop;
 }
 
-/** 服务端 hello 到了：起流任务（重复调用安全）。 */
-static void stream_start(void)
+/**
+ * 流任务收尾：拿 s_stream_lock 清掉自己的 alive 标志（全文件唯一清它的地方）。
+ *
+ * 调用顺序必须是"先关句柄、放缓冲，最后清标志"，这条不变量才成立：
+ *   s_sender_alive == true  ⇒ 上行任务还在，而且它的 Opus 编码器是开着的；
+ *   s_player_alive == true  ⇒ 下行任务还在，而且它的 Opus 解码器是开着的。
+ * xiaozhi_listen_start() 的 if (!s_sender_alive || !s_player_alive) 就靠它判断
+ * 该不该重建整条流——第二次点「轻触说话」能自愈，全靠这一步。
+ */
+static void stream_mark_exited(volatile bool *alive, bool sender)
 {
-    if (!ensure_stream_buffers()) {
-        return;
+    if (s_stream_lock != NULL) {
+        xSemaphoreTake(s_stream_lock, portMAX_DELAY);
     }
+    *alive = false;
+    bool back_idle = false;
+    if (sender) {
+        s_uplink = false;       /* 麦克风这一路没了：别再显示"正在聆听" */
+        s_listen_req = 0;       /* 界面排的开/关麦请求也没人消费了，丢掉 */
+        s_thinking = false;
+        if (s_state == XZ_ST_LISTEN) {
+            s_state = XZ_ST_IDLE;
+            back_idle = true;
+        }
+    } else {
+        s_tts_active = false;
+        if (s_state == XZ_ST_SPEAK) {
+            s_state = XZ_ST_IDLE;
+            back_idle = true;
+        }
+    }
+    if (s_stream_lock != NULL) {
+        xSemaphoreGive(s_stream_lock);
+    }
+    if (back_idle) {
+        set_status("已连接");   /* 和 xz_set_state(XZ_ST_IDLE) 同文案；别在锁里刷日志 */
+    }
+}
+
+/**
+ * 起流任务（幂等）。返回 true = 上下行两路都在跑。
+ *
+ * 依赖上面那条不变量：alive==false 意味着旧任务已经关完句柄、放完缓冲，
+ * 所以看到 false 就放心重建一份新的编解码器；看到 true 说明旧任务还活着
+ * 且句柄可用，绝不重复创建（第二份 Opus 编码器这个板子开不出来）。
+ */
+static bool stream_start(void)
+{
+    /* 裸串口标记（只走 ROM printf，不经过 esp_log 的 vprintf 钩子链）。
+       现场如果看到 [xz] raw 而看不到下面那条 ESP_LOGI，就说明崩在日志链
+       （log_buffer / log_forward / net_publish_log）里，不是我这段逻辑。 */
+    esp_rom_printf("[xz] raw: stream_start entered\n");
+    /* 进门先报一声（只用 %d，不碰任何指针）：现场如果连这条都没打出来，
+       就说明根本没走到 stream_start，问题在触摸/界面那一侧，不在这条调用链里。 */
+    ESP_LOGI(TAG, "stream_start：进入（stop %d / 上行 %d / 下行 %d）",
+             (int)s_stream_stop, (int)s_sender_alive, (int)s_player_alive);
+    if (!ensure_stream_buffers()) {
+        ESP_LOGE(TAG, "stream_start：缓冲/锁没建好，放弃");
+        return false;
+    }
+    if (s_stream_lock == NULL || s_send_lock == NULL || s_q_lock == NULL || s_q == NULL) {
+        ESP_LOGE(TAG, "stream_start：基础设施指针为空（队列 %d / q锁 %d / 发送锁 %d / 流锁 %d），放弃",
+                 (int)(s_q != NULL), (int)(s_q_lock != NULL),
+                 (int)(s_send_lock != NULL), (int)(s_stream_lock != NULL));
+        return false;
+    }
+    ESP_LOGI(TAG, "stream_start：缓冲/锁就绪，准备（重）建任务 …");
+
+    /* 上一轮正在收尾（stop 已置位）时先等它退干净，最多 1 秒：
+       这段时间里 alive 还是 true，但任务马上就会关句柄，直接重建会撞车。 */
+    if (s_stream_stop && (s_sender_alive || s_player_alive)) {
+        for (int i = 0; i < 50 && (s_sender_alive || s_player_alive); i++) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (s_sender_alive || s_player_alive) {
+            ESP_LOGW(TAG, "上一轮音频任务还在收尾（上行 %d 下行 %d），这次先不重建",
+                     (int)s_sender_alive, (int)s_player_alive);
+            return false;
+        }
+    }
+
     xSemaphoreTake(s_stream_lock, portMAX_DELAY);
-    s_stream_stop = false;
+    s_stream_stop = false;          /* 新任务的退出条件清零 */
     s_uplink = false;               /* 不自动开麦：等界面「轻触说话」再发 listen start */
     s_tts_active = false;
     if (!s_sender_alive) {
-        s_sender_alive = true;      /* 先占位，任务里不再重复置位 */
-        if (xTaskCreateWithCaps(xz_sender_task, "xz_send", XZ_TASK_STACK, NULL, 5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
+        s_sender_alive = true;      /* 先占位；创建失败要立刻放掉，成功后交给任务自己清 */
+        /* 栈必须在内部 RAM：PSRAM 栈在 flash cache 停掉时取不到指令（Instruction access fault）*/
+        if (xTaskCreate(xz_sender_task, "xz_send", XZ_TASK_STACK, NULL, 5, NULL) != pdPASS) {
             s_sender_alive = false;
             ESP_LOGE(TAG, "上行任务创建失败");
         }
     }
     if (!s_player_alive) {
         s_player_alive = true;
-        if (xTaskCreateWithCaps(xz_player_task, "xz_play", XZ_PLAY_STACK, NULL, 5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
+        if (xTaskCreate(xz_player_task, "xz_play", XZ_PLAY_STACK, NULL, 5, NULL) != pdPASS) {
             s_player_alive = false;
             ESP_LOGE(TAG, "下行任务创建失败");
         }
     }
+    const bool ok = s_sender_alive && s_player_alive;
     xSemaphoreGive(s_stream_lock);
-    ESP_LOGI(TAG, "音频流已启动（上行 %d Hz/%d ms，下行 %d Hz/%d ms）",
-             XZ_IN_RATE, XZ_FRAME_MS, XZ_OUT_RATE, XZ_FRAME_MS);
+
+    if (ok) {
+        ESP_LOGI(TAG, "音频流已启动（上行 %d Hz/%d ms，下行 %d Hz/%d ms）",
+                 XZ_IN_RATE, XZ_FRAME_MS, XZ_OUT_RATE, XZ_FRAME_MS);
+        ESP_LOGI(TAG, "音频任务栈在内部 RAM（上行 %d / 下行 %d 字节）：剩余内部 RAM %u KB / PSRAM %u KB",
+                 XZ_TASK_STACK, XZ_PLAY_STACK,
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    } else {
+        ESP_LOGE(TAG, "音频流只起来一半（上行 %d 下行 %d）",
+                 (int)s_sender_alive, (int)s_player_alive);
+    }
+    return ok;
 }
 
 /** 只置标志，不等待（可以在 WS 回调/LVGL 线程里调用）。 */
@@ -648,15 +762,12 @@ static void stream_stop_wait(int ms)
 
 /* ---- 上行：麦克风 → opus → 二进制帧 ---- */
 
-static void xz_sender_task(void *arg)
+/**
+ * 打开 Opus 编码器并取一帧的输入/输出字节数。
+ * 配置只写在这一处：任务启动和"中途句柄失效后重开"共用同一份参数，不会走偏。
+ */
+static bool stream_enc_open(void **enc_out, int *in_size, int *out_size)
 {
-    (void)arg;
-    void *enc = NULL;
-    int16_t *pcm = NULL;
-    uint8_t *frame = NULL;
-    int in_size = 0;
-    int out_size = 0;
-
     /* 与 xiaozhi-esp32 的 AS_OPUS_ENC_CONFIG() 保持一致：16k / 单声道 / 60ms / 码率自适应 */
     esp_opus_enc_config_t ecfg = {
         .sample_rate      = ESP_AUDIO_SAMPLE_RATE_16K,
@@ -671,21 +782,55 @@ static void xz_sender_task(void *arg)
         .enable_vbr       = true,
     };
 
+    void *enc = NULL;
     const esp_audio_err_t oerr = esp_opus_enc_open(&ecfg, sizeof(ecfg), &enc);
     if (oerr != ESP_AUDIO_ERR_OK || enc == NULL) {
-        enc = NULL;
         ESP_LOGE(TAG, "Opus 编码器打开失败（%d），上行不可用", (int)oerr);
-        goto out;
+        return false;
     }
-    if (esp_opus_enc_get_frame_size(enc, &in_size, &out_size) != ESP_AUDIO_ERR_OK ||
-            in_size <= 0 || out_size <= 0) {
+    if (esp_opus_enc_get_frame_size(enc, in_size, out_size) != ESP_AUDIO_ERR_OK ||
+            *in_size <= 0 || *out_size <= 0) {
         ESP_LOGE(TAG, "Opus 编码器查询帧长失败");
-        goto out;
+        esp_opus_enc_close(enc);        /* 半成品句柄就地关掉，别留给下一次 */
+        return false;
     }
     ESP_LOGI(TAG, "Opus 编码器就绪：16k 单声道 60ms（in=%d 字节 / out=%d 字节，内部 RAM %u KB / PSRAM %u KB）",
-             in_size, out_size,
+             *in_size, *out_size,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    *enc_out = enc;
+    return true;
+}
+
+/**
+ * 打一次本任务栈的剩余量（字节）。栈在内部 RAM，这个数字就是"还要不要加栈"的唯一依据：
+ * 余量偏小就按 2 KB 一档往上加 XZ_TASK_STACK / XZ_PLAY_STACK，绝不能把栈挪回 PSRAM。
+ */
+static void stream_log_stack_watermark(const char *who, int stack_bytes)
+{
+    const unsigned free_b = (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
+    if (free_b < 1024) {
+        ESP_LOGW(TAG, "%s任务栈只剩 %u 字节（共 %d 字节）：太紧，按 2 KB 一档往上加",
+                 who, free_b, stack_bytes);
+    } else {
+        ESP_LOGI(TAG, "%s任务栈余量 %u 字节（共 %d 字节，内部 RAM）", who, free_b, stack_bytes);
+    }
+}
+
+static void xz_sender_task(void *arg)
+{
+    (void)arg;
+    void *enc = NULL;
+    int16_t *pcm = NULL;
+    uint8_t *frame = NULL;
+    int in_size = 0;
+    int out_size = 0;
+    int out_cap = 0;
+
+    if (!stream_enc_open(&enc, &in_size, &out_size)) {
+        goto out;               /* 打不开也走 out：alive 照样清掉，下次轻触会重建 */
+    }
+    out_cap = out_size;
 
     pcm = xz_psram_alloc(XZ_IN_SAMPLES * sizeof(int16_t));
     frame = xz_psram_alloc(XZ_HDR_SIZE + (size_t)out_size + 64);
@@ -697,10 +842,21 @@ static void xz_sender_task(void *arg)
     uint32_t ts_ms = 0;
     uint32_t stat_frames = 0;
     uint32_t stat_bytes = 0;
-    uint32_t stat_err = 0;
+    uint32_t stat_err = 0;      /* 编码/发送失败（每秒清一次）*/
+    uint32_t stat_drop = 0;     /* 录音不足丢帧（每秒清一次）：以前混进"编码错误"，会误诊 */
+    int enc_fail_streak = 0;    /* 连续编码失败：句柄可能已经坏了 */
+    int enc_reopen_left = 1;    /* 一次流生命周期里只允许就地重开一次编码器 */
+    bool hw_logged = false;
     int64_t stat_at = esp_timer_get_time();
+    const int64_t hw_at = stat_at;
 
-    while (stream_keep_running(&s_sender_alive)) {
+    while (stream_keep_running()) {
+        if (enc == NULL) {
+            /* 只有 stream_enc_open() 成功才会进循环；真出现空句柄时绝不去调
+               esp_opus_enc_process(NULL)，直接干净退出，下次轻触重建。 */
+            ESP_LOGE(TAG, "编码器句柄为空，上行任务退出（下次轻触重建）");
+            goto out;
+        }
         /* 注意：连上服务端后不自动开麦。上行只由界面「轻触说话」
            （xiaozhi_listen_start）或服务端 listen start 消息来打开，
            否则页一出来就在"正在聆听"，麦克风也一直开着。 */
@@ -726,7 +882,7 @@ static void xz_sender_task(void *arg)
                     ESP_LOGW(TAG, "手动 listen stop 发送失败");
                 }
                 s_uplink = false;
-                xz_think_start();                   /* 等服务端把这次说话处理成 tts */
+                xz_think_start();                   /* 等服务端把这次说话处理成 tts（8 秒兜底）*/
                 if (s_state == XZ_ST_LISTEN) {
                     xz_set_state(XZ_ST_IDLE);
                 }
@@ -736,8 +892,8 @@ static void xz_sender_task(void *arg)
         if (s_uplink && s_ready && s_ws != NULL) {
             const int n = voice_audio_record(pcm, XZ_IN_SAMPLES, XZ_IN_RATE, XZ_FRAME_MS);
             if (n < XZ_IN_SAMPLES) {
-                stat_err++;
-                if (stat_err == 1) {
+                stat_drop++;
+                if (stat_drop == 1) {
                     ESP_LOGW(TAG, "录音不足（%d/%d），本帧丢弃", n, XZ_IN_SAMPLES);
                 }
                 vTaskDelay(pdMS_TO_TICKS(20));
@@ -755,10 +911,34 @@ static void xz_sender_task(void *arg)
                 const esp_audio_err_t e = esp_opus_enc_process(enc, &in, &out);
                 if (e != ESP_AUDIO_ERR_OK || out.encoded_bytes == 0) {
                     stat_err++;
+                    enc_fail_streak++;
                     if (stat_err == 1) {
                         ESP_LOGW(TAG, "Opus 编码失败（%d）", (int)e);
                     }
+                    /* 连续失败说明句柄已经不可用（内存被挤掉、或上一轮收尾没收干净）：
+                       就地重开一次；还不行就让任务干净退出，下次轻触按需重建整条流。
+                       只重开一次是上限，避免拿着坏句柄一直重开、白耗电。 */
+                    if (enc_fail_streak >= 5) {
+                        enc_fail_streak = 0;
+                        if (enc_reopen_left <= 0) {
+                            ESP_LOGE(TAG, "编码器连续失败，上行任务退出（下次轻触重建整条流）");
+                            goto out;
+                        }
+                        enc_reopen_left--;
+                        ESP_LOGW(TAG, "编码器连续失败，就地重开一次 …");
+                        if (enc != NULL) {
+                            esp_opus_enc_close(enc);
+                            enc = NULL;
+                        }
+                        if (!stream_enc_open(&enc, &in_size, &out_size) ||
+                                in_size != XZ_IN_SAMPLES * (int)sizeof(int16_t) || out_size > out_cap) {
+                            ESP_LOGE(TAG, "编码器重开失败或帧长变了（in=%d out=%d），上行任务退出",
+                                     in_size, out_size);
+                            goto out;
+                        }
+                    }
                 } else {
+                    enc_fail_streak = 0;
                     int sent;
                     if (s_wire_ver <= 1) {
                         sent = stream_send_bin(payload, out.encoded_bytes);
@@ -779,30 +959,41 @@ static void xz_sender_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(20));    /* 空闲/半双工等待：不录不编 */
         }
 
-        /* 每秒一条摘要，不刷屏 */
         const int64_t now = esp_timer_get_time();
+        if (!hw_logged && now - hw_at >= 3LL * 1000 * 1000) {
+            hw_logged = true;
+            stream_log_stack_watermark("上行", XZ_TASK_STACK);
+        }
+
+        /* 每秒一条摘要，不刷屏 */
         if (now - stat_at >= 1000000) {
-            if (s_uplink && (stat_frames > 0 || stat_err > 0)) {
-                ESP_LOGI(TAG, "上行：%u 帧 / %u 字节 / 编码错误 %u（已发 %.1f 秒）",
+            if (s_uplink && (stat_frames > 0 || stat_err > 0 || stat_drop > 0)) {
+                ESP_LOGI(TAG, "上行：%u 帧 / %u 字节 / 编码错误 %u / 录音丢帧 %u（已发 %.1f 秒）",
                          (unsigned)stat_frames, (unsigned)stat_bytes, (unsigned)stat_err,
-                         (double)ts_ms / 1000.0);
+                         (unsigned)stat_drop, (double)ts_ms / 1000.0);
             }
             stat_frames = 0;
             stat_bytes = 0;
             stat_err = 0;
+            stat_drop = 0;
             stat_at = now;
         }
     }
 
 out:
+    /* 收尾顺序：先关编码器、再放缓冲，最后才清 s_sender_alive。
+       这样 "s_sender_alive==true" 永远等于 "任务还在、编码器开着"（见 stream_mark_exited）。 */
     if (enc != NULL) {
         esp_opus_enc_close(enc);
         enc = NULL;
     }
     free(pcm);
     free(frame);
+    pcm = NULL;
+    frame = NULL;
+    stream_log_stack_watermark("上行", XZ_TASK_STACK);
+    stream_mark_exited(&s_sender_alive, true);
     ESP_LOGI(TAG, "上行任务退出");
-    s_sender_alive = false;
     vTaskDelete(NULL);
 }
 
@@ -826,7 +1017,7 @@ static void xz_player_task(void *arg)
     if (oerr != ESP_AUDIO_ERR_OK || dec == NULL) {
         dec = NULL;
         ESP_LOGE(TAG, "Opus 解码器打开失败（%d），下行不可用", (int)oerr);
-        goto out;
+        goto out;               /* 同样走 out：先把 alive 清掉，下次轻触重建 */
     }
     ESP_LOGI(TAG, "Opus 解码器就绪：24k 单声道 60ms（内部 RAM %u KB / PSRAM %u KB）",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -844,12 +1035,18 @@ static void xz_player_task(void *arg)
     uint32_t stat_err = 0;
     int idle_hits = 0;
     bool active = false;
+    bool hw_logged = false;
     int64_t stat_at = esp_timer_get_time();
+    const int64_t hw_at = stat_at;
 
-    while (stream_keep_running(&s_player_alive)) {
+    while (stream_keep_running()) {
+        if (dec == NULL) {
+            ESP_LOGE(TAG, "解码器句柄为空，下行任务退出（下次轻触重建）");
+            goto out;
+        }
         uint16_t len = 0;
         bool did = false;
-        while (stream_keep_running(&s_player_alive) && play_pop(raw, XZ_PLAY_MAX, &len)) {
+        while (stream_keep_running() && play_pop(raw, XZ_PLAY_MAX, &len)) {
             did = true;
             if (gen != s_play_gen) {
                 gen = s_play_gen;
@@ -904,6 +1101,10 @@ static void xz_player_task(void *arg)
         }
 
         const int64_t now = esp_timer_get_time();
+        if (!hw_logged && now - hw_at >= 3LL * 1000 * 1000) {
+            hw_logged = true;
+            stream_log_stack_watermark("下行", XZ_PLAY_STACK);
+        }
         if (now - stat_at >= 1000000) {
             if (active || stat_err > 0) {
                 ESP_LOGI(TAG, "下行：已播放 %.1f 秒 / 解码错误 %u",
@@ -916,6 +1117,7 @@ static void xz_player_task(void *arg)
     }
 
 out:
+    /* 收尾顺序同上行：先关解码器、清队列、放缓冲，最后才清 s_player_alive。 */
     if (dec != NULL) {
         esp_opus_dec_close(dec);
         dec = NULL;
@@ -926,8 +1128,11 @@ out:
     }
     free(raw);
     free(pcm);
+    raw = NULL;
+    pcm = NULL;
+    stream_log_stack_watermark("下行", XZ_PLAY_STACK);
+    stream_mark_exited(&s_player_alive, false);
     ESP_LOGI(TAG, "下行任务退出");
-    s_player_alive = false;
     vTaskDelete(NULL);
 }
 
@@ -1081,8 +1286,9 @@ static void handle_text_message(const char *json)
         } else if (strcmp(st, "stop") == 0) {
             s_tts_active = false;
             xz_think_clear();
-            /* 队列里可能还有几百毫秒没放完：播放任务放完最后一帧再把状态收回"已连接" */
-            if (s_q_count == 0 && s_state != XZ_ST_IDLE) {
+            /* tts 结束：还在"正在说话"（一帧音频都没来）就立刻收回"已连接"；
+               队列里可能还有几百毫秒没放完的，交给播放任务放完最后一帧自己收。 */
+            if (s_state == XZ_ST_THINK || (s_q_count == 0 && s_state != XZ_ST_IDLE)) {
                 xz_set_state(XZ_ST_IDLE);
             }
             ESP_LOGI(TAG, "服务端：TTS 结束");
@@ -1097,6 +1303,18 @@ static void handle_text_message(const char *json)
         play_flush(true);                  /* 丢队列 + 让播放任务重置解码器 */
         xz_set_state(XZ_ST_IDLE);
         ESP_LOGW(TAG, "服务端：打断（停止双向、清空待播音频）");
+
+    } else if (strcmp(t, "error") == 0) {
+        /* 服务端报错（例如 {"type":"error","message":"Error occurred while processing message"}）：
+           这一轮直接作废，回到待机，别把脸卡在"思考/正在说话"上。 */
+        const cJSON *msg = cJSON_GetObjectItemCaseSensitive(root, "message");
+        ESP_LOGE(TAG, "服务端报错：%.120s（回到待机，可以再轻触）",
+                 cJSON_IsString(msg) ? msg->valuestring : "?");
+        s_uplink = false;
+        s_tts_active = false;
+        xz_think_clear();
+        play_flush(true);                  /* 报错这一轮就别再放残音了 */
+        xz_set_state(XZ_ST_IDLE);
 
     } else if (strcmp(t, "stt") == 0) {
         const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
@@ -1357,6 +1575,11 @@ void xiaozhi_client_configure(bool enabled, const char *endpoint)
     if (!ensure_stream_buffers()) {
         ESP_LOGE(TAG, "音频流缓冲创建失败");
     }
+    /* 开机就把基础设施状态打出来：以后轻触说话时这四个里要是有一个 NULL，
+       看这行就知道是"当初没建起来"，不是"被谁释放了"。 */
+    ESP_LOGI(TAG, "音频流基础设施：队列 %d / q锁 %d / 发送锁 %d / 流锁 %d",
+             (int)(s_q != NULL), (int)(s_q_lock != NULL),
+             (int)(s_send_lock != NULL), (int)(s_stream_lock != NULL));
 
     /* 等旧任务退出，避免两个 WebSocket 同时在线。
        调用方是 LVGL 主循环（apply_cfg），所以最多等 1 秒，别把界面卡太久；
@@ -1408,9 +1631,16 @@ xz_state_t xiaozhi_state(void)
     }
     if (s_state == XZ_ST_THINK || s_thinking) {
         /* 上行停了、下行还没来 = 服务端在思考。
-           说了句空话时服务端可能不回 tts，8 秒兜底收回，别让界面一直转圈。 */
-        if (s_thinking && (esp_timer_get_time() - s_thinking_at) > 8LL * 1000 * 1000) {
+           超时判断必须对 s_state == XZ_ST_THINK 也生效：服务端只回 tts start
+           不给音频（或者直接回 {"type":"error"}）时，s_thinking 早就被清了，
+           老代码只看 s_thinking，脸就永远卡在"思考"上（现场就是这么卡死的）。
+           说了句空话、服务端不回 tts 时，也靠这里兜底收回。 */
+        if ((esp_timer_get_time() - s_thinking_at) > (int64_t)XZ_THINK_MS * 1000) {
             s_thinking = false;
+            s_state = XZ_ST_IDLE;
+            if (s_ready) {
+                set_status("已连接");   /* 兜底收回时状态文字也一起收回 */
+            }
         } else {
             return XZ_THINKING;
         }
@@ -1426,6 +1656,14 @@ xz_state_t xiaozhi_state(void)
 
 bool xiaozhi_listen_start(void)
 {
+    /* 裸串口标记：先于任何 ESP_LOG 打出去，用来判断"轻触有没有走到 xiaozhi 这一层"，
+       以及"是不是崩在日志链里"（看到 raw、看不到下面那条 ESP_LOGI 就是后者）。 */
+    esp_rom_printf("[xz] raw: listen_start entered\n");
+    /* 必须是函数第一步，而且只用 %d（绝不带 %s/指针）：
+       现场如果连它都没打出来，说明轻触根本没走到 xiaozhi 这一层，
+       问题在触摸/界面（assistant_ui / ui_home）那边。 */
+    ESP_LOGI(TAG, "开麦：进入 listen_start（enabled %d / ready %d / 上行 %d / 下行 %d）",
+             (int)s_enabled, (int)s_ready, (int)s_sender_alive, (int)s_player_alive);
     if (!s_enabled) {
         ESP_LOGW(TAG, "手动开麦被拒：小智未启用");
         return false;
@@ -1434,11 +1672,27 @@ bool xiaozhi_listen_start(void)
         ESP_LOGW(TAG, "手动开麦被拒：还没连上服务端（%s）", xiaozhi_client_status_text());
         return false;
     }
-    /* 第一次点「轻触说话」时才启动音频流（stream_start 是幂等的） */
+    /* 队列和三把锁是 xiaozhi_client_configure() 建的；这里绝不拿空锁去 take——
+       缺了就现场补建一次，还缺就干净拒绝（宁可不开麦，也不要 Load access fault）。 */
+    if (s_stream_lock == NULL || s_send_lock == NULL || s_q_lock == NULL || s_q == NULL) {
+        ESP_LOGW(TAG, "开麦：音频流基础设施缺失，现场补建一次 …");
+        ensure_stream_buffers();
+        if (s_stream_lock == NULL || s_send_lock == NULL || s_q_lock == NULL || s_q == NULL) {
+            ESP_LOGE(TAG, "开麦被拒：基础设施没建起来（队列 %d / q锁 %d / 发送锁 %d / 流锁 %d），"
+                     "内部 RAM %u KB / PSRAM %u KB",
+                     (int)(s_q != NULL), (int)(s_q_lock != NULL),
+                     (int)(s_send_lock != NULL), (int)(s_stream_lock != NULL),
+                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+            return false;
+        }
+    }
+    /* 第一次点「轻触说话」时才启动音频流（stream_start 是幂等的）。
+       上一次的两个任务如果已经收尾（alive 清掉了），这里会带着全新的编解码器重建：
+       绝不能用"标志还在就沿用"，那时候编码器可能已经关掉了。 */
     if (!s_sender_alive || !s_player_alive) {
         ESP_LOGI(TAG, "按需启动音频流 …");
-        stream_start();
-        if (!s_sender_alive) {
+        if (!stream_start()) {
             ESP_LOGE(TAG, "上行任务没起来，放弃开麦");
             return false;
         }
@@ -1450,6 +1704,8 @@ bool xiaozhi_listen_start(void)
 
 void xiaozhi_listen_stop(void)
 {
+    /* 轻触也可能走到这一支（表情还停在"正在聆听"时），先报一声，方便分辨触摸走到哪了。 */
+    ESP_LOGI(TAG, "关麦：进入 listen_stop（enabled %d）", (int)s_enabled);
     if (!s_enabled) {
         return;
     }

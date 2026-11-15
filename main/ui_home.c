@@ -1,10 +1,12 @@
 /**
- * 家庭控制屏界面：JSON 布局驱动 + 固件内置的「System」页 + 「小智 AI」页。
+ * 家庭控制屏界面：JSON 布局驱动 + 固件内置的「设置」页 + 「小智 AI」页。
  *
  * 页 0..N-1 来自 HA 的 /local/orbis/layout.json（每页最多 4 个 tile）；
- * 倒数第二页是固件自己画的系统页：固件版本 / Wi-Fi / IP / 运行时长 / 内存，
- * 以及「检查更新」按钮（拉 HA 上的 firmware.json，有新版本就下载并重启）；
- * 最后一页是小智助手页（纯白底 + 会动的脸，内容由 assistant_ui.c 画进来，
+ * 第 N 页是固件自己画的「设置」页：一张可纵向滚动的设置列表，从上到下依次是
+ * 系统状态（固件 / MQTT / Wi-Fi / 运行时长 / 内存 / 电池 + 检查更新）、蓝牙
+ * （状态 / 扫描 / 连接 / 结果）、音频输出（耳机孔 / 蓝牙音箱）。检查更新拉 HA 上的
+ * firmware.json，有新版本就下载并重启；
+ * 最后一页（N+1）是小智助手页（纯白底 + 会动的脸，内容由 assistant_ui.c 画进来，
  * 布局里 voice.enabled=true 时才建）。翻页、旋钮、手势、圆点和其它页完全一样。
  */
 
@@ -62,7 +64,7 @@ static inline void ui_obj_set_flags(lv_obj_t *obj, lv_obj_flag_t f, bool en)
 #define lv_obj_add_flag(o, f)    ui_obj_set_flags((o), (f), true)
 #define lv_obj_remove_flag(o, f) ui_obj_set_flags((o), (f), false)
 
-#define MAX_PAGES (LAYOUT_MAX_PAGES + 3) /* JSON 页 + System 页 + 小智 AI 页 + 设置页 */
+#define MAX_PAGES (LAYOUT_MAX_PAGES + 2) /* JSON 页 + 设置页（合并系统状态/蓝牙/音频）+ 小智 AI 页 */
 
 #define CARD_W    140
 #define CARD_H    90
@@ -101,26 +103,25 @@ static lv_obj_t *s_dots[MAX_PAGES];
 static int s_page_count;
 
 static lv_obj_t *s_title;
-static lv_obj_t *s_wifi_icon;
-static lv_obj_t *s_wifi_label;
+static lv_obj_t *s_wifi_icon;      /* 状态栏：WiFi 信号弧（自绘） */
 static lv_color_t s_wifi_color;
-static int s_wifi_level;      /* 0..4 格 */
-static lv_obj_t *s_ha_dot;
+static int s_wifi_level;      /* 0..3 格 */
+static lv_obj_t *s_ha_icon;        /* 状态栏：HA 房子图标（在线蓝 / 离线灰） */
 static lv_obj_t *s_hint;
 static lv_timer_t *s_refresh_timer;
 
-/* System 页的控件 */
+/* 设置页「系统状态」段每行右侧的值文字：固件 / MQTT / WiFi / 运行 / 内存 / 电池 */
 static lv_obj_t *s_sys_lines[6];
-static lv_obj_t *s_mem_bar;      /* 系统页内存占用百分比进度条 */
+static lv_obj_t *s_mem_bar;      /* 内存行底部的占用百分比进度条 */
 static lv_obj_t *s_ota_btn;
 static lv_obj_t *s_ota_btn_label;
 static lv_obj_t *s_ota_bar;
 static lv_obj_t *s_ota_status;
 
-/* 顶部状态行的蓝牙图标 + 设置页（永远是最后一页） */
+/* 顶部状态行的蓝牙图标 + 设置页（第 N 页，原 System 页的位置） */
 static lv_obj_t *s_bt_icon;
-static int s_settings_page = -1;      /* 设置页在 s_pages[] 里的下标；-1 = 没建出来 */
 static lv_obj_t *s_set_page;          /* 设置页容器 */
+static lv_obj_t *s_set_scroll;        /* 设置页的纵向滚动容器（进出页要复位到顶部） */
 static lv_obj_t *s_set_bt_state;      /* 「蓝牙  未启用…」状态行 */
 static lv_obj_t *s_set_scan_btn;      /* 扫描按钮（协议栈没启用时置灰） */
 static lv_obj_t *s_set_scan_label;
@@ -244,14 +245,9 @@ static const lv_font_t *title_font_for(const char *text)
     return &lv_font_montserrat_20;
 }
 
-static bool is_status_page(int page)
-{
-    return s_layout_valid && page == s_json_pages;
-}
-
 /* 小智助手页：只有布局里 voice.enabled=true（见 layout.c 的 voice 段）时才会建这一页，
-   并且永远是最后一页。服务端地址同样来自布局，由 main.c 的 apply_cfg() 交给
-   xiaozhi_client_configure()。 */
+   并且永远是最后一页（第 N+1 页）。服务端地址同样来自布局，由 main.c 的 apply_cfg()
+   交给 xiaozhi_client_configure()。 */
 #define UI_ASSISTANT_PAGE 1
 
 static bool is_assistant_page(int page)
@@ -259,23 +255,20 @@ static bool is_assistant_page(int page)
     return UI_ASSISTANT_PAGE && s_layout_valid && s_layout.voice_enabled && page == s_json_pages + 1;
 }
 
-/* 设置页：固件自己的最后一页（小智页后面），System 页上的「设置」按钮和
-   滑动/旋钮都能到。创建失败时 s_settings_page = -1，标题退回默认样式。 */
+/* 设置页：固件自己的第 N 页（原 System 页的位置），合并了系统状态、蓝牙和
+   音频输出，融合后是「布局页 + 设置页 + 小智页」。 */
 static bool is_settings_page(int page)
 {
-    return s_settings_page >= 0 && page == s_settings_page;
+    return page == s_json_pages;
 }
 
 static const char *page_title(int page)
 {
-    if (is_status_page(page)) {
-        return "System";
+    if (is_settings_page(page)) {
+        return "设置";
     }
     if (is_assistant_page(page)) {
         return "小智 AI";
-    }
-    if (is_settings_page(page)) {
-        return "设置";
     }
     return s_layout.pages[page].name;
 }
@@ -327,6 +320,14 @@ static int assistant_page_index(void)
     return is_assistant_page(s_json_pages + 1) ? (s_json_pages + 1) : -1;
 }
 
+/** 设置页的滚动位置复位到最上面（第一段「系统状态」）。 */
+static void settings_scroll_reset(void)
+{
+    if (s_set_scroll != NULL) {
+        lv_obj_scroll_to_y(s_set_scroll, 0, LV_ANIM_OFF);
+    }
+}
+
 /** 把所有页的可见性/位置/圆点/标题刷成"只有 s_page 可见"。构建首帧用。 */
 static void pages_apply_visibility(void)
 {
@@ -348,7 +349,7 @@ static void pages_apply_visibility(void)
         const char *title = page_title(s_page);
         lv_label_set_text(s_title, title);
         lv_obj_set_style_text_font(s_title, title_font_for(title), 0);
-        lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 18);
+        lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 30);
     }
     int visible = 0;
     for (int i = 0; i < s_page_count; i++) {
@@ -389,6 +390,12 @@ static void show_page_dir(int page, int dir)
     }
     s_page = page;
 
+    /* 进设置页：滚动位置回到最上面（系统状态），蓝牙状态立刻刷一次不等 500ms */
+    if (is_settings_page(page)) {
+        settings_scroll_reset();
+        refresh_bt_ui();
+    }
+
     /* 圆点 + 标题立刻更新，不跟着动画走 */
     for (int i = 0; i < s_page_count; i++) {
         if (s_dots[i]) {
@@ -399,7 +406,7 @@ static void show_page_dir(int page, int dir)
         const char *title = page_title(page);
         lv_label_set_text(s_title, title);
         lv_obj_set_style_text_font(s_title, title_font_for(title), 0);
-        lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 18);
+        lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 30);
     }
 
     /* 小智页的可见性：这里只改标志 + 起停定时器，不碰任何 LVGL 对象
@@ -760,20 +767,8 @@ static void wifi_icon_draw_cb(lv_event_t *e)
     lv_draw_rect(layer, &rd, &dot);
 }
 
-static lv_obj_t *make_status_dot(lv_obj_t *parent, int x, int y)
-{
-    lv_obj_t *dot = lv_obj_create(parent);
-    lv_obj_set_size(dot, 8, 8);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(dot, COLOR_BAD, 0);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(dot, 0, 0);
-    lv_obj_set_pos(dot, x, y);
-    return dot;
-}
-
 /* ------------------------------------------------------------------------- */
-/* System 页                                                                  */
+/* 设置页的公共部分：OTA 回调 / 建页失败报告                                   */
 /* ------------------------------------------------------------------------- */
 
 static void ota_button_cb(lv_event_t *e)
@@ -815,118 +810,6 @@ static void report_page_create_failed(const char *name, lv_obj_t *parent)
                   "——不是内存不足，父对象 %p 在控件树里，需查 LVGL 内部状态",
              name, (unsigned)mon.free_size, (unsigned)mon.total_size,
              (unsigned)mon.free_biggest_size, (unsigned)mon.frag_pct, (void *)parent);
-}
-
-/** System 页的「设置」按钮：跳到设置页（最后一页）。页面没建好就只记日志。 */
-static void settings_button_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_settings_page < 0 || s_settings_page >= s_page_count ||
-        s_pages[s_settings_page] == NULL) {
-        ESP_LOGW(TAG, "设置页还没建好，忽略");
-        return;
-    }
-    ESP_LOGI(TAG, "打开设置页：第 %d/%d 页", s_settings_page + 1, s_page_count);
-    show_page_dir(s_settings_page, 1);
-    refresh_bt_ui();           /* 进页立刻刷一次（不必等 500ms 定时器） */
-}
-
-static void build_status_page(lv_obj_t *scr)
-{
-    lv_obj_t *page = lv_obj_create(scr);
-    if (page == NULL) {
-        report_page_create_failed("System 页", scr);
-        return;
-    }
-    lv_obj_set_size(page, 360, 360);
-    lv_obj_set_pos(page, 0, 0);
-    lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(page, 0, 0);
-    lv_obj_set_style_pad_all(page, 0, 0);
-    lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* System 页的参数放在一张卡片里：与其他卡片同样的黑色半透明，
-       叠在背景图 + 暗化层之上，比背景更暗一些。 */
-    lv_obj_t *info_card = lv_obj_create(page);
-    lv_obj_remove_style_all(info_card);
-    lv_obj_set_pos(info_card, 32, 88);
-    lv_obj_set_size(info_card, 296, 156);
-    lv_obj_set_style_bg_color(info_card, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(info_card, (lv_opa_t)(bg_image_card_opa_pct() * 255 / 100), 0);
-    lv_obj_set_style_radius(info_card, 22, 0);
-    lv_obj_set_style_border_width(info_card, 1, 0);
-    lv_obj_set_style_border_color(info_card, COLOR_BORDER, 0);
-    lv_obj_remove_flag(info_card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-
-    for (int i = 0; i < 6; i++) {
-        s_sys_lines[i] = lv_label_create(page);
-        lv_label_set_text(s_sys_lines[i], "--");
-        lv_obj_set_style_text_font(s_sys_lines[i], &lv_font_cjk16, 0);
-        lv_obj_set_style_text_color(s_sys_lines[i], COLOR_MUTED, 0);
-        lv_obj_set_pos(s_sys_lines[i], 48, 102 + i * 24);
-    }
-
-    /* 内存占用百分比进度条：放在「内存」行右侧，颜色随占用变化 */
-    s_mem_bar = lv_bar_create(page);
-    lv_obj_set_size(s_mem_bar, 118, 8);
-    lv_obj_set_pos(s_mem_bar, 172, 102 + 4 * 24 + 5);
-    lv_bar_set_range(s_mem_bar, 0, 100);
-    lv_obj_set_style_bg_color(s_mem_bar, lv_color_hex(0x3A3A3C), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_mem_bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_mem_bar, 4, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_mem_bar, COLOR_ACCENT, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(s_mem_bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(s_mem_bar, 4, LV_PART_INDICATOR);
-
-    /* 底部两个按钮并排：左「检查更新」、右「设置」。
-       圆屏 y=250..292 处可用宽度约 x=40..320，两个按钮合起来 54..296，安全。 */
-    s_ota_btn = lv_button_create(page);
-    lv_obj_set_size(s_ota_btn, 128, 42);
-    lv_obj_align(s_ota_btn, LV_ALIGN_TOP_MID, -62, 250);
-    lv_obj_set_style_bg_color(s_ota_btn, COLOR_ACCENT, 0);
-    lv_obj_set_style_radius(s_ota_btn, 14, 0);
-    lv_obj_add_event_cb(s_ota_btn, ota_button_cb, LV_EVENT_CLICKED, NULL);
-
-    s_ota_btn_label = lv_label_create(s_ota_btn);
-    lv_label_set_text(s_ota_btn_label, "检查更新");
-    lv_obj_set_style_text_font(s_ota_btn_label, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_ota_btn_label, COLOR_TEXT, 0);
-    lv_obj_center(s_ota_btn_label);
-
-    lv_obj_t *set_btn = lv_button_create(page);
-    if (set_btn != NULL) {
-        lv_obj_set_size(set_btn, 96, 42);
-        lv_obj_align(set_btn, LV_ALIGN_TOP_MID, 68, 250);
-        lv_obj_set_style_bg_color(set_btn, lv_color_hex(0x2C2C2E), 0);
-        lv_obj_set_style_radius(set_btn, 14, 0);
-        lv_obj_set_style_border_width(set_btn, 1, 0);
-        lv_obj_set_style_border_color(set_btn, COLOR_BORDER, 0);
-        lv_obj_add_event_cb(set_btn, settings_button_cb, LV_EVENT_CLICKED, NULL);
-
-        lv_obj_t *set_label = lv_label_create(set_btn);
-        lv_label_set_text(set_label, "设置");
-        lv_obj_set_style_text_font(set_label, &lv_font_cjk16, 0);
-        lv_obj_set_style_text_color(set_label, COLOR_TEXT, 0);
-        lv_obj_center(set_label);
-    } else {
-        ESP_LOGW(TAG, "System 页「设置」按钮创建失败（LVGL 池不够？）");
-    }
-
-    s_ota_bar = lv_bar_create(page);
-    lv_obj_set_size(s_ota_bar, 220, 10);
-    lv_obj_align(s_ota_bar, LV_ALIGN_TOP_MID, 0, 308);
-    lv_bar_set_range(s_ota_bar, 0, 100);
-    lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
-
-    s_ota_status = lv_label_create(page);
-    lv_label_set_text(s_ota_status, "");
-    lv_obj_set_style_text_font(s_ota_status, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_ota_status, COLOR_MUTED, 0);
-    lv_obj_set_width(s_ota_status, 300);
-    lv_obj_set_style_text_align(s_ota_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_ota_status, LV_ALIGN_TOP_MID, 0, 322);
-
-    s_pages[s_json_pages] = page;
 }
 
 /* ---- 小智助手页（最后一页）的附加控件：音频自检 ---- */
@@ -1047,7 +930,7 @@ static void build_assistant_page(lv_obj_t *scr)
 #endif /* UI_ASSISTANT_PAGE */
 
 /* ------------------------------------------------------------------------- */
-/* 设置页（最后一页）与蓝牙状态图标                                          */
+/* 设置页（第 N 页：系统状态 + 蓝牙 + 音频输出）与蓝牙状态图标                */
 /* ------------------------------------------------------------------------- */
 
 /**
@@ -1089,26 +972,68 @@ static lv_obj_t *settings_label(lv_obj_t *parent, const char *text, int x, int y
     return lab;
 }
 
-/** 设置页卡片：与其它页一样的黑色半透明底 + 圆角描边。失败返回 NULL。 */
-static lv_obj_t *settings_card(lv_obj_t *parent, int x, int y, int w, int h)
+/* 设置页的列表尺寸：容器 256 宽，右边留 8px 给 4px 滚动条 */
+#define SET_ROW_W      248
+#define SET_ROW_H       44    /* 标准设置行高（参考常见设置列表） */
+#define SET_ROW_GAP      8
+#define SET_ROW_PAD_X   14
+#define SET_HEAD_H      30    /* 分组标题占位：16px 字 + 下方留白 */
+#define SET_SEC_GAP     14    /* 分组之间额外留白 */
+#define SET_END_PAD     24    /* 滚动内容末尾留白，最后一行不贴圆边 */
+
+/**
+ * 设置页的一条设置行：整行一张小卡片（深灰半透明 + 圆角 12），
+ * 背景图能透出来一点，和 tile 卡的玻璃质感一致。失败返回 NULL。
+ */
+static lv_obj_t *settings_row(lv_obj_t *parent, int y, int h)
 {
     if (parent == NULL) {
         return NULL;
     }
-    lv_obj_t *card = lv_obj_create(parent);
-    if (card == NULL) {
+    lv_obj_t *row = lv_obj_create(parent);
+    if (row == NULL) {
         return NULL;
     }
-    lv_obj_remove_style_all(card);
-    lv_obj_set_pos(card, x, y);
-    lv_obj_set_size(card, w, h);
-    lv_obj_set_style_bg_color(card, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(card, (lv_opa_t)(bg_image_card_opa_pct() * 255 / 100), 0);
-    lv_obj_set_style_radius(card, 18, 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_color(card, COLOR_BORDER, 0);
-    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-    return card;
+    lv_obj_remove_style_all(row);
+    lv_obj_set_pos(row, 0, y);
+    lv_obj_set_size(row, SET_ROW_W, h);
+    lv_obj_set_style_bg_color(row, COLOR_CARD, 0);
+    lv_obj_set_style_bg_opa(row, (lv_opa_t)140, 0);      /* 约 55% */
+    lv_obj_set_style_radius(row, 12, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_color(row, COLOR_BORDER, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    return row;
+}
+
+/** 行左侧标题（16px CJK 白字，垂直居中）。 */
+static lv_obj_t *settings_row_title(lv_obj_t *row, const char *text)
+{
+    lv_obj_t *lab = settings_label(row, text, 0, -1, 0, COLOR_TEXT);
+    if (lab != NULL) {
+        lv_obj_align(lab, LV_ALIGN_LEFT_MID, SET_ROW_PAD_X, 0);
+    }
+    return lab;
+}
+
+/** 行右侧的值文字（灰字、右对齐、垂直居中）；w 是最大宽度。 */
+static lv_obj_t *settings_row_value(lv_obj_t *row, int w)
+{
+    lv_obj_t *lab = settings_label(row, "--", 0, -1, w, COLOR_MUTED);
+    if (lab != NULL) {
+        lv_obj_set_style_text_align(lab, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_align(lab, LV_ALIGN_RIGHT_MID, -SET_ROW_PAD_X, 0);
+    }
+    return lab;
+}
+
+/** 分组标题：同样的 16px 中文字体，用灰色区分层级；返回下一行的 y。 */
+static int settings_heading(lv_obj_t *parent, int y, const char *text)
+{
+    if (parent != NULL) {
+        settings_label(parent, text, SET_ROW_PAD_X, y + 4, 0, COLOR_MUTED);
+    }
+    return y + SET_HEAD_H;
 }
 
 /** 扫描 / 连接按钮的可用态：可用=蓝底白字，禁用=深灰底灰字 + LV_STATE_DISABLED。 */
@@ -1221,11 +1146,11 @@ static void refresh_bt_ui(void)
     }
 
     if (s_set_bt_state != NULL) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "蓝牙  %s", bt_link_state_text());
-        if (strcmp(buf, s_set_state_shown) != 0) {
-            snprintf(s_set_state_shown, sizeof(s_set_state_shown), "%s", buf);
-            lv_label_set_text(s_set_bt_state, buf);
+        /* 行首已经有蓝牙图标，状态行只放状态文字（"未启用（蓝牙栈未编译）"等） */
+        const char *text = bt_link_state_text();
+        if (strcmp(text, s_set_state_shown) != 0) {
+            snprintf(s_set_state_shown, sizeof(s_set_state_shown), "%s", text);
+            lv_label_set_text(s_set_bt_state, text);
         }
     }
 
@@ -1253,18 +1178,22 @@ static void refresh_bt_ui(void)
 }
 
 /**
- * 设置页：蓝牙（状态 / 扫描 / 结果 / 连接）+ 音频输出（耳机孔 / 蓝牙音箱）。
+ * 设置页（第 N 页，取代原来的 System 页和独立的设置页）。
  *
- * 透明底，顶部状态行（WiFi / HA / 蓝牙图标）照常可见；内容限制在圆形安全区内：
- * 两张卡片 y=72..282、x=36..324，16px 字体行高 21。
- * 导航和别的页一样靠左右滑动 / 旋钮；System 页的「设置」按钮直接跳到这一页。
+ * 标准设置列表：一个纵向滚动容器，里面是分组标题 + 一行行设置项。
+ * 从上到下：系统状态（固件 / MQTT / WiFi / 运行 / 内存 / 电池 / 检查更新）、
+ * 蓝牙（状态 / 扫描 / 连接 / 扫描结果）、音频输出（耳机孔 / 蓝牙音箱）。
+ *
+ * 容器在圆屏中间的安全带里：x=52..308、y=64..300（滚动条在右侧 4px）。
+ * 行宽 248（右侧留 8px 给滚动条）、行高 44、行距 8。滚动位置在进页/重建时
+ * 复位到顶部。滚动方向只有 VER，所以左右滑动仍然翻页；旋钮仍然是翻页
+ * （见 ui_home_page_step），不在这里驱动滚动。
  */
 static void build_settings_page(lv_obj_t *scr)
 {
     lv_obj_t *page = lv_obj_create(scr);
     if (page == NULL) {
         report_page_create_failed("设置页", scr);
-        s_settings_page = -1;
         return;
     }
     lv_obj_set_size(page, 360, 360);
@@ -1275,78 +1204,213 @@ static void build_settings_page(lv_obj_t *scr)
     lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
 
     s_set_page = page;
-    s_pages[s_settings_page] = page;
+    s_pages[s_json_pages] = page;
 
-    lv_obj_t *bt_card = settings_card(page, 36, 72, 288, 118);
-    lv_obj_t *audio_card = settings_card(page, 36, 196, 288, 86);
-    if (bt_card == NULL || audio_card == NULL) {
-        ESP_LOGW(TAG, "设置页卡片创建失败，本页内容不完整（LVGL 池可能不够）");
+    /* ---- 纵向滚动容器：圆屏中间 x=52..308、y=64..300 的安全带 ---- */
+    lv_obj_t *cont = lv_obj_create(page);
+    if (cont == NULL) {
+        report_page_create_failed("设置页滚动区", page);
+        return;
+    }
+    lv_obj_remove_style_all(cont);
+    lv_obj_set_pos(cont, 52, 64);
+    lv_obj_set_size(cont, 256, 236);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cont, 0, 0);
+    lv_obj_set_style_pad_all(cont, 0, 0);
+    lv_obj_add_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(cont, LV_DIR_VER);      /* 只上下滚，左右留给翻页 */
+    lv_obj_set_scroll_chain(cont, false);         /* 滚到头不再把滚动传给父对象 */
+    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_AUTO);
+    /* 4px 细滚动条：圆角、半透明灰、贴右缘 */
+    lv_obj_set_style_width(cont, 4, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_color(cont, COLOR_MUTED, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_50, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(cont, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+    lv_obj_set_style_border_width(cont, 0, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_right(cont, 2, LV_PART_SCROLLBAR);
+    s_set_scroll = cont;
+
+    int y = 0;
+
+    /* ---------------- 系统状态 ---------------- */
+    y = settings_heading(cont, y, "系统状态");
+
+    static const char *const sys_names[6] = {"固件", "MQTT", "WiFi", "运行", "内存", "电池"};
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t *row = settings_row(cont, y, SET_ROW_H);
+        if (row != NULL) {
+            settings_row_title(row, sys_names[i]);
+            /* WiFi 行要放「-55 dBm / 192.168.1.23」两行，右值区留宽一点 */
+            s_sys_lines[i] = settings_row_value(row, (i == 2) ? 176 : 150);
+            if (i == 4) {
+                /* 内存：百分比在行右侧，进度条压在行底部，颜色随占用变 */
+                s_mem_bar = lv_bar_create(row);
+                if (s_mem_bar != NULL) {
+                    lv_obj_set_pos(s_mem_bar, SET_ROW_PAD_X, 34);
+                    lv_obj_set_size(s_mem_bar, SET_ROW_W - SET_ROW_PAD_X * 2, 6);
+                    lv_bar_set_range(s_mem_bar, 0, 100);
+                    lv_obj_set_style_bg_color(s_mem_bar, lv_color_hex(0x3A3A3C), LV_PART_MAIN);
+                    lv_obj_set_style_bg_opa(s_mem_bar, LV_OPA_COVER, LV_PART_MAIN);
+                    lv_obj_set_style_radius(s_mem_bar, 3, LV_PART_MAIN);
+                    lv_obj_set_style_bg_color(s_mem_bar, COLOR_ACCENT, LV_PART_INDICATOR);
+                    lv_obj_set_style_bg_opa(s_mem_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+                    lv_obj_set_style_radius(s_mem_bar, 3, LV_PART_INDICATOR);
+                }
+            }
+        }
+        y += SET_ROW_H + SET_ROW_GAP;
     }
 
-    /* ---- 卡片 1：蓝牙 ---- */
-    if (bt_card != NULL) {
-        s_set_bt_state = settings_label(bt_card, "蓝牙  未启用", 16, 8, 256, COLOR_TEXT);
+    /* 检查更新：系统状态段末尾的整行按钮，进度条/状态文字压在行下方 */
+    s_ota_btn = lv_button_create(cont);
+    if (s_ota_btn != NULL) {
+        lv_obj_set_pos(s_ota_btn, 0, y);
+        lv_obj_set_size(s_ota_btn, SET_ROW_W, SET_ROW_H);
+        lv_obj_set_style_bg_color(s_ota_btn, COLOR_ACCENT, 0);
+        lv_obj_set_style_bg_opa(s_ota_btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(s_ota_btn, 12, 0);
+        lv_obj_set_style_shadow_width(s_ota_btn, 0, 0);
+        lv_obj_add_event_cb(s_ota_btn, ota_button_cb, LV_EVENT_CLICKED, NULL);
 
-        s_set_scan_btn = lv_button_create(bt_card);
+        s_ota_btn_label = settings_label(s_ota_btn, "检查更新", 0, -1, 0, COLOR_TEXT);
+        if (s_ota_btn_label != NULL) {
+            lv_obj_align(s_ota_btn_label, LV_ALIGN_LEFT_MID, SET_ROW_PAD_X, 0);
+        }
+        lv_obj_t *ota_icon = lv_label_create(s_ota_btn);
+        if (ota_icon != NULL) {
+            lv_label_set_text(ota_icon, LV_SYMBOL_DOWNLOAD);
+            lv_obj_set_style_text_font(ota_icon, &lv_font_montserrat_20, 0);
+            lv_obj_set_style_text_color(ota_icon, COLOR_TEXT, 0);
+            lv_obj_align(ota_icon, LV_ALIGN_RIGHT_MID, -SET_ROW_PAD_X, 0);
+        }
+    } else {
+        ESP_LOGW(TAG, "设置页「检查更新」行创建失败（LVGL 池不够？）");
+    }
+    y += SET_ROW_H + 6;
+
+    s_ota_bar = lv_bar_create(cont);
+    if (s_ota_bar != NULL) {
+        lv_obj_set_pos(s_ota_bar, 0, y);
+        lv_obj_set_size(s_ota_bar, SET_ROW_W, 8);
+        lv_bar_set_range(s_ota_bar, 0, 100);
+        lv_obj_set_style_bg_color(s_ota_bar, lv_color_hex(0x3A3A3C), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(s_ota_bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(s_ota_bar, 4, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(s_ota_bar, COLOR_ACCENT, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(s_ota_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(s_ota_bar, 4, LV_PART_INDICATOR);
+        lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+    y += 8 + 6;
+
+    s_ota_status = settings_label(cont, "", SET_ROW_PAD_X, y, SET_ROW_W - SET_ROW_PAD_X * 2,
+                                  COLOR_MUTED);
+    if (s_ota_status != NULL) {
+        lv_obj_set_style_text_align(s_ota_status, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_add_flag(s_ota_status, LV_OBJ_FLAG_HIDDEN);
+    }
+    y += 21 + SET_SEC_GAP;
+
+    /* ---------------- 蓝牙 ---------------- */
+    y = settings_heading(cont, y, "蓝牙");
+
+    lv_obj_t *bt_row = settings_row(cont, y, SET_ROW_H);
+    if (bt_row != NULL) {
+        lv_obj_t *icon = lv_label_create(bt_row);
+        if (icon != NULL) {
+            lv_label_set_text(icon, LV_SYMBOL_BLUETOOTH);
+            lv_obj_set_style_text_font(icon, &lv_font_montserrat_20, 0);
+            lv_obj_set_style_text_color(icon, COLOR_MUTED, 0);
+            lv_obj_align(icon, LV_ALIGN_LEFT_MID, SET_ROW_PAD_X - 2, 0);
+        }
+        s_set_bt_state = settings_label(bt_row, "未启用（蓝牙栈未编译）", 0, -1,
+                                        SET_ROW_W - 40 - SET_ROW_PAD_X, COLOR_TEXT);
+        if (s_set_bt_state != NULL) {
+            lv_label_set_long_mode(s_set_bt_state, LV_LABEL_LONG_DOT);
+            lv_obj_align(s_set_bt_state, LV_ALIGN_LEFT_MID, 40, 0);
+        }
+    }
+    y += SET_ROW_H + SET_ROW_GAP;
+
+    lv_obj_t *bt_btns = settings_row(cont, y, SET_ROW_H);
+    if (bt_btns != NULL) {
+        s_set_scan_btn = lv_button_create(bt_btns);
         if (s_set_scan_btn != NULL) {
-            lv_obj_set_size(s_set_scan_btn, 96, 30);
-            lv_obj_set_pos(s_set_scan_btn, 16, 40);
+            lv_obj_set_size(s_set_scan_btn, 102, 30);
+            lv_obj_set_pos(s_set_scan_btn, SET_ROW_PAD_X, 7);
             lv_obj_set_style_radius(s_set_scan_btn, 10, 0);
             lv_obj_set_style_shadow_width(s_set_scan_btn, 0, 0);
             lv_obj_add_event_cb(s_set_scan_btn, settings_scan_cb, LV_EVENT_CLICKED, NULL);
             s_set_scan_label = settings_label(s_set_scan_btn, "扫描", -1, -1, 0, COLOR_TEXT);
         }
 
-        s_set_conn_btn = lv_button_create(bt_card);
+        s_set_conn_btn = lv_button_create(bt_btns);
         if (s_set_conn_btn != NULL) {
-            lv_obj_set_size(s_set_conn_btn, 96, 30);
-            lv_obj_set_pos(s_set_conn_btn, 120, 40);
+            lv_obj_set_size(s_set_conn_btn, 102, 30);
+            lv_obj_set_pos(s_set_conn_btn, 132, 7);
             lv_obj_set_style_radius(s_set_conn_btn, 10, 0);
             lv_obj_set_style_shadow_width(s_set_conn_btn, 0, 0);
             lv_obj_add_event_cb(s_set_conn_btn, settings_conn_cb, LV_EVENT_CLICKED, NULL);
             s_set_conn_label = settings_label(s_set_conn_btn, "连接", -1, -1, 0, COLOR_TEXT);
         }
+    }
+    y += SET_ROW_H + SET_ROW_GAP;
 
-        /* 扫描结果区：协议栈没启用时只有空状态文字（本版永远如此）。
-           下一轮：TODO(bt) 扫描到音箱后在这里建可点选的行，选中的 MAC 存 s_set_sel_addr。 */
-        lv_obj_t *list = settings_card(bt_card, 16, 78, 256, 28);
-        if (list != NULL) {
-            lv_obj_set_style_radius(list, 9, 0);
-            lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
-            lv_obj_set_style_bg_color(list, lv_color_hex(0x151517), 0);
-            lv_obj_set_style_border_width(list, 0, 0);
-            s_set_empty = settings_label(list, "未启用，无法扫描", -1, -1, 0, COLOR_MUTED);
+    /* 扫描结果区：协议栈没启用时只有空状态文字（本版永远如此）。
+       下一轮：TODO(bt) 扫描到音箱后在这里建可点选的行，选中的 MAC 存 s_set_sel_addr。 */
+    lv_obj_t *res_row = settings_row(cont, y, 36);
+    if (res_row != NULL) {
+        s_set_empty = settings_label(res_row, "未启用，无法扫描", 0, -1, 0, COLOR_MUTED);
+        if (s_set_empty != NULL) {
+            lv_obj_align(s_set_empty, LV_ALIGN_LEFT_MID, SET_ROW_PAD_X, 0);
         }
     }
+    y += 36 + SET_SEC_GAP;
 
-    /* ---- 卡片 2：音频输出 ---- */
-    if (audio_card != NULL) {
-        settings_label(audio_card, "音频输出", 16, 4, 256, COLOR_TEXT);
+    /* ---------------- 音频输出 ---------------- */
+    y = settings_heading(cont, y, "音频输出");
 
-        s_set_phone_btn = lv_button_create(audio_card);
+    lv_obj_t *audio_row = settings_row(cont, y, SET_ROW_H);
+    if (audio_row != NULL) {
+        s_set_phone_btn = lv_button_create(audio_row);
         if (s_set_phone_btn != NULL) {
-            lv_obj_set_size(s_set_phone_btn, 92, 28);
-            lv_obj_set_pos(s_set_phone_btn, 16, 30);
-            lv_obj_set_style_radius(s_set_phone_btn, 14, 0);
+            lv_obj_set_size(s_set_phone_btn, 94, 30);
+            lv_obj_set_pos(s_set_phone_btn, SET_ROW_PAD_X, 7);
+            lv_obj_set_style_radius(s_set_phone_btn, 15, 0);
             lv_obj_set_style_shadow_width(s_set_phone_btn, 0, 0);
             lv_obj_add_event_cb(s_set_phone_btn, settings_audio_phone_cb, LV_EVENT_CLICKED, NULL);
             s_set_phone_label = settings_label(s_set_phone_btn, "耳机孔", -1, -1, 0, COLOR_TEXT);
         }
 
-        s_set_bt_btn = lv_button_create(audio_card);
+        s_set_bt_btn = lv_button_create(audio_row);
         if (s_set_bt_btn != NULL) {
-            lv_obj_set_size(s_set_bt_btn, 108, 28);
-            lv_obj_set_pos(s_set_bt_btn, 116, 30);
-            lv_obj_set_style_radius(s_set_bt_btn, 14, 0);
+            lv_obj_set_size(s_set_bt_btn, 108, 30);
+            lv_obj_set_pos(s_set_bt_btn, 124, 7);
+            lv_obj_set_style_radius(s_set_bt_btn, 15, 0);
             lv_obj_set_style_shadow_width(s_set_bt_btn, 0, 0);
             lv_obj_add_event_cb(s_set_bt_btn, settings_audio_bt_cb, LV_EVENT_CLICKED, NULL);
             s_set_bt_label = settings_label(s_set_bt_btn, "蓝牙音箱", -1, -1, 0, COLOR_TEXT);
         }
-
-        /* 只有「选了蓝牙音箱但协议栈没启用」时才出现，5 秒后自动隐藏 */
-        s_set_audio_hint = settings_label(audio_card, "蓝牙未启用，仍走耳机孔", 16, 60, 256,
-                                          lv_color_hex(0xFF9F0A));
     }
+    y += SET_ROW_H + 6;
+
+    /* 只有「选了蓝牙音箱但协议栈没启用」时才出现，5 秒后自动隐藏 */
+    s_set_audio_hint = settings_label(cont, "蓝牙未启用，仍走耳机孔", SET_ROW_PAD_X, y,
+                                      SET_ROW_W - SET_ROW_PAD_X * 2, lv_color_hex(0xFF9F0A));
+    y += 21;
+
+    /* 末尾垫 24px：最后一行能滚到圆屏中间，不被下弧线切掉 */
+    lv_obj_t *tail = lv_obj_create(cont);
+    if (tail != NULL) {
+        lv_obj_remove_style_all(tail);
+        lv_obj_set_pos(tail, 0, y);
+        lv_obj_set_size(tail, SET_ROW_W, SET_END_PAD);
+        lv_obj_remove_flag(tail, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    /* 进页永远从「系统状态」开始 */
+    lv_obj_scroll_to_y(cont, 0, LV_ANIM_OFF);
 
     /* 按真实状态刷一遍：协议栈没启用时扫描/连接就是灰的、音频高亮在耳机孔 */
     s_set_state_shown[0] = '\0';
@@ -1383,6 +1447,14 @@ bool ui_home_assistant_current(void)
     return is_assistant_page(s_page);
 }
 
+/** 设置页系统状态行的值文字：NULL 安全（某个标签没建出来时只跳过）。 */
+static void sys_value_set(int i, const char *text)
+{
+    if (i >= 0 && i < 6 && s_sys_lines[i] != NULL) {
+        lv_label_set_text(s_sys_lines[i], text);
+    }
+}
+
 static void refresh_status_page(void)
 {
     if (s_sys_lines[0] == NULL) {
@@ -1390,29 +1462,28 @@ static void refresh_status_page(void)
     }
     char buf[64];
 
-    snprintf(buf, sizeof(buf), "固件  v%s", ota_current_version());
-    lv_label_set_text(s_sys_lines[0], buf);
+    snprintf(buf, sizeof(buf), "v%s", ota_current_version());
+    sys_value_set(0, buf);
 
-    snprintf(buf, sizeof(buf), "MQTT  %s", net_mqtt_connected() ? "已连接" : "未连接");
-    lv_label_set_text(s_sys_lines[1], buf);
+    sys_value_set(1, net_mqtt_connected() ? "已连接" : "未连接");
 
     char ip[24] = "-";
     snprintf(ip, sizeof(ip), "%s", net_ip_string());
-    snprintf(buf, sizeof(buf), "WiFi  %d dBm · %s", net_wifi_rssi(), ip);
-    lv_label_set_text(s_sys_lines[2], buf);
+    /* 两行右对齐：信号强度 / IP（行高 44 里正好放得下 2×21px） */
+    snprintf(buf, sizeof(buf), "%d dBm\n%s", net_wifi_rssi(), ip);
+    sys_value_set(2, buf);
 
     const int64_t up_s = esp_timer_get_time() / 1000000;
-    snprintf(buf, sizeof(buf), "运行  %dh%02dm", (int)(up_s / 3600), (int)((up_s % 3600) / 60));
-    lv_label_set_text(s_sys_lines[3], buf);
+    snprintf(buf, sizeof(buf), "%dh%02dm", (int)(up_s / 3600), (int)((up_s % 3600) / 60));
+    sys_value_set(3, buf);
 
     {
-        /* 内存占用百分比（内部 RAM 已用/总量）+ 进度条 */
+        /* 内存：行右侧只放百分比，进度条在行底部，颜色随占用变化 */
         const size_t mem_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
         const size_t mem_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
         const int used_pct = mem_total ? (int)((mem_total - mem_free) * 100 / mem_total) : 0;
-        snprintf(buf, sizeof(buf), "内存  %d%%（%d/%d KB）",
-                 used_pct, (int)((mem_total - mem_free) / 1024), (int)(mem_total / 1024));
-        lv_label_set_text(s_sys_lines[4], buf);
+        snprintf(buf, sizeof(buf), "%d%%", used_pct);
+        sys_value_set(4, buf);
         if (s_mem_bar) {
             lv_bar_set_value(s_mem_bar, used_pct, LV_ANIM_OFF);
             lv_obj_set_style_bg_color(s_mem_bar,
@@ -1425,35 +1496,32 @@ static void refresh_status_page(void)
     {
         const int raw = battery_raw_value();
         if (raw >= 0) {
-            snprintf(buf, sizeof(buf), "电池  raw %d", raw);
+            snprintf(buf, sizeof(buf), "raw %d", raw);
         } else {
-            snprintf(buf, sizeof(buf), "电池  --");
+            snprintf(buf, sizeof(buf), "--");
         }
-        lv_label_set_text(s_sys_lines[5], buf);
+        sys_value_set(5, buf);
     }
 
+    /* OTA 行/进度条/状态文字：任一没建出来就只跳过这一段 */
+    if (s_ota_bar == NULL || s_ota_btn_label == NULL || s_ota_status == NULL) {
+        return;
+    }
     if (ota_busy()) {
         lv_obj_remove_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
         const int p = ota_percent();
         lv_bar_set_value(s_ota_bar, p < 0 ? 0 : p, LV_ANIM_OFF);
         lv_label_set_text(s_ota_btn_label, p < 0 ? "检查中" : "升级中");
-        const char *ota_text = ota_status_text();
-    lv_label_set_text(s_ota_status, ota_text);
-    if (ota_text[0] != '\0') {
-        lv_obj_remove_flag(s_ota_status, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(s_ota_status, LV_OBJ_FLAG_HIDDEN);
-    }
     } else {
         lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(s_ota_btn_label, "检查更新");
-        const char *ota_text = ota_status_text();
+    }
+    const char *ota_text = ota_status_text();
     lv_label_set_text(s_ota_status, ota_text);
     if (ota_text[0] != '\0') {
         lv_obj_remove_flag(s_ota_status, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(s_ota_status, LV_OBJ_FLAG_HIDDEN);
-    }
     }
 }
 
@@ -1617,7 +1685,7 @@ static void refresh_timer_cb(lv_timer_t *t)
         if (s_wifi_icon != NULL) {
         const int rssi = net_wifi_rssi();
         if (!net_wifi_connected()) {
-            s_wifi_color = COLOR_BAD;                 /* 未连接：红 */
+            s_wifi_color = COLOR_MUTED;                /* 未连接：灰（状态栏弱化） */
         } else if (rssi >= -60) {
             s_wifi_color = COLOR_OK;                  /* 强：绿 */
         } else if (rssi >= -78) {
@@ -1627,7 +1695,7 @@ static void refresh_timer_cb(lv_timer_t *t)
         }
         /* 信号格数：-55 以上 4 格，往下每档减一格 */
         if (!net_wifi_connected()) {
-            s_wifi_level = 0;            /* 断开：全暗 + 红 */
+            s_wifi_level = 0;            /* 断开：全暗 */
         } else if (rssi >= -60) {
             s_wifi_level = 3;            /* 三道光弧全亮 */
         } else if (rssi >= -73) {
@@ -1636,14 +1704,13 @@ static void refresh_timer_cb(lv_timer_t *t)
             s_wifi_level = 1;
         }
         lv_obj_invalidate(s_wifi_icon);
-        if (s_wifi_label != NULL) {
-            lv_label_set_text(s_wifi_label, "");     /* 只留格数，不显示 dBm */
-        }
     }
     }
 
-    if (s_ha_dot) {
-        lv_obj_set_style_bg_color(s_ha_dot, ha_client_online() ? COLOR_OK : COLOR_BAD, 0);
+    /* Home Assistant 图标：在线 = HA 蓝，离线 = 灰（状态栏统一用图标，不用文字） */
+    if (s_ha_icon != NULL) {
+        lv_obj_set_style_text_color(s_ha_icon,
+                                    ha_client_online() ? lv_color_hex(0x03A9F4) : COLOR_MUTED, 0);
     }
 
     refresh_values();
@@ -2993,9 +3060,11 @@ static void build_ui(void)
     s_selftest_shown[0] = '\0';
 
     /* 设置页 / 蓝牙控件：重建后旧指针全部作废，先清空（refresh 里都看 NULL） */
-    s_settings_page = -1;
     s_bt_icon = NULL;
     s_set_page = NULL;
+    s_set_scroll = NULL;
+    s_mem_bar = NULL;
+    s_ota_btn_label = NULL;
     s_set_bt_state = NULL;
     s_set_scan_btn = NULL;
     s_set_scan_label = NULL;
@@ -3012,61 +3081,55 @@ static void build_ui(void)
     s_set_sel_addr[0] = '\0';
 
     s_json_pages = s_layout.page_count;
-    s_page_count = s_json_pages + 1; /* 加 System 页 */
+    s_page_count = s_json_pages + 1; /* 加合并后的「设置」页（第 N 页） */
 #if UI_ASSISTANT_PAGE
     if (s_layout_valid && s_layout.voice_enabled) {
-        s_page_count++;              /* 再加小智助手页 */
+        s_page_count++;              /* 再加小智助手页（第 N+1 页，最后一页） */
     }
 #endif
-    /* 设置页永远排在最后（小智页后面）：s_pages[s_page_count-1] */
-    s_settings_page = s_page_count;
-    s_page_count++;
     s_title = NULL;
     s_wifi_icon = NULL;
-    s_wifi_label = NULL;
-    s_ha_dot = NULL;
+    s_ha_icon = NULL;
     s_ota_btn = NULL;
     s_ota_bar = NULL;
     s_ota_status = NULL;
 
-    /* 标题 */
+    /* 标题：状态栏下面一行，y=30（状态栏图标在 y=8..28） */
     s_title = lv_label_create(scr);
-    const char *first_title = s_layout_valid ? page_title(0) : "System";
+    const char *first_title = page_title(0);
     lv_label_set_text(s_title, first_title);
     lv_obj_set_style_text_color(s_title, COLOR_TEXT, 0);
     lv_obj_set_style_text_font(s_title, title_font_for(first_title), 0);
-    lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 30);
 
-    /* 状态行 */
-    s_wifi_color = COLOR_BAD;
+    /* ---- 手机式状态栏：蓝牙 / WiFi / HA 三个图标一行，整组居中（y=8..28） ---- */
+    s_wifi_color = COLOR_MUTED;
     s_wifi_icon = lv_obj_create(scr);
-    lv_obj_remove_style_all(s_wifi_icon);
-    lv_obj_set_size(s_wifi_icon, 22, 18);
-    lv_obj_set_pos(s_wifi_icon, 118, 50);
-    lv_obj_remove_flag(s_wifi_icon, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_wifi_icon, wifi_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    if (s_wifi_icon != NULL) {
+        lv_obj_remove_style_all(s_wifi_icon);
+        lv_obj_set_size(s_wifi_icon, 22, 18);
+        /* 居中的那个：x = 180 - 11；两侧图标用 TOP_MID 偏移夹住它 */
+        lv_obj_set_pos(s_wifi_icon, 169, 8);
+        lv_obj_remove_flag(s_wifi_icon, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(s_wifi_icon, wifi_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    }
 
-    s_wifi_label = lv_label_create(scr);
-    lv_label_set_text(s_wifi_label, "--");
-    lv_obj_set_style_text_color(s_wifi_label, COLOR_MUTED, 0);
-    lv_obj_set_style_text_font(s_wifi_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(s_wifi_label, 142, 56);
-
-    s_ha_dot = make_status_dot(scr, 197, 62);
-    lv_obj_t *ha_lbl = lv_label_create(scr);
-    lv_label_set_text(ha_lbl, "HA");
-    lv_obj_set_style_text_color(ha_lbl, COLOR_MUTED, 0);
-    lv_obj_set_style_text_font(ha_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(ha_lbl, 209, 56);
-
-    /* 蓝牙状态图标（WiFi 三道弧左边）：灰 = 未启用/关闭，蓝 = 扫描中/已连接。
-       montserrat_14 里带 LV_SYMBOL_BLUETOOTH（U+F293）；颜色由 refresh_timer_cb 刷。 */
+    /* 蓝牙：灰 = 未启用/关闭，蓝 = 扫描中/已连接（颜色由 refresh_bt_icon 刷） */
     s_bt_icon = lv_label_create(scr);
     if (s_bt_icon != NULL) {
         lv_label_set_text(s_bt_icon, LV_SYMBOL_BLUETOOTH);
-        lv_obj_set_style_text_font(s_bt_icon, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(s_bt_icon, &lv_font_montserrat_20, 0);
         lv_obj_set_style_text_color(s_bt_icon, COLOR_MUTED, 0);
-        lv_obj_set_pos(s_bt_icon, 94, 51);
+        lv_obj_align(s_bt_icon, LV_ALIGN_TOP_MID, -34, 8);
+    }
+
+    /* Home Assistant：房子图标（LV_SYMBOL_HOME），在线 HA 蓝、离线灰，不再用「HA」文字 */
+    s_ha_icon = lv_label_create(scr);
+    if (s_ha_icon != NULL) {
+        lv_label_set_text(s_ha_icon, LV_SYMBOL_HOME);
+        lv_obj_set_style_text_font(s_ha_icon, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(s_ha_icon, COLOR_MUTED, 0);
+        lv_obj_align(s_ha_icon, LV_ALIGN_TOP_MID, 34, 8);
     }
 
     /* JSON 页 */
@@ -3100,14 +3163,13 @@ static void build_ui(void)
         }
     }
 
-    /* System 页 */
-    build_status_page(scr);
+    /* 设置页（第 N 页）：系统状态 + 蓝牙 + 音频输出 */
+    build_settings_page(scr);
 #if UI_ASSISTANT_PAGE
     if (s_layout_valid && s_layout.voice_enabled) {
-        build_assistant_page(scr);          /* 小智页（白底） */
+        build_assistant_page(scr);          /* 第 N+1 页：小智页（白底） */
     }
 #endif
-    build_settings_page(scr);               /* 最后一页：设置（蓝牙 + 音频输出） */
 
     /* 翻页圆点 */
     if (s_page_count > 1) {
@@ -3183,8 +3245,9 @@ static void build_ui(void)
             built++;
         }
     }
-    ESP_LOGI(TAG, "UI built: %d page(s) + system + 设置（小智页：%s），共 %d 页",
-             s_json_pages, is_assistant_page(s_json_pages + 1) ? "有" : "无", s_page_count);
+    ESP_LOGI(TAG, "UI built: %d 个布局页 + 设置页（第 %d 页）+ 小智页（%s），共 %d 页",
+             s_json_pages, s_json_pages,
+             is_assistant_page(s_json_pages + 1) ? "有" : "无", s_page_count);
     if (built != s_page_count) {
         ESP_LOGE(TAG, "页面没建全：只有 %d/%d 页有效，缺失的页在翻页时会跳过（原因见上面的报错）",
                  built, s_page_count);
@@ -3245,7 +3308,7 @@ void ui_home_apply(const layout_t *layout)
         s_layout = *layout;
         s_layout_valid = true;
     } else {
-        /* 还没有收到 cfg：只保留 System 页 */
+        /* 还没有收到 cfg：只保留合并后的「设置」页 */
         memset(&s_layout, 0, sizeof(s_layout));
         s_layout_valid = false;
     }
