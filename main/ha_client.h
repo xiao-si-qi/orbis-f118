@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>   /* ha_entity_has_hvac_mode 里的 strcmp */
 
 #include "esp_err.h"
 
@@ -17,6 +18,26 @@ typedef enum {
     HA_POLL_SLOW,         /* 60 秒兜底一致性检查（明文 ws:// 已接管，无 TLS 开销） */
     HA_POLL_PAUSED,       /* 暂停并释放常驻 HTTP/TLS（wss:// 已接管，只留一条 TLS） */
 } ha_client_poll_mode_t;
+
+/* -------------------------------------------------------------------------
+ * 空调实体的模式表
+ *
+ * 每台空调的 hvac_modes / fan_modes 都是“定长小集合”（HA 最多给 6 个），
+ * 所以按 6 × 12 的定长数组存，而不是以前那两条 80 字节的逗号串：
+ * 12 刚好放得下最长的 "medium high"（11 + '\0'）。
+ * preset_modes 界面不显示，只记“这台机器支持哪些预设”，用 1 字节位图，
+ * 不占定长数组（24 个实体 × 60 字节 = 1.4KB 内部 RAM，不值得）。
+ * ------------------------------------------------------------------------- */
+#define HA_MODE_MAX   6      /* hvac_modes / fan_modes 最多记 6 个 */
+#define HA_MODE_LEN   12     /* 单个模式名最长 11 字符 + 结尾 0 */
+#define HA_FAN_LEN    16     /* 当前 fan_mode（原样字符串，直接回传给 HA） */
+
+#define HA_PRESET_ECO    0
+#define HA_PRESET_AWAY   1
+#define HA_PRESET_BOOST  2
+#define HA_PRESET_NONE   3
+#define HA_PRESET_SLEEP  4
+#define HA_PRESET_COUNT  5
 
 typedef struct {
     char entity_id[96];
@@ -38,9 +59,37 @@ typedef struct {
     float cur_temp;        /* 当前温度 */
     float target_temp;     /* 目标温度 */
     float min_temp, max_temp;
-    char hvac_modes[80];   /* 逗号分隔，如 "off,cool,heat" */
-    char fan_modes[80];
+    /* target_temp_step：每台机器都不一样（这台 1，另一台可能 0.5），
+       旋钮/圆环/小数位全按它来；缺省 1。 */
+    float temp_step;
+    char fan_mode[HA_FAN_LEN];   /* 当前风速（原样回传，如 "medium low"） */
+    char hvac_modes[HA_MODE_MAX][HA_MODE_LEN];  /* 只存 HA 报上来的，如 auto/cool/heat/dry/fan_only/off */
+    char fan_modes[HA_MODE_MAX][HA_MODE_LEN];
+    uint8_t hvac_mode_count;
+    uint8_t fan_mode_count;
+    uint8_t preset_mask;         /* bit i = 支持 HA_PRESET_*，只占 1 字节（界面不显示）*/
 } ha_entity_t;
+
+/** 这台空调是否支持某个预设模式（下标见 HA_PRESET_*）。*/
+static inline bool ha_entity_has_preset(const ha_entity_t *e, int preset)
+{
+    return e != NULL && preset >= 0 && preset < HA_PRESET_COUNT &&
+           (e->preset_mask & (1u << preset)) != 0;
+}
+
+/** 这台空调的 hvac_modes 里有没有 mode（"cool" / "fan_only" …）。*/
+static inline bool ha_entity_has_hvac_mode(const ha_entity_t *e, const char *mode)
+{
+    if (e == NULL || mode == NULL) {
+        return false;
+    }
+    for (int i = 0; i < e->hvac_mode_count && i < HA_MODE_MAX; i++) {
+        if (strcmp(e->hvac_modes[i], mode) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /** 读取 settings 里的 HA 地址/令牌，创建 HTTP 客户端。 */
 esp_err_t ha_client_init(void);

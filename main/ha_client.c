@@ -330,12 +330,16 @@ static bool json_float_in(const char *start, const char *end, const char *key, f
     return true;
 }
 
-/** 找 "key": ["a","b",...]，拼成逗号分隔串 */
-static bool json_str_array_in(const char *start, const char *end, const char *key,
-                              char *out, size_t out_len)
+/**
+ * 找 "key": ["a","b",...]，把每一项塞进定长二维数组（每项最多 HA_MODE_LEN-1 字符）。
+ * 返回个数。空调的 hvac_modes / fan_modes 用它：按"HA 报上来的顺序"存，
+ * 界面自己再按固定顺序过滤，不需要字符串拼接，也不用二次 strtok。
+ */
+static int json_str_list_in(const char *start, const char *end, const char *key,
+                            char (*out)[HA_MODE_LEN], int max_n)
 {
-    if (start == NULL || out_len < 2) {
-        return false;
+    if (start == NULL || out == NULL || max_n <= 0) {
+        return 0;
     }
     if (end == NULL) {
         end = start + strlen(start);
@@ -344,32 +348,29 @@ static bool json_str_array_in(const char *start, const char *end, const char *ke
     snprintf(pattern, sizeof(pattern), "\"%s\":[", key);
     const char *p = strstr(start, pattern);
     if (p == NULL || p >= end) {
-        return false;
+        return 0;
     }
     p += strlen(pattern);
-    out[0] = '\0';
-    size_t used = 0;
-    while (p < end && *p != ']') {
+    int n = 0;
+    while (p < end && *p != ']' && n < max_n) {
         if (*p == '"') {
             const char *q = strchr(p + 1, '"');
             if (q == NULL || q >= end) {
                 break;
             }
-            const size_t n = (size_t)(q - p - 1);
-            if (used + n + 2 < out_len) {
-                if (used > 0) {
-                    out[used++] = ',';
-                }
-                memcpy(out + used, p + 1, n);
-                used += n;
-                out[used] = '\0';
+            size_t len = (size_t)(q - p - 1);
+            if (len > HA_MODE_LEN - 1) {
+                len = HA_MODE_LEN - 1;
             }
+            memcpy(out[n], p + 1, len);
+            out[n][len] = '\0';
+            n++;
             p = q + 1;
         } else {
             p++;
         }
     }
-    return out[0] != '\0';
+    return n;
 }
 
 static bool json_str_in(const char *start, const char *end, const char *key, char *out, size_t out_len)
@@ -426,6 +427,7 @@ esp_err_t ha_client_register(const char *entity_id, const char *label)
     }
     e->valid = true;
     e->fresh = false;
+    e->temp_step = 1.0f;      /* 空调每格默认 1°C；HA 报 target_temp_step 后按实体改 */
     strcpy(e->state, "?");
     s_count++;
     return ESP_OK;
@@ -501,6 +503,11 @@ esp_err_t ha_client_init(void)
 /* 全量刷新                                                                    */
 /* ------------------------------------------------------------------------- */
 
+/** preset_modes 的固定清单：位图下标 i 对应 k_preset_names[i]（和 ha_client.h 的 HA_PRESET_* 对齐）。*/
+static const char *const k_preset_names[HA_PRESET_COUNT] = {
+    "eco", "away", "boost", "none", "sleep",
+};
+
 /** 把 attributes（name/unit/灯/空调字段）合并进实体；state 本身由调用者处理。 */
 static void apply_attributes(ha_entity_t *e, const char *obj_start, const char *obj_end)
 {
@@ -569,14 +576,47 @@ static void apply_attributes(ha_entity_t *e, const char *obj_start, const char *
         if (json_float_in(obj_start, obj_end, "max_temp", &fv)) {
             e->max_temp = fv;
         }
+        /* target_temp_step：这台机器每格多少（0.5 还是 1）。只在 HA 给出合法值时改，
+           否则保留上一次的值——有的模式下 HA 会漏掉这个字段，不能因此把 0.5 抹成 1。 */
+        if (json_float_in(obj_start, obj_end, "target_temp_step", &fv) &&
+            fv >= 0.05f && fv <= 5.0f) {
+            e->temp_step = fv;
+        }
+        if (e->temp_step < 0.05f) {
+            e->temp_step = 1.0f;              /* 从没报过：按 1 */
+        }
         if (e->min_temp < 5.0f) {
             e->min_temp = 16.0f;
         }
         if (e->max_temp < 10.0f) {
             e->max_temp = 30.0f;
         }
-        json_str_array_in(obj_start, obj_end, "hvac_modes", e->hvac_modes, sizeof(e->hvac_modes));
-        json_str_array_in(obj_start, obj_end, "fan_modes", e->fan_modes, sizeof(e->fan_modes));
+        if (e->max_temp <= e->min_temp) {
+            e->max_temp = e->min_temp + 1.0f; /* 脏数据兜底：至少留一格 */
+        }
+        json_str_in(obj_start, obj_end, "fan_mode", e->fan_mode, sizeof(e->fan_mode));
+        const int nh = json_str_list_in(obj_start, obj_end, "hvac_modes",
+                                        e->hvac_modes, HA_MODE_MAX);
+        if (nh > 0) {
+            e->hvac_mode_count = (uint8_t)nh;
+        }
+        const int nf = json_str_list_in(obj_start, obj_end, "fan_modes",
+                                        e->fan_modes, HA_MODE_MAX);
+        if (nf > 0) {
+            e->fan_mode_count = (uint8_t)nf;
+        }
+        /* preset_modes 界面暂时不显示，只记能力位（eco/away/boost/none/sleep）。 */
+        char pm[HA_MODE_MAX][HA_MODE_LEN];
+        const int np = json_str_list_in(obj_start, obj_end, "preset_modes", pm, HA_MODE_MAX);
+        uint8_t mask = 0;
+        for (int i = 0; i < np; i++) {
+            for (int k = 0; k < HA_PRESET_COUNT; k++) {
+                if (strcmp(pm[i], k_preset_names[k]) == 0) {
+                    mask = (uint8_t)(mask | (1u << k));
+                }
+            }
+        }
+        e->preset_mask = mask;
     }
 }
 
