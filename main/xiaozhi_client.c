@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file xiaozhi_client.c
  * @brief 小智 AI 服务端接入：OTA 发现 + WebSocket hello + Opus 音频双向流。
  *
@@ -1013,7 +1013,9 @@ static void handle_server_hello(const cJSON *root)
     s_error = false;
     xz_think_clear();
     set_status("已连接");
-    stream_start();          /* 起编解码任务（上下行都靠它；开麦等界面点了才发） */
+    /* 音频流按需启动：不在这里起，等用户在小智页点「轻触说话」时再 stream_start()，
+       避免开机/连上就把 Opus 编解码和两条任务拉起来（内存紧张时会崩）。 */
+    ESP_LOGI(TAG, "握手完成，音频流按需启动（点小智页开始说话）");
 }
 
 static void handle_text_message(const char *json)
@@ -1431,6 +1433,15 @@ bool xiaozhi_listen_start(void)
     if (!s_ready) {
         ESP_LOGW(TAG, "手动开麦被拒：还没连上服务端（%s）", xiaozhi_client_status_text());
         return false;
+    }
+    /* 第一次点「轻触说话」时才启动音频流（stream_start 是幂等的） */
+    if (!s_sender_alive || !s_player_alive) {
+        ESP_LOGI(TAG, "按需启动音频流 …");
+        stream_start();
+        if (!s_sender_alive) {
+            ESP_LOGE(TAG, "上行任务没起来，放弃开麦");
+            return false;
+        }
     }
     s_listen_req = 1;       /* 上行任务看到就发 listen start，界面线程不等网络 */
     ESP_LOGI(TAG, "手动开麦已排队");
