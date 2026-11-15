@@ -1,4 +1,4 @@
-﻿/*
+/*
  * orbis-f118 · 360×360 圆屏（ESP32-S31 / JC3636F118）
  *
  * 硬件初始化沿用原来的写法（背光 / LCD / LVGL / 触摸 / 编码器 / 触觉 / 电池 / 网络）。
@@ -399,7 +399,7 @@ static void encoder_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
        硬件实测顺时针时 diff < 0；若换成反相编码器，只改这一行的 ? 分支即可。 */
     if (diff != 0) {
         const int dir = (diff < 0) ? 1 : -1;
-        const bool adjusting = ui_home_detail_knob(dir);
+        const bool adjusting = ui_home_detail_knob(-dir);
         if (ui_home_detail_open()) {
             ESP_LOGD(TAG, "旋钮: diff=%d 顺时针方向=%d 调值=%d", diff, dir, (int)adjusting);
         }
