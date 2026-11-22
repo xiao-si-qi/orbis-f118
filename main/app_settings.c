@@ -1,5 +1,5 @@
-/*
- * 设备配置：NVS 持久化（从 orbis-panel/main/app_settings.c 移植）。
+﻿/*
+ * 设备配置：NVS 持久化（从 orbis-w518/main/app_settings.c 移植）。
  *
  * 首次开机把 secrets.h 的值写进 NVS；之后配网页面（web.c）写入的配置优先。
  * 所有写操作都要能容忍 NVS 写满/写坏：日志里报警，内存里的值照常生效，

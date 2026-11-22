@@ -2,7 +2,7 @@
  * orbis-f118 · 360×360 圆屏（ESP32-S31 / JC3636F118）
  *
  * 硬件初始化沿用原来的写法（背光 / LCD / LVGL / 触摸 / 编码器 / 触觉 / 电池 / 网络）。
- * 界面改用从 orbis-panel 移植过来的 ui_home：
+ * 界面改用从 orbis-w518 移植过来的 ui_home：
  *   - JSON 布局页（HA 下发）+ 固件内置 System 页
  *   - 灯详情（开关/亮度/色温）、传感器折线、空调页都在 ui_home.c 里
  *
@@ -386,7 +386,7 @@ static void battery_task(void *arg)
 int battery_raw_value(void) { return s_bat_raw; }
 int battery_raw_peak(void) { return s_bat_raw_max; }
 
-/* ---------------- 界面：ui_home（从 orbis-panel 移植） ---------------- */
+/* ---------------- 界面：ui_home（从 orbis-w518 移植） ---------------- */
 
 static lv_group_t *s_group;          /* 编码器用的按键组（ui_home 未使用，留空表） */
 static volatile bool s_log_on;       /* 串口日志是否同时推 MQTT */

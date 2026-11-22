@@ -1,5 +1,5 @@
 ﻿/*
- * 网页配置后台（从 orbis-panel/main/wifi_manager.c 的配网部分移植）
+ * 网页配置后台（从 orbis-w518/main/wifi_manager.c 的配网部分移植）
  *
  *   http://<设备IP>/            配网表单（Wi-Fi / HA / MQTT / 设备名 / 登录口令）
  *   http://<设备IP>/save        POST：写 NVS 后重启

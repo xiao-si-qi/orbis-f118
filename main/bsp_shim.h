@@ -1,7 +1,7 @@
-#pragma once
+﻿#pragma once
 
 /*
- * 从 orbis-panel（ESP32-S3）移植到 orbis-f118（ESP32-S31）时加的一层兼容 shim。
+ * 从 orbis-w518（ESP32-S3）移植到 orbis-f118（ESP32-S31）时加的一层兼容 shim。
  *
  * 旧工程 ui_home.c 通过 bsp_display_set_backlight() 调背光；新工程的背光仍然由
  * main.c 的 backlight_init() 用 LEDC（LOW_SPEED / channel 0 / 10bit / PIN_BL）

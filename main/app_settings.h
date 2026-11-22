@@ -1,7 +1,7 @@
-#pragma once
+﻿#pragma once
 
 /*
- * 设备配置（NVS 持久化，从 orbis-panel 移植）。
+ * 设备配置（NVS 持久化，从 orbis-w518 移植）。
  *
  * 取值优先级：NVS > secrets.h 默认值。
  * 第一次开机（NVS 里没有这些键）时把 secrets.h 的值写进 NVS，所以刚烧完的板子
