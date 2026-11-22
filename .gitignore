@@ -1,5 +1,20 @@
-﻿build/
+# build outputs
+build/
+build_*/
+managed_components/
+
+# sdkconfig is generated from sdkconfig.defaults
 sdkconfig
 sdkconfig.old
+
+# local secrets — never commit (see main/secrets.h.example)
+main/secrets.h
+
+# logs / scratch
 *.log
-managed_components/
+new_size.*
+old_size.*
+size_*.json
+shot_*.jpg
+ui_*.jpg
+v_*.jpg

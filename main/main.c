@@ -48,6 +48,7 @@
 #include "layout.h"
 #include "bg_image.h"
 #include "ui_home.h"
+#include "screenshot.h"    /* 远程调试：整屏截图（MQTT/串口）+ 翻页命令 */
 #include "log_buffer.h"
 #include "ota.h"
 #include "voice_audio.h"      /* 音频自检（MQTT 的 audio_test 命令 / 小智页按钮） */
@@ -97,6 +98,9 @@ static bool on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_d
 
 static void lv_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
+    /* 截图：没在抓屏时这里只是一次 bool 判断；在抓屏时把这块拷进整屏缓冲 */
+    screenshot_flush_hook(area, px_map);
+
     s_flush_done = false;
     esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, px_map);
 
@@ -642,6 +646,65 @@ static void apply_cmd(const char *json)
             }
         }
 
+    } else if (strcmp(cmd, "screenshot") == 0) {
+        /* 远程看图：{cmd:"screenshot"} → 整屏抓一张，硬件 JPEG 编码，
+           base64 分片发到 switchyard/<dev>/shot[/<id>/<i>]。
+           可选 "quality":1-100、"delay":ms（默认 250，等翻页/开页的滑动动画走完）。
+           抓屏在 LVGL 任务里（一次整屏重绘），编码/上传在独立任务里。 */
+        const cJSON *jq = cJSON_GetObjectItemCaseSensitive(root, "quality");
+        const cJSON *jd = cJSON_GetObjectItemCaseSensitive(root, "delay");
+        const cJSON *jo = cJSON_GetObjectItemCaseSensitive(root, "order");
+        screenshot_capture(false,
+                           cJSON_IsNumber(jq) ? (int)jq->valuedouble : 0,
+                           cJSON_IsNumber(jd) ? (int)jd->valuedouble : -1,
+                           cJSON_IsNumber(jo) ? (int)jo->valuedouble : 0);
+
+    } else if (strcmp(cmd, "shot_serial") == 0) {
+        /* 同一张图改走串口 base64（===IMG BEGIN ...=== / seq,b64 / ===IMG END===）。
+           单独一条命令：平时绝不打印，免得把串口日志冲掉。115200 下约 3-5 秒。 */
+        const cJSON *jq = cJSON_GetObjectItemCaseSensitive(root, "quality");
+        const cJSON *jd = cJSON_GetObjectItemCaseSensitive(root, "delay");
+        const cJSON *jo = cJSON_GetObjectItemCaseSensitive(root, "order");
+        screenshot_capture(true,
+                           cJSON_IsNumber(jq) ? (int)jq->valuedouble : 0,
+                           cJSON_IsNumber(jd) ? (int)jd->valuedouble : -1,
+                           cJSON_IsNumber(jo) ? (int)jo->valuedouble : 0);
+
+    } else if (strcmp(cmd, "open") == 0) {
+        /* 打开灯 / 空调 / 风扇详情页（灯和风扇的详情页就是点卡片那条路），
+           或 weather.* → 天气页：{cmd:"open",entity:"light.xxx"}。
+           截图对它没有任何额外要求：详情页也是活动屏上的对象。 */
+        const cJSON *je = cJSON_GetObjectItemCaseSensitive(root, "entity");
+        if (cJSON_IsString(je) && je->valuestring[0] != '\0') {
+            screenshot_open_entity(je->valuestring);
+        } else {
+            ESP_LOGW(TAG, "open 缺少 entity（例：{\"cmd\":\"open\",\"entity\":\"light.xxx\"}）");
+        }
+
+    } else if (strcmp(cmd, "close") == 0) {
+        /* 关掉详情页 / 天气页，回到卡片页（= 左边缘右滑） */
+        screenshot_close_overlay();
+
+    } else if (strcmp(cmd, "page") == 0) {
+        /* 翻页：{cmd:"page","value":N}（0 基）或 "next" / "prev"。
+           数字 N 会先关掉详情/天气/折线子页面，再 goto_first + N 次 page_step(+1)，
+           分轮次走（每步等 220 ms 滑动动画）。 */
+        const cJSON *jv = cJSON_GetObjectItemCaseSensitive(root, "value");
+        if (cJSON_IsNumber(jv)) {
+            screenshot_goto_page((int)jv->valuedouble);
+        } else if (cJSON_IsString(jv) && jv->valuestring != NULL) {
+            if (strcmp(jv->valuestring, "next") == 0) {
+                screenshot_page_step(+1);
+            } else if (strcmp(jv->valuestring, "prev") == 0) {
+                screenshot_page_step(-1);
+            } else {
+                ESP_LOGW(TAG, "page 的 value 只认数字 / \"next\" / \"prev\"（收到 \"%s\"）",
+                         jv->valuestring);
+            }
+        } else {
+            ESP_LOGW(TAG, "page 缺少 value（数字 / \"next\" / \"prev\"）");
+        }
+
     } else if (strcmp(cmd, "get") == 0) {
         /* TODO(port): 旧工程用 mqtt_link 把 NVS 里的布局原样发回 cfg 主题；
            net.c 目前只提供 state 发布，没有"发到 cfg 主题"的接口，这里先不支持。 */
@@ -779,6 +842,7 @@ void app_main(void)
         flush_watchdog();
         uint32_t d = lv_timer_handler();
         net_mqtt_tick();          /* 连上后立刻发布 meta 并订阅，不等心跳 */
+        screenshot_tick();        /* 翻页命令的状态机（每步等 220 ms 滑动动画） */
 
         /* 配置页：断线重连 / 启动时失败的话在这里补起（已在跑就是空操作） */
     #if CONFIG_APP_WEB_ENABLED

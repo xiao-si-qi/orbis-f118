@@ -43,15 +43,26 @@ bool ui_home_detail_knob(int delta);
 /** 子页面是否打开（滑动翻页要避让）。 */
 bool ui_home_detail_open(void);
 
-/** 显示传感器折线图（由后台任务取完历史后调用，必须在 LVGL 线程）。 */
+/** 【已废弃 / ABI 桩】历史曲线已从设计稿移除：这个函数只打一条警告、什么都不做。
+ *  main.c 的 MQTT 调试命令还在调用它，所以符号必须保留。 */
 void ui_home_show_chart(const char *entity_id, const float *vals, int n,
                         float vmin, float vmax, float vavg);
 
-/** 关闭折线图。 */
+/** 【已废弃 / ABI 桩】没有历史页可关：空实现（screenshot.c / assistant_ui.c 还在调）。 */
 void ui_home_close_chart(void);
 
-/** 折线图是否打开。 */
+/** 【已废弃 / ABI 桩】永远返回 false（历史曲线已取消）。 */
 bool ui_home_chart_open(void);
+
+/** 打开天气页（实况 + 逐小时 + 逐日，整页纵向滚动）。点天气卡片时内部调用；
+ *  也留给 MQTT / 调试用。打开后旋钮归它：页内滚动，不再翻页。 */
+void ui_home_weather_show(const char *entity_id);
+
+/** 关闭天气页（左边缘右滑也会走这里）。 */
+void ui_home_weather_hide(void);
+
+/** 天气页是否打开（旋钮 / 翻页 / 手势都要避让）。 */
+bool ui_home_weather_open(void);
 
 /** 打开空调页（温度弧 / 模式键 / 风速 / 电源）。和灯共用一个详情页。 */
 void ui_home_open_climate(const char *entity_id);

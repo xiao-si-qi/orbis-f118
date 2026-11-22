@@ -64,6 +64,8 @@ typedef struct {
        旋钮/圆环/小数位全按它来；缺省 1。 */
     float temp_step;
     char fan_mode[HA_FAN_LEN];   /* 当前风速（原样回传，如 "medium low"） */
+    char swing_mode[16];         /* 当前摆风模式（default / full_swing / …）*/
+    bool has_full_swing;         /* supported：attrs 里出现过 full_swing */
     /* ---- 空调 / 风扇共用一块「模式名」存储 ----
      * climate.* 用 hvac_modes / fan_modes（外加两个计数和 preset_mask）；
      * fan.*     用 preset_modes（这台风扇支持的预设，原样字符串，直接回传 HA，
@@ -89,7 +91,86 @@ typedef struct {
     char preset_mode[16];        /* 当前预设（原样，如 "自然风"）*/
     bool oscillating;            /* 摇头（HA 的 oscillating）*/
     bool has_percentage;         /* 是否真的拿到过 percentage（没拿到就别显示 0%）*/
+    /* ---- 天气实体（其它实体保持 0）----
+     * HA 的 weather.* 只有一份"实况"，没有预报（预报见下面的 ha_wx_forecast_t）。
+     * 温度类字段一律存 ×10 的整数，浮点只在上面的解析函数里出现一次：
+     * 24 个实体的定长表 → 29 字节/实体（对齐后 32），全表多 768 字节 .bss。 */
+    int16_t wx_temp10;           /* 温度 ×10（-40.0 .. 60.0）*/
+    int16_t wx_feel10;           /* 体感温度 ×10 */
+    int16_t wx_dew10;            /* 露点 ×10 */
+    int16_t wx_press;            /* 气压 hPa */
+    uint8_t wx_humidity;         /* 湿度 % */
+    uint8_t wx_cloud;            /* 云量 % */
+    uint8_t wx_wind_kmh;         /* 风速 km/h */
+    uint8_t wx_vis_km;           /* 能见度 km */
+    uint8_t wx_kind;             /* ha_wx_kind_t（由 state 里的 condition 机器码映射）*/
+    uint8_t wx_valid;            /* 至少拿到过一次温度（否则界面显示 -- ）*/
+    char wx_wind_bearing[16];    /* 风向，HA 已经是中文（如"东北风"）*/
 } ha_entity_t;
+
+/* -------------------------------------------------------------------------
+ * 天气预报（weather.get_forecasts）
+ *
+ * 实况在 weather.* 的属性里（上面的 wx_* 字段），预报要单独调一次
+ * POST /api/services/weather/get_forecasts?return_response=true：
+ *   {"entity_id":"weather.x","type":"hourly"} → 24 条，
+ *   {"entity_id":"weather.x","type":"daily"}  → 7 条（逐日没有降水概率）。
+ * 界面只用 6 条逐小时 + 3 条逐日，所以在 HA 任务里抓完就截断，存成下面这个
+ * ~90 字节的小结构（远小于 1 KB），LVGL 线程只读一份拷贝。
+ * 刷新节奏由轮询任务控制：成功 30 分钟一次，失败 5 分钟重试。
+ * ------------------------------------------------------------------------- */
+#define HA_WX_HOURLY 6
+#define HA_WX_DAILY  3
+
+/** HA 的 condition 机器码归并成 12 种（界面按它画图标 / 写中文）。*/
+typedef enum {
+    HA_WX_SUNNY = 0,
+    HA_WX_CLEAR_NIGHT,
+    HA_WX_PARTLY,
+    HA_WX_CLOUDY,
+    HA_WX_RAIN,
+    HA_WX_POURING,
+    HA_WX_LIGHTNING,
+    HA_WX_SNOW,
+    HA_WX_SNOWY_RAIN,
+    HA_WX_FOG,
+    HA_WX_WINDY,
+    HA_WX_HAIL,
+    HA_WX_KIND_MAX
+} ha_wx_kind_t;
+
+typedef struct {
+    uint8_t hour;     /* 0..23（界面写 "21时"）*/
+    int8_t  temp;     /* °C */
+    uint8_t pop;      /* 降水概率 % */
+    uint8_t kind;     /* ha_wx_kind_t */
+} ha_wx_hour_t;
+
+typedef struct {
+    uint8_t day_off;  /* 距今天几天：0 / 1 / 2 */
+    uint8_t weekday;  /* 0=周日 .. 6=周六 */
+    int8_t  tmax;
+    int8_t  tmin;
+    uint8_t kind;
+} ha_wx_day_t;
+
+typedef struct {
+    ha_wx_hour_t hour[HA_WX_HOURLY];
+    int hour_n;
+    ha_wx_day_t day[HA_WX_DAILY];
+    int day_n;
+    bool ok;          /* 至少成功抓过一次 */
+    uint32_t stamp_s; /* 上次成功的 unix 时间（0 = 从没成功）*/
+} ha_wx_forecast_t;
+
+/** HA 的 condition 机器码 → ha_wx_kind_t（大小写不敏感，未知归到 HA_WX_CLOUDY）。*/
+ha_wx_kind_t ha_wx_kind_of(const char *condition);
+
+/** 抓一次预报（hourly + daily 各一条 POST）。只能在 HA 轮询任务里调用。 */
+esp_err_t ha_client_weather_forecast(const char *entity_id);
+
+/** 线程安全地拷一份预报缓存（LVGL 线程用）。没有数据返回 false。 */
+bool ha_client_weather_forecast_copy(ha_wx_forecast_t *out);
 
 /** 这台空调是否支持某个预设模式（下标见 HA_PRESET_*）。*/
 static inline bool ha_entity_has_preset(const ha_entity_t *e, int preset)

@@ -41,6 +41,10 @@
 /* 旧工程用的是 lv_font_noto_18_cjk（LVGL 9.2 专用）；新工程只有 lv_font_cjk16
    （16px / 4bpp，GB2312 + ASCII，自带 montserrat_20 兜底）。 */
 LV_FONT_DECLARE(lv_font_cjk16);
+/* 大号数字字体：64 号 / 4bpp / 只含 0-9 . % ° - : 和空格（lv_font_conv 生成，
+   Bahnschrift；数字高 46px、行高 47px）。灯光/风扇/天气三个页面的大号数值用它，
+   设计稿里那是 92px（≈66px 字高）——只差字号，字形和字重都对齐了。 */
+LV_FONT_DECLARE(lv_font_num64);
 
 static const char *TAG = "ui";
 
@@ -67,11 +71,17 @@ static inline void ui_obj_set_flags(lv_obj_t *obj, lv_obj_flag_t f, bool en)
 
 #define MAX_PAGES (LAYOUT_MAX_PAGES + 2) /* JSON 页 + 设置页（合并系统状态/蓝牙/音频）+ 小智 AI 页 */
 
-#define CARD_W    140
-#define CARD_H    90
-#define CARD_GAP  12
-#define GRID_TOP  84
-#define GRID_LEFT 34
+/* 卡片几何：逐条对齐设计稿 .grid2 / .card
+   （网格左上 (34,88)、2 列 140px、间距 12、卡片 140x90 圆角 18）。 */
+#define CARD_W       140
+#define CARD_H        90
+#define CARD_GAP      12
+#define CARD_RADIUS   18
+#define CARD_ICON     19    /* .card .ic：19x19，左上角 (12,10) */
+#define CARD_DOT       5    /* .card .dot：5x5，右上角 (12,14) */
+#define CARD_PAD_X    12    /* .card padding: 10px 12px */
+#define GRID_TOP      88    /* .grid2 top:88 */
+#define GRID_LEFT     34    /* .grid2 left:34 */
 
 #define COLOR_BG        lv_color_hex(0x000000)
 #define COLOR_CARD      lv_color_hex(0x1C1C1E)
@@ -83,13 +93,35 @@ static inline void ui_obj_set_flags(lv_obj_t *obj, lv_obj_flag_t f, bool en)
 #define COLOR_BAD       lv_color_hex(0xFF453A)
 #define COLOR_ACCENT    lv_color_hex(0x2563EB)
 
+/* 卡片的"域"：决定左上角图标、语义色、有没有状态点（设计稿 CARD LIBRARY 的 12 类）。
+   只用来决定**怎么画**，不决定点一下干什么——点击仍然走 tile_clicked_cb 的
+   "light/climate/fan 开详情页、weather 开天气页、其它 toggle/sensor" 那套。 */
+typedef enum {
+    TILE_DOM_LIGHT = 0,
+    TILE_DOM_CLIMATE,
+    TILE_DOM_FAN,
+    TILE_DOM_COVER,
+    TILE_DOM_SWITCH,      /* switch. / input_boolean. / lock. / 未知可开关实体 */
+    TILE_DOM_MEDIA,
+    TILE_DOM_SENSOR,
+    TILE_DOM_BINARY,
+    TILE_DOM_WEATHER,
+    TILE_DOM_SCENE,       /* scene. / script. */
+    TILE_DOM_AUTO,        /* automation. */
+} tile_dom_t;
+
 typedef struct {
     lv_obj_t *card;
-    lv_obj_t *label;
-    lv_obj_t *value;
-    lv_obj_t *dot;
+    lv_obj_t *label;      /* 标题（左下，cjk16 #8B95A8）*/
+    lv_obj_t *value;      /* 数值 / 状态（左侧，montserrat_28 / cjk16）*/
+    lv_obj_t *unit;       /* 单位（数值右边，montserrat_20 #97A1B3）*/
+    lv_obj_t *icon;       /* 左上角 19x19 图标 */
+    lv_obj_t *dot;        /* 右上角 5x5 状态点（sensor/scene/weather 没有）*/
+    lv_color_t icon_col;  /* 图标当前颜色（自绘回调读它）*/
+    uint8_t icon_alt;     /* 图标变体：传感器里 % 的（湿度）画水滴，其它画温度计 */
     char entity[96];
     tile_type_t type;
+    tile_dom_t dom;
 } tile_widget_t;
 
 static layout_t s_layout;
@@ -108,6 +140,7 @@ static lv_obj_t *s_wifi_icon;      /* 状态栏：WiFi 信号弧（自绘） */
 static lv_color_t s_wifi_color;
 static int s_wifi_level;      /* 0..3 格 */
 static lv_obj_t *s_ha_icon;        /* 状态栏：HA 房子图标（在线蓝 / 离线灰） */
+static lv_obj_t *s_batt_icon;      /* 状态栏：电量图标（本板无校准 → 未知态）*/
 static lv_obj_t *s_hint;
 static lv_timer_t *s_refresh_timer;
 
@@ -158,6 +191,7 @@ static lv_obj_t *s_detail_off_hint;              /* 关灯时露出的「已关�
 /* 焦点提示（见 detail_apply_focus）：环上"当前值"小圆点 + 环心下方那行小字 */
 static lv_obj_t *s_detail_marker;
 static lv_obj_t *s_detail_hint;
+static lv_obj_t *s_detail_name_row;   /* 名字行：图标 + 名字的 flex 容器 */
 static char s_detail_hint_shown[16];
 static bool s_detail_visible;
 
@@ -208,6 +242,135 @@ static bool s_detail_visible;
    --gc-sections 丢掉）的那套字；引用它会让 .rodata 多 ~37.5KB flash。
    想省 flash 就换成 &lv_font_montserrat_20（标题/卡片已经在用，0 成本）。 */
 #define DETAIL_PCT_FONT  (&lv_font_montserrat_28)
+/* 大号数字：64 号数字专用字体（数字 46px 高、行高 47px），灯光 / 风扇 / 天气用它；
+   空调页那一列（名字/图标/温度/室内/风速）纵向太挤，继续用 montserrat_28。 */
+#define BIG_NUM_FONT     (&lv_font_num64)
+
+/* ---- 灯光页（s_detail 第一种形态）：几何 / 配色逐条对齐设计稿 index.html ----
+ * 设计稿 .scr[data-scr="light"]：一条环 + 上中下三段式，没有内环、没有开关：
+ *   名字行（灯泡 16px + 6px 间距 + 名字）          top 74
+ *   大号数值（92px）                               top 112..191
+ *   % / K 单位（28px，opacity .72）                和数值同一行
+ *   档位文字「亮度 / 色温」（16px，字距 .24em）      top 202
+ *   控件行（分段控件 + 40x40 电源键）               top 230
+ *   提示行（16px，字距 .12em）                      top 288
+ * 环：设计稿 r=156 / stroke 10；LVGL 的 arc 半径是"外径"、线宽向内画，
+ * 所以取 161 = 156 + 10/2。环心 = 屏幕中心 (180,180)（设计稿 cx=cy=180），
+ * 270° 弧从 135° 起、缺口朝下（DETAIL_ANG_START/END 已经是这组数）。
+ *
+ * 字号：设计稿的 92px 数字在固件里没有对应字（工程只编了 montserrat 14/20/28，
+ * 且不允许新增字体），大号数值改用 montserrat_28，并把它摆到设计稿那段
+ * 92px 字块的中心（112..191 → 中心 151）——数字变小，但重心和留白一致。
+ * 字母间距（letter-spacing）用 LVGL 的 text_letter_space 还原：
+ *   档位文字 .24em ≈ 4px，提示行 .12em ≈ 2px，名字行 .06em ≈ 1px。
+ */
+#define LIGHT_R             161    /* 环外径 = 156 + 10/2 */
+#define LIGHT_W              10    /* 描边宽度（设计稿 stroke-width:10）*/
+#define LIGHT_CY            180    /* 环心 y = 屏幕中心 */
+#define LIGHT_GLOW_R        168    /* 弧外柔光（设计稿的 drop-shadow 近似）*/
+#define LIGHT_GLOW_W         22
+#define LIGHT_NAME_Y         66    /* 名字行（图标 + 文字）顶边 */
+#define LIGHT_ICON           16    /* 名字行左侧灯泡图标（设计稿 .l-name .ic）*/
+#define LIGHT_VALUE_Y       128    /* 大号数值顶边（64 号字体：46px 字高 / 47px 行高
+                                      → 墨迹 129..174，中心 151，和设计稿 92px 字块的
+                                      中心（112..191 → 151）对齐）*/
+#define LIGHT_UNIT_DY        14    /* 单位相对数值下移：让 % 的字墨中心 ≈ 数值字墨中心（151）*/
+#define LIGHT_LABEL_Y       196    /* 档位文字顶边 */
+#define LIGHT_SEG_Y         226    /* 控件行顶边 */
+#define LIGHT_SEG_H          36    /* 分段控件外高：3 padding + 30 按钮 + 3 */
+#define LIGHT_SEG_PAD         3
+#define LIGHT_BTN_W          62    /* 单个分段按钮：2 个汉字 32 + 左右各 15 */
+#define LIGHT_BTN_H          30
+#define LIGHT_SEG_GAP         4
+#define LIGHT_SEG_W         (LIGHT_SEG_PAD * 2 + LIGHT_BTN_W * 2 + LIGHT_SEG_GAP)
+#define LIGHT_CTL_GAP        10    /* 分段控件与电源键之间（设计稿 gap:10）*/
+#define LIGHT_POWER          40    /* 电源键直径（设计稿 .p-btn 40x40）*/
+#define LIGHT_HINT_Y        282    /* 提示行顶边（设计稿 288，cjk16 高 20 → 282）*/
+#define LIGHT_MARKER_SIZE    14    /* 环上值点（设计稿 r=7.5）*/
+/* 设计稿配色：rgba(255,255,255,a) 叠在近黑底上 → 这里用"白色 + opa"保留半透明 */
+#define LIGHT_INK           lv_color_hex(0xD7DEE9)   /* .l-name             */
+#define LIGHT_INK_MUTED     lv_color_hex(0x657086)   /* .l-label            */
+#define LIGHT_HINT_INK      lv_color_hex(0x5D677A)   /* .l-hint             */
+#define LIGHT_SEG_TXT       lv_color_hex(0x78829A)   /* .l-seg 未选中       */
+#define LIGHT_SEG_TXT_ON    lv_color_hex(0xF3F6FB)   /* .l-seg 选中         */
+#define LIGHT_OFF_NUM       lv_color_hex(0x5F6879)   /* .is-off .l-temp     */
+#define LIGHT_OFF_LABEL     lv_color_hex(0x4B5464)   /* .is-off .l-label    */
+#define LIGHT_ICON_INK      lv_color_hex(0x8D97A8)   /* .l-name .ic         */
+#define LIGHT_ICON_OFF      lv_color_hex(0x5A6373)   /* .is-off .l-name .ic */
+#define LIGHT_PWR_INK       lv_color_hex(0xC9D3E2)   /* .p-btn 图标         */
+#define LIGHT_PWR_INK_ON    lv_color_hex(0x17110A)   /* .p-btn.on 图标      */
+
+/* 氛围光（设计稿 .light-bg 的径向渐变近似）：三层同心半透明圆叠出"中间亮、边缘化开"。
+   固件不支持径向渐变，只能用纯色圆叠加；透明度按 RGB565 面板的观感调过：
+   22% / 11% / 4.7%（旧值 10% / 4% 在黑底上几乎看不见，这就是"光晕不显示"的原因）。
+   颜色用**灯色/预设色的原始色相**（不是对比度处理后的 accent，那个会被推成灰白）。 */
+#define GLOW_DISC_N 3
+static const int k_glow_r[GLOW_DISC_N]   = {112, 148, 176};
+static const lv_opa_t k_glow_opa[GLOW_DISC_N] = {66, 33, 15};
+static lv_obj_t *s_glow_disc[GLOW_DISC_N];
+/* 控件行：亮度 / 色温 分段控件 + 40x40 圆形电源键（设计稿 .l-seg / .p-btn）。
+   电源键由灯光页和风扇页共用（两页不会同时出现），x 位置按页摆。 */
+static lv_obj_t *s_light_seg;
+static lv_obj_t *s_light_seg_btn[2];
+static lv_obj_t *s_light_seg_lbl[2];
+static lv_obj_t *s_dial_power;
+/* 文字/外观缓存：500ms 轮询下没变就别再 set_text / 重摆 */
+static int s_light_num_x = -1;
+static int s_light_unit_x = -1;
+static char s_light_num_shown[8];
+static char s_light_unit_shown[8];
+static char s_light_label_shown[16];
+static int8_t s_light_chip_shown = -1;   /* 分段控件/电源键上次的视觉状态 */
+static bool s_dial_pwr_on;               /* 电源键此刻该画"开"（自绘图标读它）*/
+static int8_t s_hint_y_shown = -1;       /* 提示行当前位置（灯/风扇 282，空调 246）*/
+static int s_pwr_x_shown = -1;           /* 共用电源键当前 x */
+static int s_pwr_y_shown = -1;           /* 共用电源键当前 y */
+static int s_pwr_size_shown = -1;        /* 共用电源键当前边长（40 灯/风扇、44 空调）*/
+
+/** 大号数值用哪套字体：数字/小数点走 64 号数字字体（只含 0-9 . % ° - : 空格），
+ *  "OFF" 这种字母退回 montserrat_28，中文（理论上不会出现）退回 cjk16。 */
+static const lv_font_t *big_num_font_for(const char *s)
+{
+    if (s == NULL || s[0] == '\0') {
+        return BIG_NUM_FONT;
+    }
+    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; p++) {
+        if (*p >= 0x80) {
+            return &lv_font_cjk16;
+        }
+        if (!((*p >= '0' && *p <= '9') || *p == '.')) {
+            return DETAIL_PCT_FONT;      /* OFF / -- 里的字母 */
+        }
+    }
+    return BIG_NUM_FONT;
+}
+
+static void light_place_value(void);
+static void light_apply_values(const ha_entity_t *e);
+static void light_apply_chips(bool on, bool has_tint, bool ct);
+static void detail_power_set(bool want_on);
+static void detail_set_hint_forced(const char *text);
+static void detail_place_hint(int y);
+static void detail_place_power(int size, int x, int y);
+static void detail_apply_glow(lv_color_t base, bool on);
+static void detail_set_hidden(lv_obj_t *obj, bool hidden);
+static lv_obj_t *detail_make_glow_disc(lv_obj_t *parent, int r, lv_opa_t opa, int cx, int cy);
+static void light_recenter(lv_obj_t *o, int r);
+static void light_power_draw_cb(lv_event_t *e);
+static void light_power_cb(lv_event_t *e);
+static void light_tab_cb(lv_event_t *e);
+/* 天气页（定义在 build_detail_view 前面，这里先声明给翻页 / 手势 / 旋钮用） */
+static void wx_open(const char *entity_id);
+static void wx_close(void);
+static void wx_refresh_ui(void);
+static void wx_scroll_step(int delta);
+static void build_weather_page(lv_obj_t *scr);
+/* 传感器详情页（同样定义在 build_detail_view 前面，这里先声明给点击 / 手势 / 刷新用） */
+static bool s_sens_visible;
+static void sensor_open(const char *entity_id);
+static void sensor_close(void);
+static void sensor_refresh(void);
+static void build_sensor_page(lv_obj_t *scr);
 
 /* ---- 空调详情页（和灯共用 s_detail，同一套圆盘语言）----
  *
@@ -233,47 +396,63 @@ static bool s_detail_visible;
  *   5 个模式按钮 36x24 y=284..308（环圆头最低点 y=282.7，留 1.3px）
  *   电源开关 72x32  y=314..346   （离环圆头 ~47px）
  */
-#define AC_TEMP_R          118     /* 目标温度环外径（灯是 128；这里受模式键限制）*/
-#define AC_TEMP_W           22
-#define AC_TEMP_GLOW_R     132     /* 光晕 106..132，同样露在环外 14px */
-#define AC_TEMP_GLOW_W      26
+/* 空调详情页（设计稿"屏幕 1 · 温控主界面" dial 帧），和灯/风扇同一套骨架：
+ *   环 r=156 / stroke 10 / 270°（135°→45°，缺口朝下）
+ *   88px 温度（°.deg 30px 强调色）/ 副标题「目标温度 · 室内 26.4°C」
+ *   5 个 40x40 模式键（radius 13，选中 = 模式色 15% 底 + 40% 边 + 模式色图标）
+ *   44x44 圆形电源键 / 顶部两枚胶囊（设计稿是"模式 + 风速"，这里合成"风速 + 摆风"）
+ * 本页的纵向排布（全在 r=150 文字圆内）：
+ *   名字行 60..80 / 数值 100..147（num64 字墨 101..146）/ 副标题 160..180
+ *   胶囊行 186..216（电源 179..223）/ 5 个模式键 226..266 / 提示 282..302 */
+#define AC_TEMP_R          161     /* 环外径 = 156 + 10/2（和灯 / 风扇完全一致）*/
+#define AC_TEMP_W           10
+#define AC_TEMP_GLOW_R     168     /* 弧外柔光，和灯 / 风扇同一组数 */
+#define AC_TEMP_GLOW_W      22
 #define AC_UNIT             10     /* 弧值单位：0.1°C */
-#define AC_NAME_Y          134     /* 实体名（cjk16）：环心最上面一行（比灯高 14px）*/
-#define AC_NAME_W          120     /* ~7 个汉字；空调只有一条环，内孔比灯大，能多放一个字 */
-#define AC_ICON_Y          156     /* 模式图标 28x28（给上面的实体名让出 16px）*/
-#define AC_ICON_SIZE        28
-#define AC_TEMP_Y          186     /* 中间大号目标温度（montserrat_28）*/
-#define AC_ROOM_Y          218     /* 「室内 17.0°C」 */
-#define AC_FAN_Y           242     /* 风速按钮 */
-#define AC_FAN_W            92
-#define AC_FAN_H            26
-#define AC_MODE_Y          284     /* 5 个模式按钮：36 宽 + 4 间距 = 196，x 82..278 */
-#define AC_MODE_W           36
-#define AC_MODE_H           24
-#define AC_MODE_GAP          4
-#define AC_SW_Y            314
-#define AC_SW_W             72
-#define AC_SW_H             32
+#define AC_NAME_ROW_Y       60     /* 名字行（和灯 / 风扇同一骨架，整行上移）*/
+#define AC_VALUE_Y         100     /* 大号目标温度（num64）*/
+#define AC_UNIT_DY          14     /* ° 的字墨中心和大数字对齐 */
+#define AC_ROOM_Y          160     /* 「制冷 · 室内 26.4°C」（设计稿 .d-unit）*/
+#define AC_CHIP_Y          186     /* 胶囊行（设计稿 .d-chips）*/
+#define AC_CHIP_H           30
+#define AC_FAN_W           100     /* 风速胶囊（设计稿 min-width 92，中文要多一点）*/
+#define AC_SWING_W          88     /* 摆风胶囊 */
+#define AC_CHIP_GAP          8
+#define AC_POWER            44     /* 设计稿 .d-power 44x44 */
+#define AC_POWER_GAP        10
+#define AC_MODE_Y          226     /* 5 个模式键：40x40 + gap 6 = 224，x 68..292 */
+#define AC_MODE_W           40
+#define AC_MODE_H           40
+#define AC_MODE_GAP          6
 #define AC_MODE_COUNT        5     /* 自动 / 制冷 / 制热 / 除湿 / 送风 */
 #define AC_STATE_LEN        12
 
 /* 模式配色（任务指定：制冷蓝 / 制热橙 / 除湿青 / 送风绿 / 自动灰白 / 关=暗）*/
-#define AC_COOL_HEX  0x3B82F6
-#define AC_HEAT_HEX  0xFF9F0A
-#define AC_DRY_HEX   0x2DD4BF
-#define AC_FAN_HEX   0x30D158
-#define AC_AUTO_HEX  0xE5E5EA
+#define AC_COOL_HEX  0x4C8DFF   /* 设计稿 --cool */
+#define AC_HEAT_HEX  0xFF8A3D   /* --heat */
+#define AC_DRY_HEX   0x2FD6C3   /* --dry  */
+#define AC_FAN_HEX   0x5BD97A   /* --fan  */
+#define AC_AUTO_HEX  0xB9C2D0   /* --auto */
 #define AC_OFF_HEX   0x3A3A3C
 
 static lv_obj_t *s_ac_arc;                  /* 目标温度环（可点可拖）*/
 static lv_obj_t *s_ac_glow;                 /* 同一条环的光晕 */
 static lv_obj_t *s_ac_icon;                 /* 中间：模式图标（自绘）*/
-static lv_obj_t *s_ac_temp_value;           /* 中间：大号目标温度 */
-static lv_obj_t *s_ac_room;                 /* 「室内 17.0°C」 */
-static lv_obj_t *s_ac_fan_btn;               /* 风速按钮（点一下切下一档）*/
+static lv_obj_t *s_ac_temp_value;           /* 大号目标温度（num64）*/
+static lv_obj_t *s_ac_unit;                  /* 目标温度后面的 °（模式色）*/
+static lv_obj_t *s_ac_room;                  /* 「制冷 · 室内 26.4°C」*/
+static lv_obj_t *s_ac_fan_btn;               /* 风速胶囊（点一下切下一档）*/
 static lv_obj_t *s_ac_fan_label;
+static lv_obj_t *s_ac_swing_btn;             /* 摆风胶囊（default ↔ full_swing）*/
+static lv_obj_t *s_ac_swing_label;
+static lv_obj_t *s_ac_name_icon;             /* 名字行左侧：当前模式图标 */
 static lv_obj_t *s_ac_mode_btn[AC_MODE_COUNT];
-static lv_obj_t *s_ac_mode_lbl[AC_MODE_COUNT];
+static lv_obj_t *s_ac_mode_icon[AC_MODE_COUNT];
+static lv_color_t s_ac_key_col[AC_MODE_COUNT];   /* 每个模式键图标当前颜色 */
+static char s_ac_swing_local[16];            /* 摆风：本地覆盖（HA 跟上就交还）*/
+static uint32_t s_ac_swing_local_until;
+static int s_ac_num_x = -1;                  /* 数值 / 单位当前 x（没变就不重摆）*/
+static int s_ac_unit_x = -1;
 static bool s_detail_ac;                    /* 当前详情页开的是 climate.* */
 static char s_ac_mode_shown[AC_STATE_LEN];  /* 已经上过色的模式（避免 500ms 重复重绘）*/
 static lv_color_t s_ac_accent;              /* 自绘图标读它（已过对比度处理）*/
@@ -285,7 +464,7 @@ static int8_t s_sw_style_shown = -1;        /* 开关上次刷的配色：-1=未
 /* 标签文字缓存：lv_label_set_text 不做内容比较（每次都重新 malloc + 重绘），
    500ms 轮询下必须自己比一下，否则三个标签每秒各重排两次。 */
 static char s_ac_temp_txt[16];
-static char s_ac_room_txt[28];
+static char s_ac_room_txt[48];
 static char s_ac_fan_txt[32];
 /* 本地覆盖：点了模式 / 风速之后先按本地值显示，HA 落定后交还（和灯的 6s 覆盖同一套）*/
 static char s_ac_mode_local[AC_STATE_LEN];
@@ -295,92 +474,63 @@ static uint32_t s_ac_fan_local_until;
 static int s_ac_override_t10;               /* 目标温度覆盖（0.1°C）*/
 static uint32_t s_ac_override_until;
 
-/* ---- 风扇详情页（同一个 s_detail，第三种形态，和灯 / 空调共用圆盘语言）----
+/* ---- 风扇详情页（同一个 s_detail，第三种形态，和灯共用同一套骨架）----
  *
- * 几何和空调页完全一致（圆心 (180,196)、135°→45°、单环 + 光晕），只有颜色和
- * 底部控件不同：外环 = 风速 1..100%（外径 118 / 线宽 22，光晕 106..132）。
+ * 布局照设计稿 index.html 的 .scr[data-scr="fan"]（和灯光页同一个"上中下三段"）：
+ *   名字行（风图标 + 实体名）        y=66
+ *   大号百分比 + "%"（单位）          y=136
+ *   「风速」（设计稿 .l-label）        y=196
+ *   胶囊行：预设 + 摇头 + 40x40 电源键  y=226
+ *   提示行「旋转调风速 · 左滑返回」     y=282
+ * 环：设计稿 r=156 / stroke 10 → LVGL 外径 161、线宽 10，环心 (180,180)；
+ * 颜色 = 当前预设的颜色（直吹青 / 自然绿 / 循环蓝 / 睡眠灰），没有预设就青。
  *
- * 为什么不是灯的 128：下面 y=284 那排 4 个预设键顶住了 R=128 的环圆头。
- * 圆头 = 半径 R-11 处一个半径 11 的圆，R=128 时最低点 y=289.7，压进预设键
- * （顶边 284）约 6px；R=118 时最低点 y=282.7，留 1.3px —— 和空调页同一个理由、
- * 同一组数字。预设键 40x22 放在 x=91..269 / y=284..306（离环 1.3px、离屏幕圆边
- * 25.8px）；摇头键 52x24 + 电源开关 62x28 并排放在 y=314..342 的缺口里，
- * 这两个键最近的角离屏幕圆边还有 6.1px（验算见 FAN_* 宏和 build 日志）。
- *
- * 环色 = 当前预设的颜色（直吹青 / 自然绿 / 循环蓝 / 睡眠灰），没有预设就青；
- * 页面底色 = 这个颜色压到很暗的一层（关掉就是纯黑），和空调页同一套做法。 */
-#define FAN_R              118     /* 风速环外径（灯 128 / 空调 118，和空调一致）*/
-#define FAN_W               22
-#define FAN_GLOW_R         132     /* 光晕 106..132，露在环外 14px */
-#define FAN_GLOW_W          26
-#define FAN_ICON_SIZE       24     /* 环心：自绘风扇（轮毂 + 3 片扇叶）*/
-#define FAN_ICON_Y         170
-#define FAN_PCT_Y          196     /* 大号百分比（montserrat_28），和灯同一行 */
-#define FAN_PRESET_Y       226     /* 当前预设（cjk16，次要文字）*/
-#define FAN_MODE_Y         284     /* 4 个预设键：40 宽 + 6 间距 = 178，x 91..269 */
-#define FAN_MODE_W          40
-#define FAN_MODE_H          22
-#define FAN_MODE_GAP         6
+ * 摇头：这台风扇 fan.xiaomi_cn_753076593_cfan_s_4_fan 的 supported_features=57
+ * （TURN_ON|TURN_OFF|PRESET_MODE|SET_SPEED），**没有 OSCILLATE**，所以
+ * 「摇头」胶囊按设计稿保留在原来的位置，但整颗压到 40%、不可点，代码里也没有
+ * 任何 set_oscillating 的路径（选"可见地禁用"而不是删掉，三颗控件的排布保持
+ * 和设计稿一致）。 */
+#define FAN_R              161     /* 风速环外径 = 156 + 10/2（和灯同一个环）*/
+#define FAN_W               10
+#define FAN_GLOW_R         168     /* 弧外柔光（设计稿的 drop-shadow 近似）*/
+#define FAN_GLOW_W          22
 #define FAN_MODE_COUNT       4     /* 直吹 / 自然 / 循环 / 睡眠 */
-#define FAN_OSC_W           52     /* 摇头键（在下方缺口里靠左）*/
-#define FAN_OSC_H           24
-#define FAN_OSC_Y          316
-#define FAN_OSC_DX         (-40)   /* 相对 TOP_MID 的横向偏移：和右边开关凑成一对 */
-#define FAN_SW_W            62     /* 电源开关（比空调的 72 窄，给摇头让位）*/
-#define FAN_SW_H            28
-#define FAN_SW_Y           314
-#define FAN_SW_DX           29     /* 开关中心 x = 209，摇头中心 x = 140 */
 #define FAN_PCT_STEP         5     /* 旋钮每格 5%（任务指定）*/
+/* 胶囊（设计稿 .f-chip）：高 30、圆角 15、白 4.5% 底 + 白 7% 边；预设 94 宽、
+   摇头 78 宽（设计稿 #fOsc min-width:78），间距 6，行顶 226。 */
+#define FAN_CHIP_H          30
+#define FAN_CHIP_PRESET_W   94
+#define FAN_CHIP_OSC_W      78
+#define FAN_CHIP_GAP         6
+#define FAN_CHIP_ROW_Y     226
+#define FAN_CHIP_DISABLED_OPA 102  /* 40%：不支持的胶囊压到这个亮度 */
 
 static lv_obj_t *s_fan_arc;                  /* 风速环（可点可拖）*/
 static lv_obj_t *s_fan_glow;                 /* 同一条环的光晕 */
-static lv_obj_t *s_fan_icon;                 /* 中间：自绘风扇 */
-static lv_obj_t *s_fan_pct;                  /* 中间：大号百分比 */
-static lv_obj_t *s_fan_preset;               /* 中间：当前预设（次要文字）*/
-static lv_obj_t *s_fan_mode_btn[FAN_MODE_COUNT];   /* 4 个预设键 */
-static lv_obj_t *s_fan_mode_lbl[FAN_MODE_COUNT];
-static lv_obj_t *s_fan_osc_btn;              /* 摇头键 */
-static lv_obj_t *s_fan_osc_lbl;
+static lv_obj_t *s_fan_name_icon;            /* 名字行左侧的风图标（设计稿 #i-wind）*/
+static lv_obj_t *s_fan_pct;                  /* 大号百分比 */
+static lv_obj_t *s_fan_unit;                 /* 百分比后面的 "%" */
+static lv_obj_t *s_fan_label;                /* 「风速」（设计稿 .l-label）*/
+static lv_obj_t *s_fan_chip_preset;          /* 预设胶囊（点一下换下一个）*/
+static lv_obj_t *s_fan_chip_preset_lbl;
+static lv_obj_t *s_fan_chip_osc;             /* 摇头胶囊（置灰：这台机器不支持）*/
+static lv_obj_t *s_fan_chip_osc_lbl;
 static bool s_detail_fan;                    /* 当前详情页开的是 fan.* */
 static lv_color_t s_fan_accent;              /* 自绘图标读它（已过对比度处理）*/
-/* 文字 / 配色缓存：500ms 轮询下没变就别再 set_text / 重绘。
-   s_fan_preset_shown 初值是 "\x01"（不可能是任何预设），保证进页面后第一次
-   一定会刷一遍颜色和预设键。 */
+/* 文字 / 配色缓存：500ms 轮询下没变就别再 set_text / 重排 */
 static char s_fan_preset_shown[16];
-static char s_fan_preset_txt[16];
 static char s_fan_pct_txt[8];
-/* 本地覆盖：点了预设 / 摇头 / 转过旋钮之后先按本地值显示，HA 落定后交还（6s）*/
+static char s_fan_chip_txt[16];
+static char s_fan_unit_shown[8];
+static int s_fan_num_x = -1;
+static int s_fan_unit_x = -1;
+static int8_t s_fan_chip_shown = -1;
+/* 本地覆盖：点了预设 / 转过旋钮之后先按本地值显示，HA 落定后交还（6s）*/
 static char s_fan_preset_local[16];
 static uint32_t s_fan_preset_local_until;
-static bool s_fan_osc_local;
-static uint32_t s_fan_osc_local_until;
 static int s_fan_pct_override;
 static uint32_t s_fan_pct_override_until;
 
-/* ---- 传感器折线图页 ---- */
-static lv_obj_t *s_chart_page;
-static lv_obj_t *s_chart_title;
-static lv_obj_t *s_chart_span;
-static lv_obj_t *s_chart;
-static float s_chart_pts[32];
-static int s_chart_pts_n;
-static float s_chart_lo, s_chart_hi;
-static lv_obj_t *s_chart_min;
-static lv_obj_t *s_chart_max;
-static lv_obj_t *s_chart_avg;
-static lv_obj_t *s_chart_back_label;
-static bool s_chart_visible;
-
-/* ---- 传感器折线图页用的全局状态 ---- */
-static volatile bool s_chart_wanted;
-static volatile int s_chart_gen;
-static char s_chart_entity[96];
-/* 最近一次成功的折线图数据：60 秒内同一实体直接复用，避免每次点击都走网络 */
-static char s_chart_cache_entity[96];
-static float s_chart_cache_vals[32];
-static int s_chart_cache_n;
-static float s_chart_cache_min, s_chart_cache_max, s_chart_cache_avg;
-static uint32_t s_chart_cache_at;
 static char s_detail_entity[96];
 static char s_detail_name_shown[48];        /* 名字行当前文字（避免 500ms 轮询重复重排）*/
 /* 旋钮在灯详情页里调什么：默认亮度，点过色温环就切色温（换灯 / 重新进页时复位）。
@@ -451,8 +601,7 @@ static lv_color_t fan_preset_color(const char *preset);
 static lv_color_t fan_ambient_bg(const char *preset, bool on);
 static void fan_apply_entity(const ha_entity_t *e);
 static void fan_hide_all(bool hide);
-static void fan_refresh_chips(const ha_entity_t *e, const char *preset);
-static void fan_refresh_osc(const ha_entity_t *e);
+static void fan_apply_chips(const ha_entity_t *e, const char *preset, bool on);
 static bool fan_knob_step(const ha_entity_t *e, int delta);
 static uint32_t s_last_gesture_ms;   /* 最近一次手势时间，用来吃掉误触 */
 static QueueHandle_t s_cmd_q;
@@ -461,7 +610,7 @@ typedef struct {
     char entity[96];
     char service[24];
     char attrs[64];      /* 非空则带参数调用（亮度/色温/空调） */
-    int gen;             /* 折线图请求代际：过期结果直接丢掉 */
+    int gen;             /* 保留字段（原折线图代际；历史曲线已取消，目前不用） */
     bool knob;           /* 旋钮命令：worker 走快路径，发完不各自等 300ms 刷新 */
 } cmd_t;
 
@@ -513,13 +662,47 @@ static const char *page_title(int page)
     return s_layout.pages[page].name;
 }
 
-/* 小智页是纯白底：圆点要换成深色（当前页墨色、其它页浅灰），否则白底上看不见 */
-static lv_color_t dot_color(int cur_page, int dot)
+/* 状态栏图标贴在 r=152 的圆上（设计稿 .h-status：四个图标按极坐标摆，不是弧形色带）*/
+#define STATUS_ARC_R 152
+
+/** 把对象按自身宽高居中到 (180,180)、半径 r 的圆上的 deg 度位置
+ *  （LVGL 角度：0°=右、90°=下；-120° 等价于 240°）。 */
+static void place_on_arc(lv_obj_t *obj, int deg)
 {
-    if (dot == cur_page) {
-        return is_assistant_page(cur_page) ? lv_color_hex(0x1C1C1E) : COLOR_TEXT;
+    if (obj == NULL) {
+        return;
     }
-    return is_assistant_page(cur_page) ? lv_color_hex(0xC7C7CC) : lv_color_hex(0x3A3A3C);
+    lv_obj_update_layout(obj);        /* 先让标签算出宽高，才能真居中 */
+    const int32_t x = (int32_t)STATUS_ARC_R * lv_trigo_cos((int16_t)deg);
+    const int32_t y = (int32_t)STATUS_ARC_R * lv_trigo_sin((int16_t)deg);
+    lv_obj_set_pos(obj, 180 + (int)(x >> LV_TRIGO_SHIFT) - lv_obj_get_width(obj) / 2,
+                   180 + (int)(y >> LV_TRIGO_SHIFT) - lv_obj_get_height(obj) / 2);
+}
+
+/** 页面圆点（设计稿 .h-dots：top 294、间距 7；当前页是 14x5 的胶囊、其它是 5x5 点）。*/
+static void dot_style(int cur_page, int i)
+{
+    lv_obj_t *d = s_dots[i];
+    if (d == NULL) {
+        return;
+    }
+    const bool act = (i == cur_page);
+    const bool light_bg = is_assistant_page(cur_page);   /* 小智页纯白底：反色 */
+    lv_obj_set_size(d, act ? 14 : 5, 5);
+    lv_obj_set_style_radius(d, act ? 3 : LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(d, light_bg ? lv_color_hex(0x1C1C1E) : lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(d, act ? LV_OPA_COVER : (light_bg ? 90 : 46), 0);
+    lv_obj_center(d);                 /* 尺寸变了仍然固定在 20x20 命中框正中 */
+}
+
+/** 标题位置：卡片页按设计稿 .h-title（top 56 → cjk16 盒子 y=48），
+ *  设置页自己从 y=64 排，标题仍放 y=30 免得压住第一行。 */
+static void title_place(int page)
+{
+    if (s_title == NULL) {
+        return;
+    }
+    lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, is_settings_page(page) ? 64 : 48);
 }
 
 /* ---------------- 翻页动画 ---------------- */
@@ -582,14 +765,14 @@ static void pages_apply_visibility(void)
             lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
         }
         if (s_dots[i]) {
-            lv_obj_set_style_bg_color(s_dots[i], dot_color(s_page, i), 0);
+            dot_style(s_page, i);
         }
     }
     if (s_title) {
         const char *title = page_title(s_page);
         lv_label_set_text(s_title, title);
         lv_obj_set_style_text_font(s_title, title_font_for(title), 0);
-        lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 30);
+        title_place(s_page);
     }
     int visible = 0;
     for (int i = 0; i < s_page_count; i++) {
@@ -639,14 +822,14 @@ static void show_page_dir(int page, int dir)
     /* 圆点 + 标题立刻更新，不跟着动画走 */
     for (int i = 0; i < s_page_count; i++) {
         if (s_dots[i]) {
-            lv_obj_set_style_bg_color(s_dots[i], dot_color(page, i), 0);
+            dot_style(page, i);
         }
     }
     if (s_title) {
         const char *title = page_title(page);
         lv_label_set_text(s_title, title);
         lv_obj_set_style_text_font(s_title, title_font_for(title), 0);
-        lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 30);
+        title_place(page);
     }
 
     /* 小智页的可见性：这里只改标志 + 起停定时器，不碰任何 LVGL 对象
@@ -702,11 +885,14 @@ static void dot_clicked_cb(lv_event_t *e)
 }
 
 /* 旋钮翻页：delta>0 下一页，delta<0 上一页。
-   子页面（详情/折线/空调）开着时不翻页，避免误触。 */
+   子页面（详情 / 空调 / 天气）开着时不翻页，避免误触。 */
 void ui_home_page_step(int delta)
 {
     if (delta == 0 || s_page_count <= 0) return;
-    if (ui_home_detail_open() || ui_home_chart_open() || ui_home_climate_open()) return;
+    /* 天气页把旋钮"借"去滚列表了：这里绝不能再翻页（main.c 已经先问过
+       ui_home_detail_knob，双保险）*/
+    if (ui_home_weather_open()) return;
+    if (ui_home_detail_open() || ui_home_climate_open()) return;
     if (delta > 0) {
         show_page_dir(s_page + 1, 1);
     } else {
@@ -766,9 +952,18 @@ static void swipe_cb(lv_event_t *e)
     if (abs(dx) < 40 || abs(dx) < abs(dy)) {
         return;
     }
-    if (ui_home_chart_open()) {
+
+    if (ui_home_weather_open()) {
+        /* 天气页是整页滚动的覆盖层：只有左边缘右滑 = 返回 */
         if (dx > 40 && start.x < 70) {
-            ui_home_close_chart();
+            wx_close();
+        }
+        return;
+    }
+    if (s_sens_visible) {
+        /* 传感器页：左边缘右滑关闭（没有拨盘，旋钮照常翻页） */
+        if (dx > 40 && start.x < 70) {
+            sensor_close();
         }
         return;
     }
@@ -832,58 +1027,20 @@ static void tile_clicked_cb(lv_event_t *e)
     }
     ESP_LOGI(TAG, "tile 点击: %s type=%d (detail=%p)", w->entity, (int)w->type, (void *)s_detail);
 
-    /* 传感器：点开折线图（历史数据由后台任务拉取） */
-    if (w->type == TILE_SENSOR) {
-        /* 已经在看同一张图：不重复请求 */
-        if (s_chart_visible && strcmp(s_chart_entity, w->entity) == 0) {
-            return;
-        }
-        /* 缓存命中：直接画，不发请求 */
-        if (strcmp(s_chart_cache_entity, w->entity) == 0 && s_chart_cache_n > 0 &&
-            (lv_tick_get() - s_chart_cache_at) < 60000) {
-            ui_home_show_chart(w->entity, s_chart_cache_vals, s_chart_cache_n,
-                               s_chart_cache_min, s_chart_cache_max, s_chart_cache_avg);
-            ESP_LOGI(TAG, "折线图命中缓存: %s", w->entity);
-            return;
-        }
-
-        cmd_t cmd;
-        memset(&cmd, 0, sizeof(cmd));
-        snprintf(cmd.entity, sizeof(cmd.entity), "%s", w->entity);
-        snprintf(cmd.service, sizeof(cmd.service), "chart");
-        s_chart_gen++;
-        cmd.gen = s_chart_gen;
-        s_chart_wanted = true;
-        bg_image_set_paused(true);      /* 让出 TLS/内存给历史请求 */
-        xQueueSend(s_cmd_q, &cmd, 0);
-        ESP_LOGI(TAG, "请求折线图: %s (gen %d)", w->entity, cmd.gen);
-        if (s_chart_page != NULL && !s_chart_visible) {
-            snprintf(s_chart_entity, sizeof(s_chart_entity), "%s", w->entity);
-            const ha_entity_t *ent = ha_client_find(w->entity);
-            lv_label_set_text(s_chart_title, ent ? ent->name : w->entity);
-            lv_label_set_text(s_chart_span, "加载中…");
-            lv_label_set_text(s_chart_min, "");
-            lv_label_set_text(s_chart_avg, "");
-            lv_label_set_text(s_chart_max, "");
-            s_chart_pts_n = 0;               /* 清掉上一张图的线 */
-            lv_obj_invalidate(s_chart);
-            s_chart_visible = true;
-            lv_obj_set_pos(s_chart_page, 0, 0);
-            lv_obj_set_style_translate_x(s_chart_page, 360, 0);
-            lv_obj_remove_flag(s_chart_page, LV_OBJ_FLAG_HIDDEN);
-
-            lv_anim_t a;
-            lv_anim_init(&a);
-            lv_anim_set_var(&a, s_chart_page);
-            lv_anim_set_values(&a, 360, 0);
-            lv_anim_set_time(&a, 220);
-            lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-            lv_anim_set_exec_cb(&a, anim_translate_cb);
-            lv_anim_start(&a);
-        }
+    /* 天气：点开整页天气（实况 + 逐小时 + 逐日），它自己接管旋钮做页内滚动。
+       注意要放在 SENSOR 分支之前：layout_type_of() 把 weather.* 归成 TOGGLE，
+       直接 toggle 会发到 HA 报错。 */
+    if (strncmp(w->entity, "weather.", 8) == 0) {
+        wx_open(w->entity);
         return;
     }
 
+    /* 传感器：点开"传感器详情页"（设计稿 屏幕 8）。设计稿已取消历史曲线，
+       所以这里只开页、不取任何历史数据。 */
+    if (w->type == TILE_SENSOR) {
+        sensor_open(w->entity);
+        return;
+    }
     /* 空调：和灯走同一个详情页（打开时按实体 id 决定显示哪一组控件）
        旧实现是单独一页 s_clim_page，旋钮在它上面还会翻页，现在统一了 */
     if (strncmp(w->entity, "climate.", 8) == 0) {
@@ -910,6 +1067,88 @@ static void tile_clicked_cb(lv_event_t *e)
     xQueueSend(s_cmd_q, &cmd, 0);
 }
 
+/* ---- 卡片：设计稿 .card（140x90 / 圆角 18 / 黑底半透明 / 图标左上 / 点右上 /
+        26px 数值 + 15px 单位 / 16px 标题）------------------------------------ */
+
+/** entity_id → 卡片域（只影响画法，不影响点击行为）。 */
+static tile_dom_t tile_dom_of(const char *id)
+{
+    if (id == NULL) {
+        return TILE_DOM_SWITCH;
+    }
+    if (strncmp(id, "light.", 6) == 0)        return TILE_DOM_LIGHT;
+    if (strncmp(id, "climate.", 8) == 0)      return TILE_DOM_CLIMATE;
+    if (strncmp(id, "fan.", 4) == 0)          return TILE_DOM_FAN;
+    if (strncmp(id, "cover.", 6) == 0)        return TILE_DOM_COVER;
+    if (strncmp(id, "media_player.", 13) == 0) return TILE_DOM_MEDIA;
+    if (strncmp(id, "sensor.", 7) == 0)       return TILE_DOM_SENSOR;
+    if (strncmp(id, "binary_sensor.", 14) == 0) return TILE_DOM_BINARY;
+    if (strncmp(id, "weather.", 8) == 0)      return TILE_DOM_WEATHER;
+    if (strncmp(id, "scene.", 6) == 0 || strncmp(id, "script.", 7) == 0) return TILE_DOM_SCENE;
+    if (strncmp(id, "automation.", 11) == 0)  return TILE_DOM_AUTO;
+    return TILE_DOM_SWITCH;
+}
+
+/** 语义色（设计稿 .card--* 的 --c）：图标 / 状态点 / 选中描边都用它。 */
+static lv_color_t tile_dom_color(tile_dom_t dom)
+{
+    switch (dom) {
+    case TILE_DOM_LIGHT:
+    case TILE_DOM_BINARY:  return lv_color_hex(0xFFB020);   /* .card--light / binary */
+    case TILE_DOM_CLIMATE:
+    case TILE_DOM_SWITCH:  return lv_color_hex(0x4C8DFF);   /* .card--climate / switch */
+    case TILE_DOM_COVER:   return lv_color_hex(0x2FD6C3);   /* .card--cover */
+    case TILE_DOM_FAN:     return lv_color_hex(0x5BD97A);   /* .card--fan */
+    case TILE_DOM_MEDIA:
+    case TILE_DOM_SCENE:   return lv_color_hex(0xA78BFA);   /* .card--media / scene */
+    case TILE_DOM_WEATHER: return lv_color_hex(0xFFC24B);   /* .card--weather */
+    case TILE_DOM_AUTO:    return lv_color_hex(0x5BD97A);   /* .card--auto */
+    case TILE_DOM_SENSOR:
+    default:               return lv_color_hex(0xB9C2D0);   /* .card--sensor */
+    }
+}
+
+/** 有没有右上角状态点：只读的 sensor / scene / weather 没有（设计稿一致）。 */
+static bool tile_has_dot(tile_dom_t dom)
+{
+    return dom != TILE_DOM_SENSOR && dom != TILE_DOM_SCENE && dom != TILE_DOM_WEATHER;
+}
+
+/** 数值文字用哪套字体：纯 ASCII（数字/ON/OFF）用 montserrat_28，
+ *  含中文（播放中 / 晴 16° / 已启用）退回 cjk16——大字体里没有汉字。 */
+static const lv_font_t *value_font_for(const char *text)
+{
+    if (text != NULL) {
+        for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+            if (*p >= 0x80) {
+                return &lv_font_cjk16;
+            }
+        }
+    }
+    return &lv_font_montserrat_28;
+}
+
+/** 数值 + 单位两个标签排成一行：单位紧跟在数值右边、低 10px（设计稿 .v small）。
+ *  宽度用 lv_text_get_size 量，数值位数变了（9 → 100）单位跟着挪。 */
+static void tile_place_value(tile_widget_t *w)
+{
+    if (w == NULL || w->value == NULL || w->unit == NULL) {
+        return;
+    }
+    const char *vt = lv_label_get_text(w->value);
+    const char *ut = lv_label_get_text(w->unit);
+    if (vt == NULL || vt[0] == '\0' || ut == NULL || ut[0] == '\0') {
+        return;
+    }
+    lv_point_t vsz = {0, 0};
+    lv_text_get_size(&vsz, vt, lv_obj_get_style_text_font(w->value, 0), 0, 0,
+                     LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_obj_set_pos(w->unit, CARD_PAD_X + vsz.x + 2, 42);
+}
+
+static void tile_icon_draw_cb(lv_event_t *e);   /* 19x19 卡片图标（定义在空调自绘工具函数之后）*/
+static void wx_bar(lv_layer_t *l, int x1, int y1, int x2, int y2, int r, lv_color_t c);
+
 static void make_tile(lv_obj_t *parent, int page, int slot, int col, int row)
 {
     const layout_tile_t *lt = &s_layout.pages[page].tiles[slot];
@@ -918,55 +1157,77 @@ static void make_tile(lv_obj_t *parent, int page, int slot, int col, int row)
     memset(w, 0, sizeof(*w));
     snprintf(w->entity, sizeof(w->entity), "%s", lt->entity);
     w->type = lt->type;
+    w->dom = tile_dom_of(lt->entity);
+    w->icon_col = COLOR_MUTED;
 
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_set_size(card, CARD_W, CARD_H);
-    /* 坐标相对滚动容器：左右各留 22px，行距 = 卡片高 + 间隙 */
-    lv_obj_set_pos(card, 22 + col * (CARD_W + CARD_GAP), row * (CARD_H + CARD_GAP));
-    /* 卡片是黑色半透明：叠在"背景图 + 暗化层"之上会更暗，形成玻璃质感 */
+    lv_obj_set_pos(card, col * (CARD_W + CARD_GAP), row * (CARD_H + CARD_GAP));
+    /* 卡片是黑色半透明：叠在"背景图 + 暗化层"之上形成玻璃质感（设计稿 60~72%）*/
     lv_obj_set_style_bg_color(card, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(card, (lv_opa_t)(bg_image_card_opa_pct() * 255 / 100), 0);
-    lv_obj_set_style_radius(card, 22, 0);
+    lv_obj_set_style_radius(card, CARD_RADIUS, 0);
     lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_color(card, COLOR_BORDER, 0);
-    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_style_border_color(card, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(card, 26, 0);              /* rgba(255,255,255,.10) */
+    lv_obj_set_style_pad_all(card, 0, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(card, tile_clicked_cb, LV_EVENT_CLICKED, w);
 
+    /* 左上角图标 19x19（自绘，颜色随"开/关"变：关 #9AA4B5 / 开 语义色）*/
+    lv_obj_t *icon = lv_obj_create(card);
+    lv_obj_remove_style_all(icon);
+    lv_obj_set_size(icon, CARD_ICON, CARD_ICON);
+    lv_obj_set_pos(icon, CARD_PAD_X, 10);
+    lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(icon, tile_icon_draw_cb, LV_EVENT_DRAW_MAIN, w);
+
+    /* 右上角状态点 5x5（设计稿 .dot margin-top:4 → y=14）*/
+    if (tile_has_dot(w->dom)) {
+        lv_obj_t *dot = lv_obj_create(card);
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, CARD_DOT, CARD_DOT);
+        lv_obj_set_pos(dot, CARD_W - CARD_PAD_X - CARD_DOT, 14);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0x626B7C), 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        w->dot = dot;
+    }
+
+    /* 数值（左 12 / 顶 32 / 宽 116）——26px 的近似：montserrat_28 */
+    lv_obj_t *value = lv_label_create(card);
+    lv_label_set_text(value, "--");
+    lv_obj_set_style_text_font(value, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(value, lv_color_hex(0xF3F5F9), 0);
+    lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(value, CARD_W - CARD_PAD_X * 2);
+    lv_obj_set_pos(value, CARD_PAD_X, 32);
+
+    /* 单位（15px 的近似：montserrat_20，颜色 #97A1B3）*/
+    lv_obj_t *unit = lv_label_create(card);
+    lv_label_set_text(unit, "");
+    lv_obj_set_style_text_font(unit, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(unit, lv_color_hex(0x97A1B3), 0);
+    lv_obj_set_pos(unit, CARD_PAD_X, 42);
+    lv_obj_add_flag(unit, LV_OBJ_FLAG_HIDDEN);
+
+    /* 标题（左 12 / 底 8 → 顶 62，16px #8B95A8）*/
     lv_obj_t *label = lv_label_create(card);
     lv_label_set_text(label, lt->label[0] ? lt->label : lt->entity);
     lv_obj_set_style_text_font(label, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(label, COLOR_TEXT, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(0x8B95A8), 0);
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(label, CARD_W - 24, 42); /* 最多两行，超出打点 */
-    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    lv_obj_t *value = lv_label_create(card);
-    lv_label_set_text(value, "--");
-    lv_obj_set_style_text_font(value, &lv_font_montserrat_20, 0);
-    if (lt->type == TILE_SENSOR) {
-        lv_obj_set_style_text_color(value, COLOR_TEXT, 0);
-        lv_obj_align(value, LV_ALIGN_LEFT_MID, 0, 8);
-        lv_obj_set_width(value, CARD_W - 24);
-    } else {
-        lv_obj_set_style_text_color(value, COLOR_MUTED, 0);
-        lv_obj_align(value, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-
-        lv_obj_t *dot = lv_obj_create(card);
-        lv_obj_set_size(dot, 10, 10);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(dot, COLOR_BAD, 0);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(dot, 0, 0);
-        lv_obj_align(dot, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-        w->dot = dot;
-    }
+    lv_obj_set_width(label, CARD_W - CARD_PAD_X * 2);
+    lv_obj_set_pos(label, CARD_PAD_X, 62);
 
     w->card = card;
     w->label = label;
     w->value = value;
+    w->unit = unit;
+    w->icon = icon;
 }
 
 /** WiFi 图标：三道弧 + 一个点，点亮的弧数量表示信号格数（1~3 格）。 */
@@ -1009,6 +1270,85 @@ static void wifi_icon_draw_cb(lv_event_t *e)
     rd.radius = 1;
     lv_area_t dot = {cx - 1, cy - 1, cx + 1, cy + 1};
     lv_draw_rect(layer, &rd, &dot);
+}
+
+/* ------------------------------------------------------------------------- */
+/* 电量：只有"未知"态（这块板没有校准）                                        */
+/* ------------------------------------------------------------------------- */
+/* ESP32-S31 只有单档 ADC 衰减、没有校准方案，读到的只是原始值（约 4100-4160），
+ * 不能换算成百分比、也不能换算成电压。所以界面统一显示"未知"态：
+ * 状态栏电池图标 = 设计稿 #sbBatt.unknown 的样子（空壳 + 一道斜杠、颜色 #8B95A8），
+ * 设置页那一行写"未知 raw N"（原始值留着，方便一眼看电池健康）。
+ * 以后拿到校准参数：把 BATTERY_CALIBRATED 改成 1，在 battery_display_state() 里
+ * 用原始值算出百分比，界面（图标填充 / 低电配色 / 百分比文字）不用改。 */
+#define BATTERY_CALIBRATED 0
+
+typedef enum {
+    BATTERY_ST_UNKNOWN = 0,     /* 没有校准：只报"未知" */
+    BATTERY_ST_PCT,             /* 有校准：pct 有效 */
+} battery_state_t;
+
+typedef struct {
+    battery_state_t st;
+    int pct;                    /* 0..100，仅 BATTERY_ST_PCT 有效 */
+    int raw;                    /* ADC 原始值，无效为 -1 */
+} battery_display_t;
+
+static battery_display_t battery_display_state(void)
+{
+    battery_display_t b;
+    b.st = BATTERY_ST_UNKNOWN;
+    b.pct = -1;
+    b.raw = battery_raw_value();
+#if BATTERY_CALIBRATED
+    /* 校准后的唯一改动点：raw -> pct，然后 b.st = BATTERY_ST_PCT; */
+#endif
+    return b;
+}
+
+static void battery_icon_draw_cb(lv_event_t *e);
+static void ac_dr_line(lv_layer_t *layer, int x1, int y1, int x2, int y2, int w, lv_color_t c);
+
+/** 状态栏电池图标（设计稿 #sbBatt）：空壳 + 正极帽；未知态再画一道斜杠。
+ *  颜色：#8B95A8（unknown）/ #E4E9F2（有百分比时）。 */
+static void battery_icon_draw_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if (obj == NULL || layer == NULL) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const battery_display_t b = battery_display_state();
+    const lv_color_t c = (b.st == BATTERY_ST_PCT) ? lv_color_hex(0xE4E9F2) : lv_color_hex(0x8B95A8);
+
+    /* 壳体：外框 16x10（22x22 画布里的 2..18 / 7..17），圆角 2.6 → 1.5px 描边 */
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_opa = LV_OPA_TRANSP;
+    d.border_color = c;
+    d.border_opa = LV_OPA_COVER;
+    d.border_width = 2;
+    d.radius = 3;
+    lv_area_t shell = {(lv_coord_t)(a.x1 + 2), (lv_coord_t)(a.y1 + 7),
+                       (lv_coord_t)(a.x1 + 18), (lv_coord_t)(a.y1 + 17)};
+    lv_draw_rect(layer, &d, &shell);
+
+    /* 正极帽 */
+    wx_bar(layer, a.x1 + 19, a.y1 + 10, a.x1 + 21, a.y1 + 13, 1, c);
+
+    if (b.st == BATTERY_ST_PCT) {
+        /* 有百分比：按电量填格（最低留 2px，别画成空壳）*/
+        int w = (14 * (b.pct < 0 ? 0 : (b.pct > 100 ? 100 : b.pct))) / 100;
+        if (w < 2) {
+            w = 2;
+        }
+        wx_bar(layer, a.x1 + 4, a.y1 + 9, a.x1 + 4 + w, a.y1 + 15, 1, c);
+    } else {
+        /* 未知：一道斜杠（设计稿 .slash: M4.4 17.4 L19.6 6.6）*/
+        ac_dr_line(layer, a.x1 + 4, a.y1 + 16, a.x1 + 19, a.y1 + 7, 2, c);
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1217,17 +1557,17 @@ static lv_obj_t *settings_label(lv_obj_t *parent, const char *text, int x, int y
 }
 
 /* 设置页的列表尺寸：容器 256 宽，右边留 8px 给 4px 滚动条 */
-#define SET_ROW_W      248
-#define SET_ROW_H       44    /* 标准设置行高（参考常见设置列表） */
+#define SET_ROW_W      252
+#define SET_ROW_H       42    /* 设计稿 .s-row：42px，行间 1px 分隔线 */
 #define SET_ROW_GAP      8
-#define SET_ROW_PAD_X   14
-#define SET_HEAD_H      30    /* 分组标题占位：16px 字 + 下方留白 */
+#define SET_ROW_PAD_X    0
+#define SET_HEAD_H      28    /* 分组标题占位（设计稿没有分组，沿用它的字距/字色）*/
 #define SET_SEC_GAP     14    /* 分组之间额外留白 */
 #define SET_END_PAD     24    /* 滚动内容末尾留白，最后一行不贴圆边 */
 
 /**
- * 设置页的一条设置行：整行一张小卡片（深灰半透明 + 圆角 12），
- * 背景图能透出来一点，和 tile 卡的玻璃质感一致。失败返回 NULL。
+ * 设置页的一条设置行：设计稿 .s-row —— 透明底 + 高 42 + 底部 1px 分隔线
+ * （rgba(255,255,255,.05) → 白色 opa 13），不再是一条一条的小卡片。失败返回 NULL。
  */
 static lv_obj_t *settings_row(lv_obj_t *parent, int y, int h)
 {
@@ -1241,29 +1581,30 @@ static lv_obj_t *settings_row(lv_obj_t *parent, int y, int h)
     lv_obj_remove_style_all(row);
     lv_obj_set_pos(row, 0, y);
     lv_obj_set_size(row, SET_ROW_W, h);
-    lv_obj_set_style_bg_color(row, COLOR_CARD, 0);
-    lv_obj_set_style_bg_opa(row, (lv_opa_t)140, 0);      /* 约 55% */
-    lv_obj_set_style_radius(row, 12, 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(row, 0, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_border_width(row, 1, 0);
-    lv_obj_set_style_border_color(row, COLOR_BORDER, 0);
+    lv_obj_set_style_border_color(row, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(row, 13, 0);             /* rgba(255,255,255,.05) */
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     return row;
 }
 
-/** 行左侧标题（16px CJK 白字，垂直居中）。 */
+/** 行左侧标题（设计稿 .s-row 的 span：16px #B6C0D0，垂直居中）。 */
 static lv_obj_t *settings_row_title(lv_obj_t *row, const char *text)
 {
-    lv_obj_t *lab = settings_label(row, text, 0, -1, 0, COLOR_TEXT);
+    lv_obj_t *lab = settings_label(row, text, 0, -1, 0, lv_color_hex(0xB6C0D0));
     if (lab != NULL) {
         lv_obj_align(lab, LV_ALIGN_LEFT_MID, SET_ROW_PAD_X, 0);
     }
     return lab;
 }
 
-/** 行右侧的值文字（灰字、右对齐、垂直居中）；w 是最大宽度。 */
+/** 行右侧的值文字（设计稿 .s-row b：400、#F3F5F9、右对齐、垂直居中）；w 是最大宽度。 */
 static lv_obj_t *settings_row_value(lv_obj_t *row, int w)
 {
-    lv_obj_t *lab = settings_label(row, "--", 0, -1, w, COLOR_MUTED);
+    lv_obj_t *lab = settings_label(row, "--", 0, -1, w, lv_color_hex(0xF3F5F9));
     if (lab != NULL) {
         lv_obj_set_style_text_align(lab, LV_TEXT_ALIGN_RIGHT, 0);
         lv_obj_align(lab, LV_ALIGN_RIGHT_MID, -SET_ROW_PAD_X, 0);
@@ -1271,11 +1612,15 @@ static lv_obj_t *settings_row_value(lv_obj_t *row, int w)
     return lab;
 }
 
-/** 分组标题：同样的 16px 中文字体，用灰色区分层级；返回下一行的 y。 */
+/** 分组标题：设计稿没有分组，沿用它的"小标题"语言（灰字 + 字距）。返回下一行的 y。 */
 static int settings_heading(lv_obj_t *parent, int y, const char *text)
 {
     if (parent != NULL) {
-        settings_label(parent, text, SET_ROW_PAD_X, y + 4, 0, COLOR_MUTED);
+        lv_obj_t *lab = settings_label(parent, text, SET_ROW_PAD_X, y + 4, 0,
+                                       lv_color_hex(0x7B8597));
+        if (lab != NULL) {
+            lv_obj_set_style_text_letter_space(lab, 2, 0);
+        }
     }
     return y + SET_HEAD_H;
 }
@@ -1287,7 +1632,8 @@ static void settings_apply_btn_enabled(lv_obj_t *btn, lv_obj_t *label, bool en)
         return;
     }
     lv_obj_set_state(btn, LV_STATE_DISABLED, !en);
-    lv_obj_set_style_bg_color(btn, en ? COLOR_ACCENT : lv_color_hex(0x2C2C2E), 0);
+    lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(btn, en ? 33 : 12, 0);          /* 可用 = 白 13%，禁用 = 白 4.5% */
     if (label != NULL) {
         lv_obj_set_style_text_color(label, en ? COLOR_TEXT : COLOR_MUTED, 0);
     }
@@ -1297,17 +1643,20 @@ static void settings_apply_btn_enabled(lv_obj_t *btn, lv_obj_t *label, bool en)
 static void settings_apply_audio(void)
 {
     const bool bt = bt_link_audio_to_bt();
-    const lv_color_t on_bg = COLOR_ACCENT;
-    const lv_color_t off_bg = lv_color_hex(0x2C2C2E);
+    /* 设计稿 .l-seg：选中 = 白 13% 底 + 近白字，未选 = 白 4.5% 底 + 灰字 */
+    const lv_color_t on_bg = lv_color_white();
+    const lv_color_t off_bg = lv_color_white();
 
     if (s_set_phone_btn != NULL) {
         lv_obj_set_style_bg_color(s_set_phone_btn, bt ? off_bg : on_bg, 0);
+        lv_obj_set_style_bg_opa(s_set_phone_btn, bt ? 12 : 33, 0);
     }
     if (s_set_phone_label != NULL) {
         lv_obj_set_style_text_color(s_set_phone_label, bt ? COLOR_MUTED : COLOR_TEXT, 0);
     }
     if (s_set_bt_btn != NULL) {
         lv_obj_set_style_bg_color(s_set_bt_btn, bt ? on_bg : off_bg, 0);
+        lv_obj_set_style_bg_opa(s_set_bt_btn, bt ? 33 : 12, 0);
     }
     if (s_set_bt_label != NULL) {
         lv_obj_set_style_text_color(s_set_bt_label, bt ? COLOR_TEXT : COLOR_MUTED, 0);
@@ -1450,29 +1799,37 @@ static void build_settings_page(lv_obj_t *scr)
     s_set_page = page;
     s_pages[s_json_pages] = page;
 
-    /* ---- 纵向滚动容器：圆屏中间 x=52..308、y=64..300 的安全带 ---- */
+    /* ---- 面板：设计稿 .s-panel（左/右 40、top 94、圆角 18、rgba(8,10,15,.55)、
+       1px rgba(255,255,255,.055) 边、内边距 2/14 + 3px 自绘滚动条）。
+       高度取 196（94..290）：比设计稿的 188 多 8px，给 20 多行设置多一点可视区。 */
     lv_obj_t *cont = lv_obj_create(page);
     if (cont == NULL) {
         report_page_create_failed("设置页滚动区", page);
         return;
     }
     lv_obj_remove_style_all(cont);
-    lv_obj_set_pos(cont, 52, 64);
-    lv_obj_set_size(cont, 256, 236);
-    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(cont, 0, 0);
-    lv_obj_set_style_pad_all(cont, 0, 0);
+    lv_obj_set_pos(cont, 40, 94);
+    lv_obj_set_size(cont, 280, 196);
+    lv_obj_set_style_bg_color(cont, lv_color_hex(0x080A0F), 0);
+    lv_obj_set_style_bg_opa(cont, 189, 0);               /* .74：这是设计稿 glass-off 档，
+                                                            亮壁纸上才读得清文字 */
+    lv_obj_set_style_radius(cont, 18, 0);
+    lv_obj_set_style_border_width(cont, 1, 0);
+    lv_obj_set_style_border_color(cont, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(cont, 14, 0);            /* .055 */
+    lv_obj_set_style_pad_hor(cont, 14, 0);
+    lv_obj_set_style_pad_ver(cont, 2, 0);
     lv_obj_add_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(cont, LV_DIR_VER);      /* 只上下滚，左右留给翻页 */
     lv_obj_set_scroll_chain(cont, false);         /* 滚到头不再把滚动传给父对象 */
     lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_AUTO);
-    /* 4px 细滚动条：圆角、半透明灰、贴右缘 */
-    lv_obj_set_style_width(cont, 4, LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_color(cont, COLOR_MUTED, LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_opa(cont, LV_OPA_50, LV_PART_SCROLLBAR);
-    lv_obj_set_style_radius(cont, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+    /* 设计稿 .s-bar：3px 宽、圆角 2、滑块 white 30% */
+    lv_obj_set_style_width(cont, 3, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_color(cont, lv_color_white(), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(cont, 77, LV_PART_SCROLLBAR);        /* .30 */
+    lv_obj_set_style_radius(cont, 2, LV_PART_SCROLLBAR);
     lv_obj_set_style_border_width(cont, 0, LV_PART_SCROLLBAR);
-    lv_obj_set_style_pad_right(cont, 2, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_right(cont, 5, LV_PART_SCROLLBAR);
     s_set_scroll = cont;
 
     int y = 0;
@@ -1492,11 +1849,11 @@ static void build_settings_page(lv_obj_t *scr)
                 s_mem_bar = lv_bar_create(row);
                 if (s_mem_bar != NULL) {
                     lv_obj_set_pos(s_mem_bar, SET_ROW_PAD_X, 34);
-                    lv_obj_set_size(s_mem_bar, SET_ROW_W - SET_ROW_PAD_X * 2, 6);
+                    lv_obj_set_size(s_mem_bar, SET_ROW_W - SET_ROW_PAD_X * 2, 4);
                     lv_bar_set_range(s_mem_bar, 0, 100);
-                    lv_obj_set_style_bg_color(s_mem_bar, lv_color_hex(0x3A3A3C), LV_PART_MAIN);
-                    lv_obj_set_style_bg_opa(s_mem_bar, LV_OPA_COVER, LV_PART_MAIN);
-                    lv_obj_set_style_radius(s_mem_bar, 3, LV_PART_MAIN);
+                    lv_obj_set_style_bg_color(s_mem_bar, lv_color_white(), LV_PART_MAIN);
+                    lv_obj_set_style_bg_opa(s_mem_bar, 20, LV_PART_MAIN);     /* 轨道 white 8% */
+                    lv_obj_set_style_radius(s_mem_bar, 2, LV_PART_MAIN);
                     lv_obj_set_style_bg_color(s_mem_bar, COLOR_ACCENT, LV_PART_INDICATOR);
                     lv_obj_set_style_bg_opa(s_mem_bar, LV_OPA_COVER, LV_PART_INDICATOR);
                     lv_obj_set_style_radius(s_mem_bar, 3, LV_PART_INDICATOR);
@@ -1536,14 +1893,14 @@ static void build_settings_page(lv_obj_t *scr)
     s_ota_bar = lv_bar_create(cont);
     if (s_ota_bar != NULL) {
         lv_obj_set_pos(s_ota_bar, 0, y);
-        lv_obj_set_size(s_ota_bar, SET_ROW_W, 8);
+        lv_obj_set_size(s_ota_bar, SET_ROW_W, 4);
         lv_bar_set_range(s_ota_bar, 0, 100);
-        lv_obj_set_style_bg_color(s_ota_bar, lv_color_hex(0x3A3A3C), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(s_ota_bar, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_radius(s_ota_bar, 4, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(s_ota_bar, lv_color_white(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(s_ota_bar, 20, LV_PART_MAIN);      /* 轨道 white 8% */
+        lv_obj_set_style_radius(s_ota_bar, 2, LV_PART_MAIN);
         lv_obj_set_style_bg_color(s_ota_bar, COLOR_ACCENT, LV_PART_INDICATOR);
         lv_obj_set_style_bg_opa(s_ota_bar, LV_OPA_COVER, LV_PART_INDICATOR);
-        lv_obj_set_style_radius(s_ota_bar, 4, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(s_ota_bar, 2, LV_PART_INDICATOR);
         lv_obj_add_flag(s_ota_bar, LV_OBJ_FLAG_HIDDEN);
     }
     y += 8 + 6;
@@ -1583,7 +1940,12 @@ static void build_settings_page(lv_obj_t *scr)
         if (s_set_scan_btn != NULL) {
             lv_obj_set_size(s_set_scan_btn, 102, 30);
             lv_obj_set_pos(s_set_scan_btn, SET_ROW_PAD_X, 7);
-            lv_obj_set_style_radius(s_set_scan_btn, 10, 0);
+            lv_obj_set_style_radius(s_set_scan_btn, 15, 0);
+            lv_obj_set_style_bg_color(s_set_scan_btn, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_set_scan_btn, 12, 0);   /* .045 */
+            lv_obj_set_style_border_width(s_set_scan_btn, 1, 0);
+            lv_obj_set_style_border_color(s_set_scan_btn, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_set_scan_btn, 18, 0); /* .07 */
             lv_obj_set_style_shadow_width(s_set_scan_btn, 0, 0);
             lv_obj_add_event_cb(s_set_scan_btn, settings_scan_cb, LV_EVENT_CLICKED, NULL);
             s_set_scan_label = settings_label(s_set_scan_btn, "扫描", -1, -1, 0, COLOR_TEXT);
@@ -1593,7 +1955,12 @@ static void build_settings_page(lv_obj_t *scr)
         if (s_set_conn_btn != NULL) {
             lv_obj_set_size(s_set_conn_btn, 102, 30);
             lv_obj_set_pos(s_set_conn_btn, 132, 7);
-            lv_obj_set_style_radius(s_set_conn_btn, 10, 0);
+            lv_obj_set_style_radius(s_set_conn_btn, 15, 0);
+            lv_obj_set_style_bg_color(s_set_conn_btn, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_set_conn_btn, 12, 0);
+            lv_obj_set_style_border_width(s_set_conn_btn, 1, 0);
+            lv_obj_set_style_border_color(s_set_conn_btn, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_set_conn_btn, 18, 0);
             lv_obj_set_style_shadow_width(s_set_conn_btn, 0, 0);
             lv_obj_add_event_cb(s_set_conn_btn, settings_conn_cb, LV_EVENT_CLICKED, NULL);
             s_set_conn_label = settings_label(s_set_conn_btn, "连接", -1, -1, 0, COLOR_TEXT);
@@ -1622,6 +1989,11 @@ static void build_settings_page(lv_obj_t *scr)
             lv_obj_set_size(s_set_phone_btn, 94, 30);
             lv_obj_set_pos(s_set_phone_btn, SET_ROW_PAD_X, 7);
             lv_obj_set_style_radius(s_set_phone_btn, 15, 0);
+            lv_obj_set_style_bg_color(s_set_phone_btn, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_set_phone_btn, 12, 0);
+            lv_obj_set_style_border_width(s_set_phone_btn, 1, 0);
+            lv_obj_set_style_border_color(s_set_phone_btn, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_set_phone_btn, 18, 0);
             lv_obj_set_style_shadow_width(s_set_phone_btn, 0, 0);
             lv_obj_add_event_cb(s_set_phone_btn, settings_audio_phone_cb, LV_EVENT_CLICKED, NULL);
             s_set_phone_label = settings_label(s_set_phone_btn, "耳机孔", -1, -1, 0, COLOR_TEXT);
@@ -1632,6 +2004,11 @@ static void build_settings_page(lv_obj_t *scr)
             lv_obj_set_size(s_set_bt_btn, 108, 30);
             lv_obj_set_pos(s_set_bt_btn, 124, 7);
             lv_obj_set_style_radius(s_set_bt_btn, 15, 0);
+            lv_obj_set_style_bg_color(s_set_bt_btn, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_set_bt_btn, 12, 0);
+            lv_obj_set_style_border_width(s_set_bt_btn, 1, 0);
+            lv_obj_set_style_border_color(s_set_bt_btn, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_set_bt_btn, 18, 0);
             lv_obj_set_style_shadow_width(s_set_bt_btn, 0, 0);
             lv_obj_add_event_cb(s_set_bt_btn, settings_audio_bt_cb, LV_EVENT_CLICKED, NULL);
             s_set_bt_label = settings_label(s_set_bt_btn, "蓝牙音箱", -1, -1, 0, COLOR_TEXT);
@@ -1738,11 +2115,14 @@ static void refresh_status_page(void)
 
     /* 电池：ESP32-S31 只有单档衰减且无校准方案，先显示原始值（未标定） */
     {
-        const int raw = battery_raw_value();
-        if (raw >= 0) {
-            snprintf(buf, sizeof(buf), "raw %d", raw);
+        const battery_display_t b = battery_display_state();
+        if (b.st == BATTERY_ST_PCT) {
+            snprintf(buf, sizeof(buf), "%d%%", b.pct);
+        } else if (b.raw >= 0) {
+            /* 没有校准 → 只报"未知"，原始值仍然留在这一行（看电池健康用）*/
+            snprintf(buf, sizeof(buf), "未知 raw %d", b.raw);
         } else {
-            snprintf(buf, sizeof(buf), "--");
+            snprintf(buf, sizeof(buf), "未知");
         }
         sys_value_set(5, buf);
     }
@@ -1772,18 +2152,6 @@ static void refresh_status_page(void)
 /* ------------------------------------------------------------------------- */
 /* 刷新                                                                       */
 /* ------------------------------------------------------------------------- */
-
-/** 状态文本可能含中文（天气"晴"、模式名等）：非 ASCII 就用 CJK 字体的较小字号。 */
-static const lv_font_t *value_font_for(const char *text)
-{
-    if (text == NULL) {
-        return &lv_font_cjk16;
-    }
-    /* 统一用同一个字体（这版 CJK 字库自带 ASCII 数字/字母），
-       这样"晴"和"56.0 W"的字号完全一致，不会一大一小 */
-    (void)text;
-    return &lv_font_cjk16;
-}
 
 /**
  * HA 的天气状态是英文机器码（sunny / partlycloudy / rainy…），卡片上要显示中文。
@@ -1836,86 +2204,182 @@ static const char *weather_state_zh(const char *entity_id, const char *state)
     return state;
 }
 
+/** 把一张卡刷成当前实体状态（设计稿 .card：数值 + 单位 / 标题 / 图标 / 状态点）。
+ *  行为不变：只读实体表，不点也不发命令。 */
+static void tile_apply(tile_widget_t *w)
+{
+    if (w == NULL || w->value == NULL) {
+        return;
+    }
+    const ha_entity_t *e = ha_client_find(w->entity);
+
+    char val[48] = "--";
+    char unit[12] = "";
+    bool on = false;
+    lv_color_t ink = lv_color_hex(0xF3F5F9);
+    lv_color_t dom = tile_dom_color(w->dom);
+
+    if (e != NULL) {
+        const bool fresh = e->fresh && strcmp(e->state, "unavailable") != 0 &&
+                           strcmp(e->state, "unknown") != 0;
+        switch (w->dom) {
+        case TILE_DOM_LIGHT:
+            on = e->on;
+            if (!fresh) {
+                snprintf(val, sizeof(val), "--");
+            } else if (!on) {
+                snprintf(val, sizeof(val), "OFF");
+                ink = COLOR_MUTED;
+            } else {
+                snprintf(val, sizeof(val), "%d", e->brightness * 100 / 255);
+                snprintf(unit, sizeof(unit), "%%");
+            }
+            break;
+        case TILE_DOM_FAN:
+            on = e->on;
+            if (!fresh) {
+                snprintf(val, sizeof(val), "--");
+            } else if (!on) {
+                snprintf(val, sizeof(val), "OFF");
+                ink = COLOR_MUTED;
+            } else if (e->has_percentage) {
+                snprintf(val, sizeof(val), "%d", e->percentage);
+                snprintf(unit, sizeof(unit), "%%");
+            } else {
+                snprintf(val, sizeof(val), "ON");
+            }
+            break;
+        case TILE_DOM_CLIMATE: {
+            /* climate.* 的 state 是 cool/heat/off…，没有 "on" */
+            on = fresh && strcmp(e->state, "off") != 0;
+            if (!fresh) {
+                snprintf(val, sizeof(val), "--");
+            } else if (!on) {
+                snprintf(val, sizeof(val), "OFF");
+                ink = COLOR_MUTED;
+            } else if (e->target_temp > 0.0f) {
+                snprintf(val, sizeof(val), "%d", (int)(e->target_temp + 0.5f));
+                snprintf(unit, sizeof(unit), "°");
+            } else {
+                snprintf(val, sizeof(val), "ON");
+            }
+            break;
+        }
+        case TILE_DOM_COVER:
+            on = fresh && strcmp(e->state, "open") == 0;
+            snprintf(val, sizeof(val), "%s", on ? "ON" : "OFF");
+            if (!on) {
+                ink = COLOR_MUTED;
+            }
+            break;
+        case TILE_DOM_MEDIA: {
+            const char *zh = "--";
+            if (fresh) {
+                if (strcmp(e->state, "playing") == 0)      zh = "播放中";
+                else if (strcmp(e->state, "paused") == 0)  zh = "已暂停";
+                else if (strcmp(e->state, "idle") == 0)    zh = "空闲";
+                else if (strcmp(e->state, "off") == 0)     zh = "关机";
+                else                                       zh = "开启";
+            }
+            snprintf(val, sizeof(val), "%s", zh);
+            on = fresh && strcmp(e->state, "idle") != 0 && strcmp(e->state, "off") != 0;
+            break;
+        }
+        case TILE_DOM_SENSOR:
+            /* 只读：数值 + 单位（天气实体走下面那一档，显示"晴 16°"）*/
+            if (!fresh) {
+                snprintf(val, sizeof(val), "--");
+            } else {
+                snprintf(val, sizeof(val), "%s", e->state);
+                snprintf(unit, sizeof(unit), "%s", e->unit);
+            }
+            break;
+        case TILE_DOM_BINARY:
+            on = fresh && e->on;
+            snprintf(val, sizeof(val), "%s", on ? "ON" : "OFF");
+            if (!on) {
+                ink = COLOR_MUTED;
+            }
+            break;
+        case TILE_DOM_WEATHER:
+            if (!fresh || !e->wx_valid) {
+                snprintf(val, sizeof(val), "--");
+            } else {
+                snprintf(val, sizeof(val), "%s %d°",
+                         weather_state_zh(e->entity_id, e->state),
+                         (e->wx_temp10 >= 0) ? ((e->wx_temp10 + 5) / 10)
+                                             : ((e->wx_temp10 - 5) / 10));
+            }
+            break;
+        case TILE_DOM_SCENE:
+            snprintf(val, sizeof(val), "%s", fresh ? "执行" : "--");
+            break;
+        case TILE_DOM_AUTO:
+            on = fresh && e->on;
+            snprintf(val, sizeof(val), "%s", !fresh ? "--" : (on ? "已启用" : "已停用"));
+            if (!on) {
+                ink = COLOR_MUTED;
+            }
+            break;
+        case TILE_DOM_SWITCH:
+        default:
+            on = fresh && e->on;
+            snprintf(val, sizeof(val), "%s", fresh ? (on ? "ON" : "OFF") : "--");
+            if (!on) {
+                ink = COLOR_MUTED;
+            }
+            break;
+        }
+    }
+
+    /* 数值 / 字体 / 单位（宽度变了才重排）*/
+    if (strcmp(lv_label_get_text(w->value), val) != 0) {
+        lv_label_set_text(w->value, val);
+        lv_obj_set_style_text_font(w->value, value_font_for(val), 0);
+        lv_obj_set_style_text_color(w->value, ink, 0);
+    }
+    lv_obj_set_style_text_color(w->value, ink, 0);
+    if (w->unit != NULL) {
+        if (strcmp(lv_label_get_text(w->unit), unit) != 0) {
+            lv_label_set_text(w->unit, unit);
+            detail_set_hidden(w->unit, unit[0] == '\0');
+        }
+        tile_place_value(w);
+    }
+
+    /* 图标：关 #9AA4B5 / 开 语义色（和设计稿 .card .ic / .card.on .ic 一致）*/
+    if (w->icon != NULL) {
+        if (w->dom == TILE_DOM_SENSOR) {
+            w->icon_alt = (unit[0] == '%') ? 1 : 0;      /* 湿度画水滴，其它画温度计 */
+        }
+        w->icon_col = on ? dom : lv_color_hex(0x9AA4B5);
+        lv_obj_invalidate(w->icon);
+    }
+    /* 状态点：关 #626B7C / 开 语义色；实体不新鲜时红点（沿用原来的"掉线"提示）*/
+    if (w->dot != NULL) {
+        lv_color_t dc = on ? dom : lv_color_hex(0x626B7C);
+        if (e == NULL || !e->fresh) {
+            dc = COLOR_BAD;
+        }
+        lv_obj_set_style_bg_color(w->dot, dc, 0);
+    }
+    /* 卡片描边：开 = 语义色 45%（设计稿 .card.on border-color: <c> 45%），关 = 白 10% */
+    lv_obj_set_style_border_color(w->card, on ? dom : lv_color_white(), 0);
+    lv_obj_set_style_border_opa(w->card, on ? 115 : 26, 0);
+}
+
 static void refresh_values(void)
 {
     for (int p = 0; p < s_json_pages; p++) {
         for (int i = 0; i < s_page_tiles[p]; i++) {
-            tile_widget_t *w = &s_tiles[p][i];
-            const ha_entity_t *e = ha_client_find(w->entity);
-            if (w->value == NULL) {
-                continue;
-            }
-            if (e == NULL) {
-                lv_label_set_text(w->value, "--");
-                continue;
-            }
-            if (w->type == TILE_SENSOR) {
-                const char *state_txt = weather_state_zh(e->entity_id, e->state);
-                if (!e->fresh || strcmp(e->state, "unavailable") == 0) {
-                    lv_label_set_text(w->value, "--");
-                } else if (e->unit[0]) {
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "%s %s", state_txt, e->unit);
-                    lv_label_set_text(w->value, buf);
-                    lv_obj_set_style_text_font(w->value, value_font_for(buf), 0);
-                } else {
-                    lv_label_set_text(w->value, state_txt);
-                    lv_obj_set_style_text_font(w->value, value_font_for(state_txt), 0);
-                }
-                continue;
-            }
-
-            const char *txt;
-            if (!e->fresh || strcmp(e->state, "unavailable") == 0 || strcmp(e->state, "unknown") == 0) {
-                txt = "--";
-            } else if (strcmp(e->state, "on") == 0) {
-                txt = "ON";
-            } else if (strcmp(e->state, "off") == 0) {
-                txt = "OFF";
-            } else {
-                txt = e->state;
-            }
-            lv_label_set_text(w->value, txt);
-            lv_obj_set_style_text_font(w->value, value_font_for(txt), 0);
-            lv_obj_set_style_bg_color(w->card, e->on ? COLOR_CARD_ON : COLOR_CARD, 0);
-            lv_obj_set_style_text_color(w->value, e->on ? COLOR_TEXT : COLOR_MUTED, 0);
-            if (w->dot) {
-                lv_obj_set_style_bg_color(w->dot, e->fresh ? COLOR_OK : COLOR_BAD, 0);
-            }
+            tile_apply(&s_tiles[p][i]);
         }
     }
 }
 
-/* 折线图结果：worker 任务只负责取数，画图统一回到 LVGL 线程。
-   新工程 LV_USE_OS=NONE（没有 LVGL 互斥锁），所以 worker 只填结构体 + 置标志，
-   由下面 500ms 的 refresh_timer_cb（跑在 LVGL 线程）取走并调用 LVGL。
-   和 net.c 里 cfg/cmd 的"写缓冲 + 置 pending 标志"是同一套做法。 */
-typedef struct {
-    char entity[96];
-    float vals[32];
-    int n;
-    float vmin, vmax, vavg;
-    int gen;
-} chart_res_t;
-
-static chart_res_t s_chart_res;          /* worker 写 -> LVGL 线程读 */
-static char s_chart_fail_entity[96];
-static int s_chart_fail_gen;
-static volatile int s_chart_result;      /* 0=没有, 1=成功数据, 2=取数失败 */
-
-static void chart_show_result(void);
-static void chart_fail_result(void);
-
+/* 500ms 刷新定时器：状态栏颜色 / 卡片数值 / 传感器页 / 设置页（都在 LVGL 线程）。 */
 static void refresh_timer_cb(lv_timer_t *t)
 {
-    if (s_chart_result == 1) {
-        s_chart_result = 0;
-        chart_show_result();
-    } else if (s_chart_result == 2) {
-        s_chart_result = 0;
-        chart_fail_result();
-    }
-
 #if UI_ASSISTANT_PAGE
     refresh_selftest_label();      /* 小智页顶部「音频自检」按钮的文字/结果 */
 #endif
@@ -1923,6 +2387,7 @@ static void refresh_timer_cb(lv_timer_t *t)
     if (s_detail_visible) {
         detail_apply_entity();     /* 子页数值跟着轮询刷新 */
     }
+    sensor_refresh();              /* 传感器页的大号数值（不可见时直接返回）*/
     (void)t;
 
     {
@@ -1960,6 +2425,7 @@ static void refresh_timer_cb(lv_timer_t *t)
     refresh_values();
     refresh_status_page();
     refresh_bt_ui();               /* 蓝牙图标颜色 + 设置页状态（本版恒「未启用」） */
+    wx_refresh_ui();               /* 天气页开着时才真的刷（内部有可见性判断 + 判重）*/
 
     if (s_hint) {
         if (s_layout_valid) {
@@ -1978,70 +2444,12 @@ static void refresh_timer_cb(lv_timer_t *t)
 /* 构建                                                                       */
 /* ------------------------------------------------------------------------- */
 
-/* 折线图结果的两个消费者：只在 LVGL 线程（refresh_timer_cb）里被调用。 */
-static void chart_show_result(void)
-{
-    if (s_chart_res.gen != s_chart_gen || !s_chart_wanted) {
-        ESP_LOGI(TAG, "折线图结果已过期，丢弃 (%d != %d)", s_chart_res.gen, s_chart_gen);
-        return;
-    }
-    ui_home_show_chart(s_chart_res.entity, s_chart_res.vals, s_chart_res.n,
-                       s_chart_res.vmin, s_chart_res.vmax, s_chart_res.vavg);
-}
-
-static void chart_fail_result(void)
-{
-    if (s_chart_fail_gen != s_chart_gen) {
-        return;
-    }
-    const ha_entity_t *ent = ha_client_find(s_chart_fail_entity);
-    lv_label_set_text(s_chart_title, ent ? ent->name : s_chart_fail_entity);
-    lv_label_set_text(s_chart_span, "取不到历史数据，稍后再试");
-    lv_label_set_text(s_chart_min, "");
-    lv_label_set_text(s_chart_avg, "");
-    lv_label_set_text(s_chart_max, "");
-    s_chart_pts_n = 0;
-    lv_obj_invalidate(s_chart);
-    /* 页面保持打开（返回手势照常），但允许下次重新请求 */
-    s_chart_wanted = false;
-    s_chart_visible = true;
-    lv_obj_set_pos(s_chart_page, 0, 0);
-    lv_obj_set_style_translate_x(s_chart_page, 0, 0);
-    lv_obj_remove_flag(s_chart_page, LV_OBJ_FLAG_HIDDEN);
-}
-
 static void worker_task(void *arg)
 {
     (void)arg;
     while (true) {
         cmd_t cmd;
         if (xQueueReceive(s_cmd_q, &cmd, portMAX_DELAY) == pdTRUE) {
-            if (strcmp(cmd.service, "chart") == 0) {
-                static float vals[32];
-                int n = 0;
-                float vmin = 0, vmax = 0, vavg = 0;
-                esp_err_t he = ha_client_history(cmd.entity, 6, vals, 32, &n, &vmin, &vmax, &vavg);
-                bg_image_set_paused(false);
-                if (he == ESP_OK && n > 0) {
-                    const int keep = (n > 32) ? 32 : n;
-                    memset(&s_chart_res, 0, sizeof(s_chart_res));
-                    snprintf(s_chart_res.entity, sizeof(s_chart_res.entity), "%s", cmd.entity);
-                    memcpy(s_chart_res.vals, vals, sizeof(float) * (size_t)keep);
-                    s_chart_res.n = keep;
-                    s_chart_res.vmin = vmin;
-                    s_chart_res.vmax = vmax;
-                    s_chart_res.vavg = vavg;
-                    s_chart_res.gen = cmd.gen;
-                    s_chart_result = 1;      /* 交给 refresh_timer_cb 画 */
-                } else {
-                    ESP_LOGW(TAG, "折线图无数据: %s (%s)", cmd.entity, esp_err_to_name(he));
-                    snprintf(s_chart_fail_entity, sizeof(s_chart_fail_entity), "%s", cmd.entity);
-                    s_chart_fail_gen = cmd.gen;
-                    s_chart_result = 2;
-                }
-                continue;
-            }
-
             ESP_LOGI(TAG, "%s %s %s", cmd.service, cmd.entity, cmd.attrs);
             if (cmd.knob) {
                 /* 旋钮命令：POST 一回来就放开 in-flight，让 UI 能马上补最新值。
@@ -2396,43 +2804,28 @@ static lv_color_t detail_grad_color(int t, int lo, int hi)
     return detail_on_bg(kelvin_to_color(k));
 }
 
-/** 色温文字的档位：<3000 暖光 / <4500 中性 / <5500 自然 / 其它 冷光。*/
-static const char *detail_ct_word(int k)
-{
-    if (k < 3000) return "暖光";
-    if (k < 4500) return "中性";
-    if (k < 5500) return "自然";
-    return "冷光";
-}
-
 /** 中间的百分比文字（旋钮 / 拖动 / 轮询三条路径都走它）。
- *  亮度下限是 1%：0% 会被 Home Assistant 当成"关灯"，开关才是唯一的电源控制。*/
+ *  亮度下限是 1%：0% 会被 Home Assistant 当成"关灯"，电源只归电源键。
+ *  数字 / 单位 / 档位文字的排版与配色统一在 light_apply_values 里：
+ *  它直接读圆环的当前值，所以这里只需要把环已经改好的值刷到屏幕上。 */
 static void detail_set_br_text(int pct)
 {
     if (s_detail_br_value == NULL) {
         return;
     }
-    if (pct < 1) {
-        pct = 1;
-    }
-    if (pct > 100) {
-        pct = 100;
-    }
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d%%", pct);
-    lv_label_set_text(s_detail_br_value, buf);
+    (void)pct;                        /* 值已经写进圆环，读环比传参更准 */
+    light_apply_values(ha_client_find(s_detail_entity));
     detail_marker_update();          /* 焦点值点跟着亮度环当前值走 */
 }
 
-/** 中间的「3500K 中性」文字。 */
+/** 中间的色温数字（同样交给 light_apply_values：单位是 K、档位文字是「色温」）。*/
 static void detail_set_ct_text(int k)
 {
     if (s_detail_ct_value == NULL) {
         return;
     }
-    char buf[28];
-    snprintf(buf, sizeof(buf), "%dK %s", k, detail_ct_word(k));
-    lv_label_set_text(s_detail_ct_value, buf);
+    (void)k;
+    light_apply_values(ha_client_find(s_detail_entity));
     detail_marker_update();          /* 焦点值点跟着色温环当前值走 */
 }
 
@@ -2481,22 +2874,289 @@ static void detail_set_name(const char *name)
     if (name[0] == '\0') {
         lv_label_set_text(s_detail_name, "");
         lv_obj_add_flag(s_detail_name, LV_OBJ_FLAG_HIDDEN);
+        if (s_detail_name_row != NULL) {
+            lv_obj_add_flag(s_detail_name_row, LV_OBJ_FLAG_HIDDEN);
+        }
         return;
     }
     char line[48];
     detail_name_line(name, line, sizeof(line));
     lv_label_set_text(s_detail_name, line);
     lv_obj_remove_flag(s_detail_name, LV_OBJ_FLAG_HIDDEN);
+    if (s_detail_name_row != NULL) {
+        lv_obj_remove_flag(s_detail_name_row, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
-/** 名字行的位置 / 宽度跟着页面走：灯 y=148 宽 100，空调 y=134 宽 120。*/
-static void detail_place_name(bool ac)
+/* ------------------------------------------------------------------------- */
+/* 灯光页：设计稿的"上中下三段式"（几何见文件头 LIGHT_* 宏）                    */
+/*   y=66  名字行（灯泡图标 16 + 间距 6 + 实体名）                              */
+/*   y=136 大号数值（montserrat_28）+ 单位（montserrat_20，低 8px）             */
+/*   y=196 档位文字「亮度 / 色温」（cjk16，字距 4px）                           */
+/*   y=226 控件行：分段控件（亮度/色温）+ 40x40 圆形电源键                      */
+/*   y=282 提示行「旋转调节 · 左滑返回」                                        */
+/* ------------------------------------------------------------------------- */
+
+/** 氛围光圆盘：一个纯色圆（半径 r、透明度 opa），圆心 (cx,cy)。
+ *  注意 lv_obj_remove_style_all() 会把 radius / bg / border 全部清掉，
+ *  所以这里必须把半径、底色、透明度、边框宽度重新写一遍（这是"圆盘不显示"的第二个坑）。 */
+static lv_obj_t *detail_make_glow_disc(lv_obj_t *parent, int r, lv_opa_t opa, int cx, int cy)
 {
-    if (s_detail_name == NULL) {
+    lv_obj_t *o = lv_obj_create(parent);
+    if (o == NULL) {
+        return NULL;
+    }
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, r * 2, r * 2);
+    lv_obj_set_pos(o, cx - r, cy - r);
+    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(o, lv_color_hex(0x4C8DFF), 0);
+    lv_obj_set_style_bg_opa(o, opa, 0);
+    lv_obj_set_style_border_width(o, 0, 0);
+    lv_obj_set_style_pad_all(o, 0, 0);
+    lv_obj_set_style_shadow_width(o, 0, 0);
+    lv_obj_set_style_outline_width(o, 0, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    return o;
+}
+
+/** 三层氛围光统一刷：显隐 + 颜色 + 透明度。
+ *  base 用原始色相（灯色 / 预设色），关掉时压到 1/4，仍留一点"灯罩在发光"的感觉
+ *  （设计稿 .is-off .light-bg{opacity:.12}）。 */
+static void detail_apply_glow(lv_color_t base, bool on)
+{
+    for (int i = 0; i < GLOW_DISC_N; i++) {
+        lv_obj_t *o = s_glow_disc[i];
+        if (o == NULL) {
+            continue;
+        }
+        detail_set_hidden(o, false);
+        lv_obj_set_style_bg_color(o, base, 0);
+        lv_obj_set_style_bg_opa(o, on ? k_glow_opa[i] : (lv_opa_t)(k_glow_opa[i] / 4), 0);
+        lv_obj_invalidate(o);
+    }
+}
+
+/** 灯的环 / 光晕以屏幕中心为心（detail_make_arc 是按 (DETAIL_CX,DETAIL_CY) 摆的）。*/
+static void light_recenter(lv_obj_t *o, int r)
+{
+    if (o != NULL) {
+        lv_obj_set_pos(o, DETAIL_CX - r, LIGHT_CY - r);
+    }
+}
+
+/** 大号数值 + 单位：数字 montserrat_28、单位 montserrat_20（低 8px），
+ *  两个标签一起水平居中（设计稿 .l-temp 的 flex 居中）。
+ *  位置没变就不调 set_pos：否则 500ms 轮询会把两个标签每帧标脏重绘。 */
+static void light_place_value(void)
+{
+    if (s_detail_br_value == NULL || s_detail_ct_value == NULL) {
         return;
     }
-    lv_obj_set_width(s_detail_name, ac ? AC_NAME_W : DETAIL_NAME_W);
-    lv_obj_align(s_detail_name, LV_ALIGN_TOP_MID, 0, ac ? AC_NAME_Y : DETAIL_NAME_Y);
+    lv_point_t nsz = {0, 0};
+    lv_point_t usz = {0, 0};
+    const char *ntxt = lv_label_get_text(s_detail_br_value);
+    const char *utxt = lv_label_get_text(s_detail_ct_value);
+    if (ntxt != NULL && ntxt[0] != '\0') {
+        lv_text_get_size(&nsz, ntxt, lv_obj_get_style_text_font(s_detail_br_value, 0), 0, 0,
+                     LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    if (utxt != NULL && utxt[0] != '\0') {
+        lv_text_get_size(&usz, utxt, &lv_font_montserrat_20, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    const int gap = (usz.x > 0) ? 3 : 0;
+    const int x0 = DETAIL_CX - (nsz.x + gap + usz.x) / 2;
+    if (s_light_num_x != x0) {
+        s_light_num_x = x0;
+        lv_obj_set_pos(s_detail_br_value, x0, LIGHT_VALUE_Y);
+    }
+    const int ux = x0 + nsz.x + gap;
+    if (s_light_unit_x != ux) {
+        s_light_unit_x = ux;
+        lv_obj_set_pos(s_detail_ct_value, ux, LIGHT_VALUE_Y + LIGHT_UNIT_DY);
+    }
+}
+
+/** 灯光页的文案与配色：大号数值 / 单位 / 档位文字 / 提示行。
+ *  数值直接读圆环（环已经由 apply_entity / 旋钮 / 拖动刷过），所以这里不碰实体值：
+ *  "转动时先动数字、HA 落定后再对齐"的老规矩完全不变。
+ *  关机态按设计稿 .scr.is-off：大号数字 "OFF"、档位文字 "已关闭" 并压暗。 */
+static void light_apply_values(const ha_entity_t *e)
+{
+    if (s_detail_br_value == NULL || s_detail_ct_value == NULL) {
+        return;
+    }
+    const bool on = detail_device_on(e);
+    const bool has_tint = (e != NULL) && e->has_tint;
+    const bool has_br = (e != NULL) && e->has_brightness;
+    const bool ct = (s_detail_knob_target == DETAIL_KNOB_CT) && has_tint;
+    const int pct = (s_detail_br_arc != NULL) ? (int)lv_arc_get_value(s_detail_br_arc) : 100;
+    const int k = (s_detail_ct_arc != NULL) ? (int)lv_arc_get_value(s_detail_ct_arc) : 4000;
+
+    char num[8];
+    const char *unit = "";
+    const char *label = "";
+    lv_color_t num_col = lv_color_white();
+    lv_color_t label_col = LIGHT_INK_MUTED;
+    if (!on) {
+        snprintf(num, sizeof(num), "OFF");
+        label = "已关闭";
+        num_col = LIGHT_OFF_NUM;
+        label_col = LIGHT_OFF_LABEL;
+    } else if (ct) {
+        snprintf(num, sizeof(num), "%d", k);
+        unit = "K";
+        label = "色温";
+        num_col = s_detail_accent;          /* 设计稿：色温档的数字用灯色 */
+    } else {
+        snprintf(num, sizeof(num), "%d", pct);
+        unit = has_br ? "%" : "";
+        label = has_br ? "亮度" : "开";
+    }
+
+    if (strcmp(num, s_light_num_shown) != 0) {
+        snprintf(s_light_num_shown, sizeof(s_light_num_shown), "%s", num);
+        lv_label_set_text(s_detail_br_value, num);
+        /* 字体按内容选：数字走 64 号数字字体，OFF 走 montserrat_28（数字字体没有字母）*/
+        lv_obj_set_style_text_font(s_detail_br_value, big_num_font_for(num), 0);
+        light_place_value();                 /* 位数变了（9 → 100）要重新居中 */
+    }
+    if (strcmp(unit, s_light_unit_shown) != 0) {
+        snprintf(s_light_unit_shown, sizeof(s_light_unit_shown), "%s", unit);
+        lv_label_set_text(s_detail_ct_value, unit);
+        light_place_value();
+    }
+    if (s_detail_off_hint != NULL && strcmp(label, s_light_label_shown) != 0) {
+        snprintf(s_light_label_shown, sizeof(s_light_label_shown), "%s", label);
+        lv_label_set_text(s_detail_off_hint, label);
+    }
+    lv_obj_set_style_text_color(s_detail_br_value, num_col, 0);
+    lv_obj_set_style_text_color(s_detail_ct_value, lv_color_white(), 0);
+    lv_obj_set_style_text_opa(s_detail_ct_value, on ? 184 : 120, 0);   /* .72 / 压暗 */
+    if (s_detail_off_hint != NULL) {
+        lv_obj_set_style_text_color(s_detail_off_hint, label_col, 0);
+    }
+    /* 名字行（设计稿 .l-name：#D7DEE9；关灯时压到 #5A6373）*/
+    if (s_detail_name != NULL) {
+        lv_obj_set_style_text_color(s_detail_name, on ? LIGHT_INK : LIGHT_ICON_OFF, 0);
+    }
+    detail_place_hint(LIGHT_HINT_Y);
+    detail_set_hint_forced("旋转调节 · 左滑返回");
+    if (s_detail_hint != NULL) {
+        lv_obj_set_style_text_color(s_detail_hint, LIGHT_HINT_INK, 0);
+    }
+    detail_marker_update();                  /* 值点跟着环的当前值走 */
+}
+
+/** 分段控件 / 电源键的外观：
+ *   选中项 = 白 13% 底 + 近白字（设计稿 .l-seg button.on）；
+ *   未选   = 透明底 + #78829A 字；
+ *   整组在关机时压到 42%（.scr.is-off .l-seg）；色温键在灯不支持色温时置灰；
+ *   电源键：开 = 灯色实心 + 深色图标，关 = 白 6% 底 + 浅灰图标（.p-btn）。 */
+static void light_apply_chips(bool on, bool has_tint, bool ct)
+{
+    const int8_t st = (int8_t)((on ? 1 : 0) | (has_tint ? 2 : 0) | (ct ? 4 : 0));
+    if (st != s_light_chip_shown) {
+        s_light_chip_shown = st;
+        for (int i = 0; i < 2; i++) {
+            lv_obj_t *btn = s_light_seg_btn[i];
+            lv_obj_t *lbl = s_light_seg_lbl[i];
+            if (btn == NULL) {
+                continue;
+            }
+            const bool sel = (i == 1) ? ct : !ct;
+            const bool usable = (i == 0) || has_tint;
+            lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(btn, sel ? 33 : LV_OPA_TRANSP, 0);   /* 13% */
+            if (lbl != NULL) {
+                lv_obj_set_style_text_color(lbl, sel ? LIGHT_SEG_TXT_ON : LIGHT_SEG_TXT, 0);
+                lv_obj_set_style_text_opa(lbl, usable ? LV_OPA_COVER : LV_OPA_40, 0);
+            }
+        }
+        if (s_light_seg != NULL) {
+            lv_obj_set_style_opa(s_light_seg, on ? LV_OPA_COVER : 107, 0);   /* .42 */
+        }
+    }
+    s_dial_pwr_on = on;
+    if (s_dial_power != NULL) {
+        lv_obj_set_style_bg_color(s_dial_power, on ? s_detail_accent : lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(s_dial_power, on ? LV_OPA_COVER : 15, 0);        /* 6% */
+        lv_obj_set_style_border_opa(s_dial_power, on ? LV_OPA_TRANSP : 23, 0);   /* 9% */
+        lv_obj_invalidate(s_dial_power);        /* 图标颜色跟着开关状态变 */
+    }
+}
+
+/** 提示行文字：绕开 detail_set_hint 的"文字缓存"（空调/风扇也用同一行，
+ *  如果只改 label 不改缓存，切页后那边会以为文字没变而不刷新）。 */
+static void detail_set_hint_forced(const char *text)
+{
+    if (s_detail_hint == NULL || text == NULL) {
+        return;
+    }
+    if (strcmp(text, s_detail_hint_shown) == 0) {
+        lv_obj_remove_flag(s_detail_hint, LV_OBJ_FLAG_HIDDEN);
+        return;                          /* 文字没变：500ms 轮询不重排这一行 */
+    }
+    snprintf(s_detail_hint_shown, sizeof(s_detail_hint_shown), "%.15s", text);
+    lv_label_set_text(s_detail_hint, text);
+    lv_obj_remove_flag(s_detail_hint, LV_OBJ_FLAG_HIDDEN);
+}
+
+/** 提示行的纵向位置：灯 / 风扇 282，空调 246（没变就不重摆，省一次重绘）。*/
+static void detail_place_hint(int y)
+{
+    if (s_detail_hint == NULL || s_hint_y_shown == y) {
+        return;
+    }
+    s_hint_y_shown = (int8_t)y;
+    lv_obj_align(s_detail_hint, LV_ALIGN_TOP_MID, 0, y);
+}
+
+/** 共用电源键的位置 / 尺寸：灯 40x40 @232、风扇 40x40 @252、空调 44x44 @(261,179)。
+ *  size 传 0 表示沿用上一次的尺寸（灯 / 风扇都是 40）。 */
+static void detail_place_power(int size, int x, int y)
+{
+    if (s_dial_power == NULL) {
+        return;
+    }
+    if (s_pwr_size_shown != size) {
+        s_pwr_size_shown = size;
+        lv_obj_set_size(s_dial_power, size, size);
+        s_pwr_x_shown = -1;                /* 尺寸变了，位置必须重设 */
+        s_pwr_y_shown = -1;
+    }
+    if (s_pwr_x_shown != x || s_pwr_y_shown != y) {
+        s_pwr_x_shown = x;
+        s_pwr_y_shown = y;
+        lv_obj_set_pos(s_dial_power, x, y);
+    }
+}
+
+/** 名字行的位置 / 宽度跟着页面走：灯 = 图标 + 名字一行居中，空调 y=134 宽 120。*/
+static void detail_place_name(bool ac)
+{
+    if (s_detail_name_row == NULL) {
+        return;
+    }
+    /* 整行固定 x=60..300，纵向按页面放：灯 / 风扇 y=66，空调 y=134。
+       图标显隐：灯 = 灯泡、风扇 = 风图标、空调两个都不要（只留名字）。 */
+    lv_obj_set_pos(s_detail_name_row, 60, ac ? AC_NAME_ROW_Y : LIGHT_NAME_Y);
+    const bool show_bulb = !ac && !s_detail_fan;
+    const bool show_wind = !ac && s_detail_fan;
+    if (s_detail_icon != NULL) {
+        if (show_bulb) {
+            lv_obj_remove_flag(s_detail_icon, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_detail_icon, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_fan_name_icon != NULL) {
+        if (show_wind) {
+            lv_obj_remove_flag(s_fan_name_icon, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_fan_name_icon, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 static void detail_set_hidden(lv_obj_t *obj, bool hidden)
@@ -2547,6 +3207,127 @@ static void detail_apply_switch_style(bool on)
                               LV_PART_KNOB);
 }
 
+/** 统一的电源动作：开关（空调 / 风扇）和灯光页的圆形电源键都走这里。
+ *  和原来 detail_power_changed_cb 的逻辑一模一样，只是入口多了一个。 */
+static void detail_power_set(bool want_on)
+{
+    s_sw_override_on = want_on;
+    s_sw_override_until = lv_tick_get() + OVERRIDE_MS;
+    s_sw_on_shown = -1;               /* CHECKED 状态交给下一次 detail_apply_entity 对齐 */
+    s_sw_on_now = want_on;
+
+    if (!want_on) {
+        /* 关掉：丢掉还没补发的旋钮值（灯 / 风扇都一样：别让关机后补发的
+           brightness_pct / percentage 又把它打开）*/
+        s_knob_dirty = false;
+        detail_knob_timer_park();
+        if (s_detail_ac) {
+            /* 空调关机 = hvac 模式变成 off：本地先跟着变（环变暗、模式键全灭），
+               别让模式灯还亮着等 HA 那 5 秒轮询 */
+            snprintf(s_ac_mode_local, sizeof(s_ac_mode_local), "off");
+            s_ac_mode_local_until = lv_tick_get() + OVERRIDE_MS;
+            s_ac_mode_shown[0] = '\0';
+        }
+    } else if (s_detail_ac) {
+        /* 开机：恢复到 HA 记着的那个模式（等它下一次 state_changed / 轮询）*/
+        s_ac_mode_local_until = 0;
+    }
+
+    if (s_detail_ac) {
+        detail_apply_switch_style(want_on);
+    }
+    {
+        /* 灯 / 风扇 / 空调都是圆形电源键：底色 / 环隐现 / 电源键配色，
+           全在这一帧刷完（空调还要刷副标题和模式键）*/
+        s_detail_fg_dirty = true;
+        s_light_chip_shown = -1;
+        s_fan_chip_shown = -1;
+        detail_update_ambience();
+        detail_apply_focus();
+        if (s_detail_ac) {
+            const ha_entity_t *ent = ha_client_find(s_detail_entity);
+            if (ent != NULL) {
+                ac_apply_entity(ent);
+            }
+        }
+    }
+
+    if (s_detail_entity[0] == '\0' || s_cmd_q == NULL) {
+        return;
+    }
+    cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    snprintf(cmd.entity, sizeof(cmd.entity), "%s", s_detail_entity);
+    snprintf(cmd.service, sizeof(cmd.service), "%s", want_on ? "turn_on" : "turn_off");
+    xQueueSend(s_cmd_q, &cmd, 0);
+}
+
+/** 灯光页电源键：点一下切换开 / 关（设计稿 .p-btn）。 */
+static void light_power_cb(lv_event_t *e)
+{
+    (void)e;
+    const ha_entity_t *ent = ha_client_find(s_detail_entity);
+    bool on;
+    if (s_detail_ac) {
+        /* 空调的 state 是 cool/heat/…/off，没有 "on"：按"模式 != off"判 */
+        on = (ent != NULL) && !ac_state_is_off(ac_state_now(ent));
+    } else {
+        on = detail_device_on(ent);
+    }
+    detail_power_set(!on);
+}
+
+/** 分段控件：亮度 / 色温（设计稿 .l-seg button）。user_data = 0 亮度 / 1 色温。 */
+static void light_tab_cb(lv_event_t *e)
+{
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    const ha_entity_t *ent = ha_client_find(s_detail_entity);
+    if (idx == 1 && (ent == NULL || !ent->has_tint)) {
+        return;                        /* 这只灯不支持色温：按键是灰的，点了也不动 */
+    }
+    s_detail_knob_target = (idx == 1) ? DETAIL_KNOB_CT : DETAIL_KNOB_BR;
+    ESP_LOGI(TAG, "灯光页切换档位: %s", idx == 1 ? "色温" : "亮度");
+    s_light_chip_shown = -1;           /* 强制刷一次高亮 */
+    detail_apply_focus();
+}
+
+/** 电源图标：缺口圆环 + 顶部竖线（设计稿 #i-power，19px / stroke 1.9）。*/
+static void light_power_draw_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if (obj == NULL || layer == NULL) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const int cx = (a.x1 + a.x2) / 2;
+    const int cy = (a.y1 + a.y2) / 2;
+    const lv_color_t col = s_dial_pwr_on ? LIGHT_PWR_INK_ON : LIGHT_PWR_INK;
+
+    lv_draw_arc_dsc_t d;
+    lv_draw_arc_dsc_init(&d);
+    d.color = col;
+    d.opa = LV_OPA_COVER;
+    d.width = 2;
+    d.rounded = 1;
+    d.radius = 7;
+    d.center.x = cx;
+    d.center.y = cy + 1;
+    d.start_angle = 305;               /* 缺口朝上：305° → 235° */
+    d.end_angle = 235;
+    lv_draw_arc(layer, &d);
+
+    lv_draw_rect_dsc_t r;
+    lv_draw_rect_dsc_init(&r);
+    r.bg_color = col;
+    r.bg_opa = LV_OPA_COVER;
+    r.radius = 1;
+    lv_area_t bar = {(lv_coord_t)(cx - 1), (lv_coord_t)(cy - 7),
+                     (lv_coord_t)(cx + 1), (lv_coord_t)(cy + 1)};
+    lv_draw_rect(layer, &r, &bar);
+}
+
 /** 环 / 光晕 / 灯泡的颜色：先按底色做对比度处理，再刷到样式上。*/
 static void detail_apply_dial_colors(void)
 {
@@ -2559,8 +3340,9 @@ static void detail_apply_dial_colors(void)
         }
         const char *preset = fan_preset_now(e);
         s_fan_accent = detail_on_bg(fan_preset_color(preset));
-        /* 开关的"开"色 = 预设色：放在判重之前，颜色变了能跟着刷 */
-        detail_apply_switch_style(s_sw_on_now);
+        /* 氛围光必须放在"预设没变就 return"之前：否则第二次进风扇页时
+           这段直接跳过，三个圆盘永远停在 detail_hide_light(true) 藏起来的状态。 */
+        detail_apply_glow(fan_preset_color(preset), detail_device_on(e));
         if (strcmp(preset, s_fan_preset_shown) == 0) {
             return;
         }
@@ -2571,13 +3353,14 @@ static void detail_apply_dial_colors(void)
         if (s_fan_glow) {
             lv_obj_set_style_arc_color(s_fan_glow, s_fan_accent, LV_PART_INDICATOR);
         }
-        if (s_fan_icon) {
-            lv_obj_invalidate(s_fan_icon);       /* 自绘图标：颜色变了得手动失效 */
+        if (s_fan_name_icon) {
+            lv_obj_invalidate(s_fan_name_icon);      /* 自绘图标：颜色变了得手动失效 */
         }
-        /* 预设键的高亮 / 显示哪些键跟着预设走；能力（preset_modes）每台不同，
-           所以和"预设真的变了"一起刷，500ms 轮询不会再把 4 个键重绘一遍。 */
-        fan_refresh_chips(e, preset);
-        fan_refresh_osc(e);                      /* 摇头的开色跟着预设色走 */
+        /* 胶囊（预设名 / 电源键开色）跟着预设走 */
+        s_fan_chip_shown = -1;
+        fan_apply_chips(e, preset, detail_device_on(e));
+        /* 氛围光 = 预设色的原始色相（设计稿 .light-bg 在风扇页同样存在）*/
+        detail_apply_glow(fan_preset_color(preset), detail_device_on(e));
         return;
     }
     if (s_detail_ac) {
@@ -2631,6 +3414,11 @@ static void detail_apply_dial_colors(void)
     /* 这两块是自绘的：样式变了不会自动重画，得手动失效 */
     if (s_detail_ct_arc) lv_obj_invalidate(s_detail_ct_arc);
     if (s_detail_icon)   lv_obj_invalidate(s_detail_icon);
+
+    /* 氛围光（设计稿 .light-bg）：内圈灯色 22% + 中圈 11% + 外圈 4.7%，关灯压到 1/4。
+       颜色用**原始灯色**（detail_light_base），不用对比度处理后的 accent ——
+       accent 会在亮底上被推成灰白，看起来就像"没有光晕"。 */
+    detail_apply_glow(detail_light_base(), on);
 }
 
 /** 环是不是正显示着（对象在、没被藏）。*/
@@ -2686,10 +3474,10 @@ static void detail_marker_update(void)
         col = s_ac_accent;
     } else {
         const ha_entity_t *e = ha_client_find(s_detail_entity);
-        const bool br = (s_detail_knob_target != DETAIL_KNOB_CT);
-        ring = br ? s_detail_br_arc : s_detail_ct_arc;
-        radius = br ? (DETAIL_BR_R - DETAIL_BR_W / 2) : (DETAIL_CT_R - DETAIL_CT_W / 2);
-        col = br ? s_detail_accent : detail_on_bg(kelvin_to_color(detail_kelvin_now(e)));
+        const bool ct = (s_detail_knob_target == DETAIL_KNOB_CT) && (e != NULL) && e->has_tint;
+        ring = ct ? s_detail_ct_arc : s_detail_br_arc;
+        radius = LIGHT_R - LIGHT_W / 2;      /* 灯页单环：r=156 的中线 */
+        col = ct ? detail_on_bg(kelvin_to_color(detail_kelvin_now(e))) : s_detail_accent;
         if (!detail_device_on(e)) {
             ring = NULL;                      /* 关灯：整组圆盘是藏着的 */
         }
@@ -2698,6 +3486,13 @@ static void detail_marker_update(void)
     if (!detail_ring_visible(ring)) {
         lv_obj_add_flag(s_detail_marker, LV_OBJ_FLAG_HIDDEN);
         return;
+    }
+    /* 灯光页的值点按设计稿放大到 14px（r=7.5），空调 / 风扇保持 10px */
+    const int msz = (!s_detail_ac && !s_detail_fan) ? LIGHT_MARKER_SIZE : DETAIL_MARKER_SIZE;
+    static int msz_shown;
+    if (msz_shown != msz) {
+        msz_shown = msz;
+        lv_obj_set_size(s_detail_marker, msz, msz);
     }
 
     const int32_t vmin = lv_arc_get_min_value(ring);
@@ -2714,9 +3509,11 @@ static void detail_marker_update(void)
         }
     }
     const int deg = (DETAIL_ANG_START + DETAIL_ANG_SWEEP * t / 1000) % 360;
+    /* 灯 / 风扇的环心是屏幕中心 (180,180)，空调是 (180,196) */
+    const int cy = LIGHT_CY;      /* 三个页面现在都以屏幕中心 (180,180) 为环心 */
     const int mx = DETAIL_CX + (int)(((int32_t)radius * lv_trigo_cos((int16_t)deg)) >> LV_TRIGO_SHIFT);
-    const int my = DETAIL_CY + (int)(((int32_t)radius * lv_trigo_sin((int16_t)deg)) >> LV_TRIGO_SHIFT);
-    lv_obj_set_pos(s_detail_marker, mx - DETAIL_MARKER_SIZE / 2, my - DETAIL_MARKER_SIZE / 2);
+    const int my = cy + (int)(((int32_t)radius * lv_trigo_sin((int16_t)deg)) >> LV_TRIGO_SHIFT);
+    lv_obj_set_pos(s_detail_marker, mx - msz / 2, my - msz / 2);
     lv_obj_set_style_bg_color(s_detail_marker, col, 0);
     lv_obj_remove_flag(s_detail_marker, LV_OBJ_FLAG_HIDDEN);
 }
@@ -2736,103 +3533,135 @@ static void detail_apply_focus(void)
     const lv_color_t muted = detail_muted_on_bg();
 
     if (s_detail_fan) {
-        /* 风扇也只有一个环：它永远是焦点。开着才有光晕 / 值点 / 提示；
-           关掉时环压暗、并且**不可点**——fan.set_percentage 会顺带开机，
-           而电源只归开关管（视线里那圈刻度还在，只是拨不动）。 */
+        /* 风扇页（设计稿 .scr[data-scr="fan"]）：单环 + 预设胶囊 + 置灰的摇头胶囊
+           + 圆形电源键。开着才有光晕 / 值点；关掉时环压暗、不可点——
+           fan.set_percentage 会顺带开机，电源只归电源键（刻度还在，只是拨不动）。 */
         const ha_entity_t *e = ha_client_find(s_detail_entity);
         const bool on = detail_device_on(e);
         if (s_fan_arc) {
-            lv_obj_set_style_arc_width(s_fan_arc, FAN_W + 2, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_width(s_fan_arc, FAN_W, LV_PART_INDICATOR);
             lv_obj_set_style_arc_opa(s_fan_arc, on ? LV_OPA_COVER : DETAIL_DIM_OPA,
                                      LV_PART_INDICATOR);
-            /* 轨道（没填满那圈）：焦点环亮一档，关机时再暗一档 */
             lv_obj_set_style_arc_opa(s_fan_arc, on ? DETAIL_TRACK_OPA : DETAIL_TRACK_DIM_OPA,
                                      LV_PART_MAIN);
             lv_obj_set_clickable(s_fan_arc, on);
         }
         if (s_fan_glow) {
-            lv_obj_set_style_arc_opa(s_fan_glow, on ? DETAIL_GLOW_OPA : LV_OPA_TRANSP,
-                                     LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(s_fan_glow, on ? 26 : LV_OPA_TRANSP, LV_PART_INDICATOR);
         }
         if (s_fan_pct) {
             lv_obj_set_style_text_opa(s_fan_pct, on ? LV_OPA_COVER : DETAIL_DIM_OPA, 0);
             lv_obj_set_style_text_color(s_fan_pct, on ? fg : muted, 0);
         }
-        if (s_fan_preset) {
-            lv_obj_set_style_text_color(s_fan_preset, detail_muted_on_bg(), 0);
+        if (s_fan_unit) {
+            lv_obj_set_style_text_opa(s_fan_unit, on ? 184 : 120, 0);
         }
-        detail_set_hint(on ? "旋钮：风速" : NULL);
+        if (s_fan_label) {
+            lv_obj_set_style_text_color(s_fan_label, on ? LIGHT_INK_MUTED : LIGHT_OFF_LABEL, 0);
+        }
+        if (s_detail_name != NULL) {
+            /* 名字行（设计稿 .l-name）：开 = #D7DEE9，关 = 压暗 */
+            lv_obj_set_style_text_color(s_detail_name, on ? LIGHT_INK : LIGHT_ICON_OFF, 0);
+        }
+        /* 控件行：预设 / 摇头 胶囊 + 共用电源键（x=252，见 FAN_CHIP_*）*/
+        detail_set_hidden(s_light_seg, true);
+        detail_set_hidden(s_dial_power, false);
+        detail_place_power(LIGHT_POWER, 252, LIGHT_SEG_Y + (LIGHT_SEG_H - LIGHT_POWER) / 2);
+        fan_apply_chips(e, fan_preset_now(e), on);
+        /* 氛围光（.light-bg）：预设色原始色相，三层同心圆 */
+        detail_apply_glow(fan_preset_color(fan_preset_now(e)), on);
+        detail_place_hint(LIGHT_HINT_Y);
+        detail_set_hint_forced("旋转调风速 · 左滑返回");
+        if (s_detail_hint != NULL) {
+            lv_obj_set_style_text_color(s_detail_hint, LIGHT_HINT_INK, 0);
+        }
         detail_marker_update();
         return;
     }
 
     if (s_detail_ac) {
-        /* 空调只有一个环：它永远是焦点。开着才有光晕，关掉连光晕都收掉。 */
+        /* 空调页（设计稿 dial 帧）：单环 10px + 光晕，和灯 / 风扇同一套观感。
+           开着才有光晕 / 值点；关掉环压暗、不可点（旋钮不发温度）。 */
         const ha_entity_t *e = ha_client_find(s_detail_entity);
         const bool on = (e != NULL) && !ac_state_is_off(ac_state_now(e));
         if (s_ac_arc) {
-            lv_obj_set_style_arc_width(s_ac_arc, AC_TEMP_W + 2, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_width(s_ac_arc, AC_TEMP_W, LV_PART_INDICATOR);
             lv_obj_set_style_arc_opa(s_ac_arc, on ? LV_OPA_COVER : DETAIL_DIM_OPA,
                                      LV_PART_INDICATOR);
-            /* 轨道（没填满那圈）：焦点环亮一档，关机时再暗一档 */
             lv_obj_set_style_arc_opa(s_ac_arc, on ? DETAIL_TRACK_OPA : DETAIL_TRACK_DIM_OPA,
                                      LV_PART_MAIN);
+            lv_obj_set_clickable(s_ac_arc, on);
         }
         if (s_ac_glow) {
-            lv_obj_set_style_arc_opa(s_ac_glow, on ? DETAIL_GLOW_OPA : LV_OPA_TRANSP,
-                                     LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(s_ac_glow, on ? 26 : LV_OPA_TRANSP, LV_PART_INDICATOR);
         }
         if (s_ac_temp_value) {
             lv_obj_set_style_text_opa(s_ac_temp_value, on ? LV_OPA_COVER : DETAIL_DIM_OPA, 0);
             lv_obj_set_style_text_color(s_ac_temp_value, on ? fg : muted, 0);
         }
-        detail_set_hint(NULL);            /* 单环：没有"选哪个"的问题 */
+        if (s_ac_unit) {
+            lv_obj_set_style_text_opa(s_ac_unit, on ? LV_OPA_COVER : DETAIL_DIM_OPA, 0);
+        }
+        /* 模式键 / 摆风胶囊 / 副标题：跟着模式色和开关状态刷 */
+        if (e != NULL) {
+            ac_refresh_chips(e, ac_state_now(e));
+        }
+        detail_place_hint(LIGHT_HINT_Y);
+        detail_set_hint_forced("旋转调温 · 左滑返回");
+        if (s_detail_hint != NULL) {
+            lv_obj_set_style_text_color(s_detail_hint, LIGHT_HINT_INK, 0);
+        }
         detail_marker_update();
         return;
     }
 
-    const bool br = (s_detail_knob_target == DETAIL_KNOB_BR);
+    /* ---- 灯光页：单环（设计稿只有一条 r=156 的环）+ 分段控件 ----
+       焦点 = 分段控件选中的那一项（亮度 / 色温）：两个值共用同一条环，
+       只显示当前那一环（另一环连对象一起藏起来，也就不会被手指点到）。 */
+    const ha_entity_t *le = ha_client_find(s_detail_entity);
+    const bool on = detail_device_on(le);
+    const bool has_tint = (le != NULL) && le->has_tint;
+    const bool has_br = (le != NULL) && le->has_brightness;
+    if (!has_tint) {
+        s_detail_knob_target = DETAIL_KNOB_BR;   /* 没有色温能力：只能调亮度 */
+    }
+    const bool ct = (s_detail_knob_target == DETAIL_KNOB_CT) && has_tint;
+    const bool br_show = on && has_br && !ct;
+    const bool ct_show = on && has_tint && ct;
+
+    detail_set_hidden(s_detail_br_arc, !br_show);
+    detail_set_hidden(s_detail_br_glow, !br_show);
+    detail_set_hidden(s_detail_ct_arc, !ct_show);
+    detail_set_hidden(s_detail_ct_glow, !ct_show);
     if (s_detail_br_arc) {
-        lv_obj_set_style_arc_width(s_detail_br_arc, br ? DETAIL_BR_W + 2 : DETAIL_BR_W,
-                                   LV_PART_INDICATOR);
-        lv_obj_set_style_arc_opa(s_detail_br_arc, br ? LV_OPA_COVER : DETAIL_DIM_OPA,
-                                 LV_PART_INDICATOR);
-        /* 轨道：只有焦点环能看到一圈"刻度"（70%），另一个压到 45% */
-        lv_obj_set_style_arc_opa(s_detail_br_arc, br ? DETAIL_TRACK_OPA : DETAIL_TRACK_DIM_OPA,
-                                 LV_PART_MAIN);
+        lv_obj_set_clickable(s_detail_br_arc, br_show);
+    }
+    if (s_detail_ct_arc) {
+        lv_obj_set_clickable(s_detail_ct_arc, ct_show);
+    }
+    if (s_detail_br_arc) {
+        lv_obj_set_style_arc_width(s_detail_br_arc, LIGHT_W, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(s_detail_br_arc, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(s_detail_br_arc, DETAIL_TRACK_OPA, LV_PART_MAIN);
     }
     if (s_detail_br_glow) {
-        lv_obj_set_style_arc_opa(s_detail_br_glow, br ? DETAIL_GLOW_OPA : LV_OPA_TRANSP,
+        lv_obj_set_style_arc_opa(s_detail_br_glow, br_show ? 26 : LV_OPA_TRANSP,
                                  LV_PART_INDICATOR);
     }
     if (s_detail_ct_glow) {
-        lv_obj_set_style_arc_opa(s_detail_ct_glow, br ? LV_OPA_TRANSP : DETAIL_GLOW_OPA,
+        lv_obj_set_style_arc_opa(s_detail_ct_glow, ct_show ? 26 : LV_OPA_TRANSP,
                                  LV_PART_INDICATOR);
     }
     if (s_detail_ct_arc) {
-        /* 轨道同理，只是焦点方向相反 */
-        lv_obj_set_style_arc_opa(s_detail_ct_arc, br ? DETAIL_TRACK_DIM_OPA : DETAIL_TRACK_OPA,
-                                 LV_PART_MAIN);
-        /* 色温环的渐变是自绘的：宽度/透明度都在回调里按焦点算 → 重画即可 */
+        lv_obj_set_style_arc_opa(s_detail_ct_arc, DETAIL_TRACK_OPA, LV_PART_MAIN);
+        /* 色温环的渐变是自绘的：切档 / 换灯都要重画 */
         lv_obj_invalidate(s_detail_ct_arc);
     }
-    if (s_detail_br_value) {
-        lv_obj_set_style_text_opa(s_detail_br_value, br ? LV_OPA_COVER : DETAIL_DIM_OPA, 0);
-        lv_obj_set_style_text_color(s_detail_br_value, br ? fg : muted, 0);
-    }
-    if (s_detail_ct_value) {
-        lv_obj_set_style_text_opa(s_detail_ct_value, br ? DETAIL_DIM_OPA : LV_OPA_COVER, 0);
-        lv_obj_set_style_text_color(s_detail_ct_value, br ? muted : fg, 0);
-    }
 
-    /* 小字提示 + 值点：只有灯开着、焦点环真的在屏幕上才露出来 */
-    const bool on = detail_device_on(ha_client_find(s_detail_entity));
-    const bool ring_on_screen = detail_ring_visible(br ? s_detail_br_arc : s_detail_ct_arc);
-    if (on && ring_on_screen) {
-        detail_set_hint(br ? "旋钮：亮度" : "旋钮：色温");
-    } else {
-        detail_set_hint(NULL);
-    }
+    light_apply_chips(on, has_tint, ct);
+    light_apply_values(le);
+    detail_place_power(LIGHT_POWER, 232, LIGHT_SEG_Y + (LIGHT_SEG_H - LIGHT_POWER) / 2);
+    detail_set_hidden(s_dial_power, false);
     detail_marker_update();
 }
 
@@ -2881,9 +3710,9 @@ static void detail_ct_grad_draw_cb(lv_event_t *e)
     d.radius = (uint16_t)r;
     d.center.x = area.x1 + r;
     d.center.y = area.y1 + r;
-    d.opa = (s_detail_knob_target == DETAIL_KNOB_CT) ? LV_OPA_COVER : DETAIL_DIM_OPA;
-    /* 焦点环的指示灯加粗 2px（和亮度环的规则一致），没焦点时保持细描边 */
-    d.width = DETAIL_CT_W + ((s_detail_knob_target == DETAIL_KNOB_CT) ? 2 : 0);
+    d.opa = LV_OPA_COVER;
+    /* 设计稿里亮度 / 色温共用同一条 10px 的环（不再分粗细）*/
+    d.width = LIGHT_W;
 
     for (int seg = a0; seg < a1; seg += DETAIL_GRAD_STEP) {
         int seg_end = seg + DETAIL_GRAD_STEP;
@@ -2899,7 +3728,8 @@ static void detail_ct_grad_draw_cb(lv_event_t *e)
     }
 }
 
-/** 圆盘中间那颗灯泡：两笔就够（玻璃泡 = 圆，灯颈/灯座 = 两个小圆角矩形）。*/
+/** 名字行左侧那颗灯泡（设计稿 .l-name .ic，16x16、颜色 #8D97A8 / 关灯 #5A6373）：
+ *  玻璃泡 = 圆，灯颈 / 灯座 = 两个小圆角矩形，三笔就够。 */
 static void detail_bulb_draw_cb(lv_event_t *e)
 {
     lv_obj_t *obj = lv_event_get_target(e);
@@ -2910,23 +3740,25 @@ static void detail_bulb_draw_cb(lv_event_t *e)
     lv_area_t a;
     lv_obj_get_coords(obj, &a);
     const int cx = (a.x1 + a.x2) / 2;
+    const bool on = detail_device_on(ha_client_find(s_detail_entity));
 
     lv_draw_rect_dsc_t d;
     lv_draw_rect_dsc_init(&d);
-    d.bg_color = s_detail_accent;
+    d.bg_color = on ? LIGHT_ICON_INK : LIGHT_ICON_OFF;
     d.bg_opa = LV_OPA_COVER;
 
-    lv_area_t glass = {(lv_coord_t)(cx - 9), a.y1, (lv_coord_t)(cx + 8), (lv_coord_t)(a.y1 + 17)};
-    d.radius = 9;
+    /* 16x16 画布：玻璃泡 3..12 / y 0..9，灯颈 y 9..11，灯座 y 11..14 */
+    lv_area_t glass = {(lv_coord_t)(cx - 5), a.y1, (lv_coord_t)(cx + 5), (lv_coord_t)(a.y1 + 9)};
+    d.radius = 5;
     lv_draw_rect(layer, &d, &glass);
 
-    lv_area_t neck = {(lv_coord_t)(cx - 3), (lv_coord_t)(a.y1 + 16),
-                      (lv_coord_t)(cx + 2), (lv_coord_t)(a.y1 + 19)};
+    lv_area_t neck = {(lv_coord_t)(cx - 2), (lv_coord_t)(a.y1 + 9),
+                      (lv_coord_t)(cx + 2), (lv_coord_t)(a.y1 + 11)};
     d.radius = 1;
     lv_draw_rect(layer, &d, &neck);
 
-    lv_area_t base = {(lv_coord_t)(cx - 5), (lv_coord_t)(a.y1 + 20),
-                      (lv_coord_t)(cx + 4), (lv_coord_t)(a.y1 + 22)};
+    lv_area_t base = {(lv_coord_t)(cx - 3), (lv_coord_t)(a.y1 + 11),
+                      (lv_coord_t)(cx + 3), (lv_coord_t)(a.y1 + 14)};
     lv_draw_rect(layer, &d, &base);
 }
 
@@ -2951,7 +3783,6 @@ static void detail_apply_foreground(bool dark_text)
     if (s_ac_temp_value)   lv_obj_set_style_text_color(s_ac_temp_value, fg, 0);
     if (s_ac_room)         lv_obj_set_style_text_color(s_ac_room, muted, 0);
     if (s_ac_fan_label)    lv_obj_set_style_text_color(s_ac_fan_label, fg, 0);
-    if (s_fan_preset)      lv_obj_set_style_text_color(s_fan_preset, detail_muted_on_bg(), 0);
 }
 
 /** 背景氛围：按"关=黑、开=灯色 × 亮度"更新子页底色，顺便把圆盘配色跟着刷新。 */
@@ -2989,6 +3820,9 @@ static void detail_apply_entity(void)
     }
     detail_place_name(s_detail_ac);
     detail_set_name(e != NULL ? e->name : NULL);
+    /* 名字行的位置依赖"文字实际宽度"：必须**先写文字再摆位置**（旧顺序是先摆后写，
+       量到的是上一次的文字宽度，标签只有几像素宽 → 名字被挤到中线右边）。 */
+    detail_place_name(s_detail_ac);
     if (e == NULL) {
         return;
     }
@@ -3014,22 +3848,13 @@ static void detail_apply_entity(void)
     /* 记住开关此刻该显示的状态：开关配色（detail_apply_switch_style）在
        detail_apply_dial_colors 里跟着灯色/模式色一起刷，要读它。 */
     s_sw_on_now = on;
-    if (s_detail_power_sw != NULL) {
-        /* 底部那一行一页比一页挤：灯 96x46 / 空调 72x32 / 风扇 62x28（还要给摇头让位）*/
-        const int geom = s_detail_ac ? 1 : (s_detail_fan ? 2 : 0);
-        if (s_sw_geom != geom) {
-            s_sw_geom = geom;
-            if (geom == 1) {
-                lv_obj_set_size(s_detail_power_sw, AC_SW_W, AC_SW_H);
-                lv_obj_align(s_detail_power_sw, LV_ALIGN_TOP_MID, 0, AC_SW_Y);
-            } else if (geom == 2) {
-                lv_obj_set_size(s_detail_power_sw, FAN_SW_W, FAN_SW_H);
-                lv_obj_align(s_detail_power_sw, LV_ALIGN_TOP_MID, FAN_SW_DX, FAN_SW_Y);
-            } else {
-                lv_obj_set_size(s_detail_power_sw, 96, 46);
-                lv_obj_align(s_detail_power_sw, LV_ALIGN_TOP_MID, 0, 273);
-            }
-        }
+    /* 灯 / 风扇按设计稿都是 40x40 圆形电源键，开关只剩空调页在用 */
+    if (s_detail_power_sw != NULL && !s_detail_ac) {
+        detail_set_hidden(s_detail_power_sw, true);
+    }
+    if (s_detail_power_sw != NULL && s_detail_ac) {
+        /* 空调页现在也用 44x44 圆形电源键（设计稿 .d-power），开关彻底不用了 */
+        detail_set_hidden(s_detail_power_sw, true);
         /* CHECKED 状态只在真的变了时切；配色走 detail_apply_switch_style
            （那里自己判重，所以颜色变化不用等下一次开关动作）。 */
         const int8_t shown = on ? 1 : 0;
@@ -3048,6 +3873,8 @@ static void detail_apply_entity(void)
            顺序很重要：先显示整组，再算底色/配色（里面会按能力把不支持的模式键
            重新藏掉），否则 ac_hide_all(false) 会把刚藏掉的键又放出来。 */
         detail_hide_light(true);
+        fan_hide_all(true);                      /* ← 之前漏了：风扇组会叠在空调页上 */
+        detail_set_hidden(s_dial_power, true);   /* 空调页只有开关，没有圆形电源键 */
         ac_hide_all(false);
         detail_update_ambience();
         ac_apply_entity(e);
@@ -3067,11 +3894,15 @@ static void detail_apply_entity(void)
         return;
     }
 
+    /* ---------------- 灯光页（设计稿 .scr[data-scr="light"]）----------------
+       单环 + 分段控件：亮度和色温共用同一条 r=156 的环，只显示当前那一档；
+       大号数字 / 单位 / 档位文字 / 提示行由 light_apply_values 统一刷。
+       灯关着时数字还是显示的（设计稿写 "OFF"），所以这里不再整组藏起来。 */
     ac_hide_all(true);                        /* 空调那组藏起来 */
     fan_hide_all(true);                       /* 风扇那组藏起来 */
+    detail_set_hidden(s_light_seg, false);
     detail_update_ambience();
-    /* 圆盘：灯关着就整组藏起来、只留「已关闭」；不支持的能力也藏。
-       值仍然照常写进去（哪怕藏着），开灯后第一帧就是对的。 */
+
     if (s_detail_br_arc != NULL) {
         int pct = e->brightness * 100 / 255;
         if (s_br_override_until > lv_tick_get()) {
@@ -3090,10 +3921,6 @@ static void detail_apply_entity(void)
             lv_arc_set_value(s_detail_br_glow, pct);
         }
         detail_set_br_text(pct);
-        const bool show = on && e->has_brightness;
-        detail_set_hidden(s_detail_br_arc, !show);
-        detail_set_hidden(s_detail_br_glow, !show);
-        detail_set_hidden(s_detail_br_value, !show);
     }
     if (s_detail_ct_arc != NULL) {
         int lo = 2000, hi = 6500;
@@ -3120,14 +3947,13 @@ static void detail_apply_entity(void)
             lv_arc_set_value(s_detail_ct_glow, k);
         }
         detail_set_ct_text(k);
-        const bool show = on && e->has_tint;
-        detail_set_hidden(s_detail_ct_arc, !show);
-        detail_set_hidden(s_detail_ct_glow, !show);
-        detail_set_hidden(s_detail_ct_value, !show);
     }
-    detail_set_hidden(s_detail_icon, !on);
-    detail_set_hidden(s_detail_off_hint, on);
-    detail_apply_focus();                     /* 焦点可能被能力判断顶掉过 */
+    /* 名字行左侧的灯泡：设计稿里关灯也留着（只是压暗），所以不跟着藏 */
+    detail_set_hidden(s_detail_icon, false);
+    detail_set_hidden(s_detail_br_value, false);
+    detail_set_hidden(s_detail_ct_value, false);
+    detail_set_hidden(s_detail_off_hint, false);
+    detail_apply_focus();                     /* 环的隐现 / 分段控件 / 电源键 / 数字 */
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3310,34 +4136,156 @@ static void ac_fmt_temp(char *buf, size_t n, int t10, int step_t10)
 }
 
 /** 中间的大号目标温度（旋钮 / 拖动 / 轮询三条路径都走它）。*/
+/* 自绘工具函数在文件后面定义，这里先声明（模式图标要先用到）*/
+static void ac_dr_dot(lv_layer_t *layer, int x, int y, int r, lv_color_t c);
+static void ac_dr_line(lv_layer_t *layer, int x1, int y1, int x2, int y2, int w, lv_color_t c);
+static void ac_dr_arc(lv_layer_t *layer, int cx, int cy, int r, int w, int a1, int a2, lv_color_t c);
+static void ac_dir_point(int cx, int cy, int dir12, int dist, int *x, int *y);
+static bool ac_swing_now(const ha_entity_t *e);
+
+/* ---- 模式图标（自绘）：28px 的设计按 u 缩放，名字行(16) 和模式键(20) 共用 ---- */
+static void ac_glyph_draw(lv_layer_t *l, int cx, int cy, int u, int mode, lv_color_t c)
+{
+    const int R = (u * 11) / 28;            /* 设计稿 28px 画布里最大半径 11 */
+    const int lw = (u >= 24) ? 3 : 2;
+    const int h = (R * 3) / 5;              /* 半臂长 */
+    switch (mode) {
+    case 0:                                   /* 自动：A 字（两撇 + 横杠）*/
+        ac_dr_line(l, cx - h, cy + R, cx, cy - R, lw, c);
+        ac_dr_line(l, cx, cy - R, cx + h, cy + R, lw, c);
+        ac_dr_line(l, cx - (h * 2) / 3, cy + (R * 2) / 5, cx + (h * 2) / 3, cy + (R * 2) / 5, lw, c);
+        break;
+    case 1:                                   /* 制冷：雪花（三条交叉线 + 短枝）*/
+        for (int i = 0; i < 12; i += 4) {
+            int x1, y1, x2, y2;
+            ac_dir_point(cx, cy, i, R, &x1, &y1);
+            ac_dir_point(cx, cy, i + 6, R, &x2, &y2);
+            ac_dr_line(l, x1, y1, x2, y2, lw, c);
+        }
+        break;
+    case 2:                                   /* 制热：太阳（圆 + 六道光）*/
+        ac_dr_dot(l, cx, cy, (R * 2) / 5, c);
+        for (int i = 0; i < 12; i += 2) {
+            int x1, y1, x2, y2;
+            ac_dir_point(cx, cy, i, (R * 3) / 5, &x1, &y1);
+            ac_dir_point(cx, cy, i, R, &x2, &y2);
+            ac_dr_line(l, x1, y1, x2, y2, lw, c);
+        }
+        break;
+    case 3:                                   /* 除湿：水滴 */
+        ac_dr_dot(l, cx, cy + (R * 2) / 5, (R * 2) / 3, c);
+        ac_dr_line(l, cx, cy - R, cx - (R * 2) / 3, cy + R / 4, lw, c);
+        ac_dr_line(l, cx, cy - R, cx + (R * 2) / 3, cy + R / 4, lw, c);
+        break;
+    default:                                  /* 送风：护环 + 三片叶 + 轮毂 */
+        ac_dr_arc(l, cx, cy, R, lw, 0, 360, c);
+        for (int i = 0; i < 12; i += 4) {
+            int x1, y1, x2, y2;
+            ac_dir_point(cx, cy, i, (R * 2) / 5, &x1, &y1);
+            ac_dir_point(cx, cy, i, (R * 4) / 5, &x2, &y2);
+            ac_dr_line(l, x1, y1, x2, y2, lw + 1, c);
+        }
+        ac_dr_dot(l, cx, cy, (R * 2) / 5, c);
+        break;
+    }
+}
+
+/** 模式键里的图标（user_data = k_ac_modes 下标，颜色由 ac_refresh_chips 刷进 s_ac_key_col）。 */
+static void ac_key_icon_draw_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (obj == NULL || layer == NULL || idx < 0 || idx >= AC_MODE_COUNT) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const int u = a.x2 - a.x1 + 1;
+    ac_glyph_draw(layer, (a.x1 + a.x2) / 2, (a.y1 + a.y2) / 2, u, idx, s_ac_key_col[idx]);
+}
+
+/** 名字行左侧的模式图标（当前模式，16px，颜色 = 模式色）。 */
+static void ac_name_icon_draw_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if (obj == NULL || layer == NULL) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    int mode = 4;
+    for (int i = 0; i < AC_MODE_COUNT; i++) {
+        if (strcmp(ac_state_now(ha_client_find(s_detail_entity)), k_ac_modes[i].mode) == 0) {
+            mode = i;
+            break;
+        }
+    }
+    ac_glyph_draw(layer, (a.x1 + a.x2) / 2, (a.y1 + a.y2) / 2, a.x2 - a.x1 + 1, mode,
+                  s_ac_accent);
+}
+
+/** 大号目标温度 + ° 一起水平居中（数字 num64、° 用 montserrat_20，字墨中心对齐）。 */
+static void ac_place_value(void)
+{
+    if (s_ac_temp_value == NULL || s_ac_unit == NULL) {
+        return;
+    }
+    lv_point_t nsz = {0, 0};
+    lv_point_t usz = {0, 0};
+    const char *ntxt = lv_label_get_text(s_ac_temp_value);
+    const char *utxt = lv_label_get_text(s_ac_unit);
+    if (ntxt != NULL && ntxt[0] != '\0') {
+        lv_text_get_size(&nsz, ntxt, lv_obj_get_style_text_font(s_ac_temp_value, 0), 0, 0,
+                         LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    if (utxt != NULL && utxt[0] != '\0') {
+        lv_text_get_size(&usz, utxt, &lv_font_montserrat_20, 0, 0, LV_COORD_MAX,
+                         LV_TEXT_FLAG_NONE);
+    }
+    const int gap = (usz.x > 0) ? 3 : 0;
+    const int x0 = DETAIL_CX - (nsz.x + gap + usz.x) / 2;
+    if (s_ac_num_x != x0) {
+        s_ac_num_x = x0;
+        lv_obj_set_pos(s_ac_temp_value, x0, AC_VALUE_Y);
+    }
+    const int ux = x0 + nsz.x + gap;
+    if (s_ac_unit_x != ux) {
+        s_ac_unit_x = ux;
+        lv_obj_set_pos(s_ac_unit, ux, AC_VALUE_Y + AC_UNIT_DY);
+    }
+}
+
 static void ac_set_temp_text(int t10, int step_t10)
 {
     if (s_ac_temp_value == NULL) {
         return;
     }
     char num[12];
-    char buf[16];
     ac_fmt_temp(num, sizeof(num), t10, step_t10);
-    snprintf(buf, sizeof(buf), "%s°", num);
-    if (strcmp(buf, s_ac_temp_txt) != 0) {
-        snprintf(s_ac_temp_txt, sizeof(s_ac_temp_txt), "%s", buf);
-        lv_label_set_text(s_ac_temp_value, buf);
+    if (strcmp(num, s_ac_temp_txt) != 0) {
+        snprintf(s_ac_temp_txt, sizeof(s_ac_temp_txt), "%s", num);
+        lv_label_set_text(s_ac_temp_value, num);
     }
+    ac_place_value();
     detail_marker_update();   /* 文字没变（四舍五入到同一步）时值点也要跟上 */
 }
 
-/** 「室内 17.0°C」；没有 current_temperature 就显示 --。 */
-static void ac_set_room_text(float cur)
+/** 「制冷 · 室内 26.4°C」（设计稿 .d-unit：目标温度 · 室内 xx°C）；
+ *  关机时前半截写「已关闭」；没有 current_temperature 就显示 --。 */
+static void ac_set_room_text(const char *mode_zh, float cur)
 {
     if (s_ac_room == NULL) {
         return;
     }
-    char buf[28];
+    char buf[40];
+    const char *head = (mode_zh != NULL && mode_zh[0] != '\0') ? mode_zh : "空调";
     if (cur > 0.0f) {
         const int t10 = (int)(cur * (float)AC_UNIT + 0.5f);
-        snprintf(buf, sizeof(buf), "室内 %d.%d°C", t10 / AC_UNIT, t10 % AC_UNIT);
+        snprintf(buf, sizeof(buf), "%.12s · 室内 %d.%d°C", head, t10 / AC_UNIT, t10 % AC_UNIT);
     } else {
-        snprintf(buf, sizeof(buf), "室内 --");
+        snprintf(buf, sizeof(buf), "%.12s · 室内 --", head);
     }
     if (strcmp(buf, s_ac_room_txt) == 0) {
         return;
@@ -3426,95 +4374,123 @@ static void ac_dir_point(int cx, int cy, int idx, int r, int *x, int *y)
     *y = cy + (int)((k_dir_y[i] * r) / 1024);
 }
 
-/** 按当前模式画中间那颗图标：雪花 / 太阳 / 水滴 / 风扇 / A / 电源。*/
-static void ac_icon_draw_cb(lv_event_t *e)
+/** 卡片左上角图标（19x19，自绘；颜色由 tile_apply 写进 w->icon_col）。
+ *  只用圆 / 圆角条 / 线 / 弧四种图元，不引字体符号也不加图片。
+ *  w->dom 决定画什么，w->icon_alt 只用来区分"湿度传感器"（水滴）和别的传感器（温度计）。 */
+static void tile_icon_draw_cb(lv_event_t *e)
 {
     lv_obj_t *obj = lv_event_get_target(e);
     lv_layer_t *layer = lv_event_get_layer(e);
-    if (obj == NULL || layer == NULL) {
+    tile_widget_t *w = (tile_widget_t *)lv_event_get_user_data(e);
+    if (obj == NULL || layer == NULL || w == NULL) {
         return;
     }
     lv_area_t a;
     lv_obj_get_coords(obj, &a);
     const int cx = (a.x1 + a.x2) / 2;
     const int cy = (a.y1 + a.y2) / 2;
-    const lv_color_t c = s_ac_accent;
-    const char *m = s_ac_mode_shown;
+    const lv_color_t c = w->icon_col;
+    const int lw = 2;
 
-    if (strcmp(m, "cool") == 0) {
-        /* 雪花：3 条穿过圆心的线 = 6 根叉，端头各挂两小段斜枝 */
-        for (int i = 0; i < 6; i += 2) {
-            int x1, y1, x2, y2;
-            ac_dir_point(cx, cy, i, 11, &x1, &y1);
-            ac_dir_point(cx, cy, i + 6, 11, &x2, &y2);
-            ac_dr_line(layer, x1, y1, x2, y2, 2, c);
-            for (int k = -1; k <= 1; k += 2) {
-                int bx, by, tx, ty;
-                ac_dir_point(cx, cy, i, 6, &bx, &by);
-                ac_dir_point(cx, cy, i + k, 9, &tx, &ty);
-                ac_dr_line(layer, bx, by, tx, ty, 2, c);
-                ac_dir_point(cx, cy, i + 6, 6, &bx, &by);
-                ac_dir_point(cx, cy, i + 6 - k, 9, &tx, &ty);
-                ac_dr_line(layer, bx, by, tx, ty, 2, c);
-            }
-        }
-    } else if (strcmp(m, "heat") == 0) {
-        /* 太阳：实心圆 + 6 根短光线 */
-        ac_dr_dot(layer, cx, cy, 5, c);
-        for (int i = 0; i < 12; i += 2) {
-            int x1, y1, x2, y2;
-            ac_dir_point(cx, cy, i, 8, &x1, &y1);
-            ac_dir_point(cx, cy, i, 12, &x2, &y2);
-            ac_dr_line(layer, x1, y1, x2, y2, 2, c);
-        }
-    } else if (strcmp(m, "dry") == 0) {
-        /* 水滴：下面一个实心圆 + 上面两条斜边 */
-        ac_dr_dot(layer, cx, cy + 3, 5, c);
-        ac_dr_line(layer, cx, cy - 11, cx - 5, cy + 2, 2, c);
-        ac_dr_line(layer, cx, cy - 11, cx + 5, cy + 2, 2, c);
-        ac_dr_line(layer, cx - 3, cy + 3, cx + 3, cy + 3, 2, c);
-    } else if (strcmp(m, "fan_only") == 0) {
-        /* 风扇：一圈细环 + 三片扇叶（0/120/240 三个方向）*/
-        ac_dr_arc(layer, cx, cy, 10, 2, 0, 360, c);
+    switch (w->dom) {
+    case TILE_DOM_LIGHT:                      /* 灯泡：玻璃泡 + 灯颈 + 灯座 */
+        ac_dr_dot(layer, cx, cy - 2, 5, c);
+        wx_bar(layer, cx - 2, cy + 3, cx + 2, cy + 5, 1, c);
+        wx_bar(layer, cx - 4, cy + 5, cx + 4, cy + 6, 1, c);
+        break;
+    case TILE_DOM_CLIMATE:                    /* 雪花：三条交叉线 + 短枝 */
         for (int i = 0; i < 12; i += 4) {
             int x1, y1, x2, y2;
-            ac_dir_point(cx, cy, i, 3, &x1, &y1);
-            ac_dir_point(cx, cy, i, 8, &x2, &y2);
+            ac_dir_point(cx, cy, i, 7, &x1, &y1);
+            ac_dir_point(cx, cy, i + 6, 7, &x2, &y2);
+            ac_dr_line(layer, x1, y1, x2, y2, lw, c);
+        }
+        break;
+    case TILE_DOM_FAN:                        /* 风扇：护环 + 三片叶 + 轮毂 */
+        ac_dr_arc(layer, cx, cy, 7, lw, 0, 360, c);
+        for (int i = 0; i < 12; i += 4) {
+            int x1, y1, x2, y2;
+            ac_dir_point(cx, cy, i, 2, &x1, &y1);
+            ac_dir_point(cx, cy, i, 6, &x2, &y2);
             ac_dr_line(layer, x1, y1, x2, y2, 3, c);
         }
         ac_dr_dot(layer, cx, cy, 2, c);
-    } else if (strcmp(m, "auto") == 0) {
-        /* 自动：一个 A（两条腿 + 一横）*/
-        ac_dr_line(layer, cx - 7, cy + 9, cx, cy - 9, 2, c);
-        ac_dr_line(layer, cx, cy - 9, cx + 7, cy + 9, 2, c);
-        ac_dr_line(layer, cx - 4, cy + 2, cx + 4, cy + 2, 2, c);
-    } else {
-        /* 关 / 未知：电源符号（缺口圆环 + 顶部竖线）*/
-        ac_dr_arc(layer, cx, cy, 9, 2, 120, 60, c);
-        ac_dr_line(layer, cx, cy - 12, cx, cy - 3, 3, c);
+        break;
+    case TILE_DOM_COVER:                      /* 窗帘：顶轨 + 两片布 + 中间的缝 */
+        ac_dr_line(layer, cx - 8, cy - 7, cx + 8, cy - 7, lw, c);
+        ac_dr_line(layer, cx - 6, cy - 6, cx - 3, cy + 7, lw, c);
+        ac_dr_line(layer, cx + 6, cy - 6, cx + 3, cy + 7, lw, c);
+        ac_dr_line(layer, cx - 1, cy - 6, cx - 1, cy + 7, 1, c);
+        break;
+    case TILE_DOM_SWITCH:                     /* 插头：两只脚 + 身体 + 线 */
+        ac_dr_line(layer, cx - 3, cy - 8, cx - 3, cy - 4, lw, c);
+        ac_dr_line(layer, cx + 3, cy - 8, cx + 3, cy - 4, lw, c);
+        wx_bar(layer, cx - 6, cy - 4, cx + 6, cy + 3, 3, c);
+        ac_dr_line(layer, cx, cy + 3, cx, cy + 8, lw, c);
+        break;
+    case TILE_DOM_MEDIA:                      /* 音箱：箱体 + 喇叭 + 高音孔 */
+        wx_bar(layer, cx - 5, cy - 8, cx + 5, cy + 8, 3, c);
+        ac_dr_arc(layer, cx, cy + 3, 3, lw, 0, 360, c);
+        ac_dr_dot(layer, cx, cy - 4, 1, c);
+        break;
+    case TILE_DOM_SENSOR:
+        if (w->icon_alt) {                    /* 湿度：水滴 */
+            ac_dr_dot(layer, cx, cy + 3, 4, c);
+            ac_dr_line(layer, cx, cy - 8, cx - 4, cy + 2, lw, c);
+            ac_dr_line(layer, cx, cy - 8, cx + 4, cy + 2, lw, c);
+        } else {                              /* 温度：温度计 */
+            ac_dr_line(layer, cx, cy - 8, cx, cy + 1, lw, c);
+            ac_dr_dot(layer, cx, cy + 4, 4, c);
+        }
+        break;
+    case TILE_DOM_BINARY:                     /* 门：门板 + 门把手 */
+        wx_bar(layer, cx - 5, cy - 8, cx + 5, cy + 8, 2, c);
+        ac_dr_dot(layer, cx + 2, cy, 1, c);
+        break;
+    case TILE_DOM_WEATHER:                    /* 太阳：圆 + 六根光线 */
+        ac_dr_dot(layer, cx, cy, 4, c);
+        for (int i = 0; i < 12; i += 2) {
+            int x1, y1, x2, y2;
+            ac_dir_point(cx, cy, i, 6, &x1, &y1);
+            ac_dir_point(cx, cy, i, 9, &x2, &y2);
+            ac_dr_line(layer, x1, y1, x2, y2, lw, c);
+        }
+        break;
+    case TILE_DOM_SCENE:                      /* 场景：播放三角 */
+        ac_dr_line(layer, cx - 4, cy - 7, cx + 6, cy, lw, c);
+        ac_dr_line(layer, cx + 6, cy, cx - 4, cy + 7, lw, c);
+        ac_dr_line(layer, cx - 4, cy + 7, cx - 4, cy - 7, lw, c);
+        break;
+    case TILE_DOM_AUTO:                       /* 自动化：带箭头的圆弧 */
+        ac_dr_arc(layer, cx, cy, 7, lw, 210, 120, c);
+        ac_dr_line(layer, cx + 2, cy - 9, cx + 6, cy - 5, lw, c);
+        ac_dr_line(layer, cx + 6, cy - 5, cx + 6, cy - 1, lw, c);
+        break;
+    default:
+        ac_dr_dot(layer, cx, cy, 4, c);
+        break;
     }
 }
 
-/** 模式按钮高亮：当前模式用该模式的颜色填充，其余保持深灰。 */
 static void ac_refresh_chips(const ha_entity_t *e, const char *state)
 {
     const bool on = !ac_state_is_off(state);
     for (int i = 0; i < AC_MODE_COUNT; i++) {
         lv_obj_t *btn = s_ac_mode_btn[i];
-        lv_obj_t *lbl = s_ac_mode_lbl[i];
         if (btn == NULL) {
             continue;
         }
+        /* 设计稿 .m-row button：未选 = 白 4% 底 + 白 5.5% 边 + 灰图标；
+           选中 = 模式色 15% 底 + 模式色 40% 边 + 模式色图标 */
         const bool active = on && (strcmp(state, k_ac_modes[i].mode) == 0);
-        const lv_color_t fill = active ? detail_on_bg(lv_color_hex(k_ac_modes[i].rgb))
-                                       : lv_color_hex(0x24262B);
-        lv_obj_set_style_bg_color(btn, fill, 0);
-        lv_obj_set_style_bg_opa(btn, active ? LV_OPA_COVER : LV_OPA_80, 0);
-        if (lbl != NULL) {
-            const lv_color_t tc = active ? (detail_luma(fill) >= 140 ? lv_color_black()
-                                                                     : lv_color_white())
-                                         : COLOR_TEXT;
-            lv_obj_set_style_text_color(lbl, tc, 0);
+        const lv_color_t c = detail_on_bg(lv_color_hex(k_ac_modes[i].rgb));
+        lv_obj_set_style_bg_color(btn, active ? c : lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(btn, active ? 38 : 10, 0);
+        lv_obj_set_style_border_color(btn, active ? c : lv_color_white(), 0);
+        lv_obj_set_style_border_opa(btn, active ? 102 : 14, 0);
+        s_ac_key_col[i] = active ? c : lv_color_hex(0x6F798C);
+        if (s_ac_mode_icon[i] != NULL) {
+            lv_obj_invalidate(s_ac_mode_icon[i]);
         }
         /* 只留这台机器 hvac_modes 里有的（顺序永远按 k_ac_modes）；
            还没拉到 hvac_modes（开机头几秒）就先全显示，别让整行消失。 */
@@ -3530,14 +4506,17 @@ static void ac_hide_all(bool hide)
     detail_set_hidden(s_ac_glow, hide);
     detail_set_hidden(s_ac_icon, hide);
     detail_set_hidden(s_ac_temp_value, hide);
+    detail_set_hidden(s_ac_unit, hide);
     detail_set_hidden(s_ac_room, hide);
     detail_set_hidden(s_ac_fan_btn, hide);
+    detail_set_hidden(s_ac_swing_btn, hide);
+    detail_set_hidden(s_ac_name_icon, hide);
     for (int i = 0; i < AC_MODE_COUNT; i++) {
         detail_set_hidden(s_ac_mode_btn[i], hide);
     }
 }
 
-/** 灯那组控件全部隐藏/显示（切到空调页时整组藏起来）。 */
+/** 灯那组控件全部隐藏/显示（切到空调 / 风扇页时整组藏起来）。 */
 static void detail_hide_light(bool hide)
 {
     detail_set_hidden(s_detail_br_arc, hide);
@@ -3548,6 +4527,11 @@ static void detail_hide_light(bool hide)
     detail_set_hidden(s_detail_ct_value, hide);
     detail_set_hidden(s_detail_icon, hide);
     detail_set_hidden(s_detail_off_hint, hide);
+    /* 灯光页独有的控件：氛围光 / 分段控件（电源键两页共用，由各页自己摆） */
+    for (int i = 0; i < GLOW_DISC_N; i++) {
+        detail_set_hidden(s_glow_disc[i], hide);
+    }
+    detail_set_hidden(s_light_seg, hide);
 }
 
 /** 把实体状态刷到空调页的所有控件上（轮询 500ms 也走这里）。 */
@@ -3568,8 +4552,49 @@ static void ac_apply_entity(const ha_entity_t *e)
         lv_arc_set_value(s_ac_glow, t10);
     }
     ac_set_temp_text(t10, st);
-    ac_set_room_text(e->cur_temp);
+    /* 副标题：模式名 · 室内温度（关机写"已关闭"）*/
+    {
+        const char *st_now = ac_state_now(e);
+        const char *zh = "已关闭";
+        if (!ac_state_is_off(st_now)) {
+            for (int i = 0; i < AC_MODE_COUNT; i++) {
+                if (strcmp(st_now, k_ac_modes[i].mode) == 0) {
+                    zh = k_ac_modes[i].label;
+                    break;
+                }
+            }
+        }
+        ac_set_room_text(zh, e->cur_temp);
+    }
     ac_set_fan_text(e);
+    /* 单位 ° / 名字行图标 / 摆风胶囊：颜色跟着模式色 */
+    if (s_ac_unit != NULL) {
+        lv_obj_set_style_text_color(s_ac_unit, s_ac_accent, 0);
+    }
+    if (s_ac_name_icon != NULL) {
+        lv_obj_invalidate(s_ac_name_icon);
+    }
+    {
+        const bool sw_on = ac_swing_now(e);
+        const bool sw_ok = (e != NULL) && e->has_full_swing;
+        if (s_ac_swing_btn != NULL) {
+            detail_set_hidden(s_ac_swing_btn, !sw_ok);      /* 不支持摆风就不显示 */
+            lv_obj_set_style_bg_color(s_ac_swing_btn,
+                                      (sw_on && sw_ok) ? s_ac_accent : lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_ac_swing_btn, (sw_on && sw_ok) ? 38 : 12, 0);
+            lv_obj_set_style_border_color(s_ac_swing_btn,
+                                          (sw_on && sw_ok) ? s_ac_accent : lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_ac_swing_btn, (sw_on && sw_ok) ? 102 : 18, 0);
+        }
+        if (s_ac_swing_label != NULL) {
+            lv_label_set_text(s_ac_swing_label, sw_on ? "摆风" : "固定");
+            lv_obj_set_style_text_color(s_ac_swing_label,
+                                        (sw_on && sw_ok) ? s_ac_accent : lv_color_hex(0xC2CBDB), 0);
+        }
+    }
+    /* 电源键：设计稿 44x44，放在胶囊行最右 */
+    detail_place_power(AC_POWER, DETAIL_CX + 250 / 2 - AC_POWER, AC_CHIP_Y - 7);
+    detail_set_hidden(s_dial_power, false);
     /* 模式按钮的高亮 / 可见性在 detail_apply_dial_colors 里（模式变了才刷）*/
     detail_set_hidden(s_ac_fan_btn, e->fan_mode_count == 0);
 }
@@ -3684,23 +4709,22 @@ static void ac_fan_cb(lv_event_t *e)
 
 
 /* ------------------------------------------------------------------------- */
-/* 风扇详情页：和灯 / 空调共用 s_detail 与同一套圆盘（外环 = 风速）             */
+/* 风扇详情页：和灯共用 s_detail 与同一套圆盘（环 = 风速）                     */
+/* （布局和颜色见文件头 FAN_* 宏；这里只放"怎么摆、怎么写、怎么发命令"）        */
 /* ------------------------------------------------------------------------- */
 
-/* 4 个预设的固定顺序：raw = 发给 HA 的原样字符串（和这台风扇 preset_modes 里的
-   写法一致），label = 屏幕上两个字的简称，rgb = 这个预设的环色。
-   都是静态常量，按钮建一次就够，不占实体内存，也不用每次开页重建。 */
+/* 4 个预设的固定顺序：raw = 发给 HA 的原样中文（和这台风扇 preset_modes 一致），
+   rgb = 这个预设的环色。胶囊上直接显示实体报上来的原样字符串。 */
 typedef struct {
     const char *raw;
-    const char *label;
     uint32_t rgb;
 } fan_preset_def_t;
 
 static const fan_preset_def_t k_fan_presets[FAN_MODE_COUNT] = {
-    {"直吹风", "直吹", 0x2DD4BF},   /* 青：直吹 */
-    {"自然风", "自然", 0x30D158},   /* 绿：自然 */
-    {"循环风", "循环", 0x3B82F6},   /* 蓝：循环 */
-    {"睡眠",   "睡眠", 0x8E8E93},   /* 灰：睡眠 */
+    {"直吹风", 0x2DD4BF},   /* 青 */
+    {"自然风", 0x30D158},   /* 绿 */
+    {"循环风", 0x3B82F6},   /* 蓝 */
+    {"睡眠",   0x8E8E93},   /* 灰 */
 };
 
 static bool detail_is_fan(const ha_entity_t *e)
@@ -3737,12 +4761,8 @@ static lv_color_t fan_preset_color(const char *preset)
     return lv_color_hex(0x2DD4BF);
 }
 
-/**
- * 风扇页底色：预设色压到很暗的一层，关掉纯黑（和空调页 ac_mode_bg 同一套做法）。
- * 不把整页染成预设色：底色一亮，中间的小字和预设键的对比度就保不住了。
- * 青 -> (0x07,0x21,0x1E)、绿 -> (0x07,0x20,0x0D)、蓝 -> (0x09,0x14,0x26)、
- * 灰 -> (0x16,0x16,0x17)，感知亮度都在 30 以下，白字照样拉得开。
- */
+/** 风扇页底色：预设色压到很暗的一层，关掉纯黑（和空调页 ac_mode_bg 同一套做法）。
+ *  不把整页染成预设色：底色一亮，中间的小字和胶囊的对比度就保不住了。 */
 static lv_color_t fan_ambient_bg(const char *preset, bool on)
 {
     if (!on) {
@@ -3755,7 +4775,7 @@ static lv_color_t fan_ambient_bg(const char *preset, bool on)
 }
 
 /** 当前该显示 / 该用的风速百分比：本地覆盖优先，其次实体值，最后按 100%。
- *  下限 1%：0% 会被 Home Assistant 当成"关"，电源只归开关管（同灯的亮度）。 */
+ *  下限 1%：0% 会被 Home Assistant 当成"关"，电源只归电源键（同灯的亮度）。 */
 static int fan_pct_now(const ha_entity_t *e)
 {
     int pct = 100;
@@ -3773,6 +4793,101 @@ static int fan_pct_now(const ha_entity_t *e)
     return pct;
 }
 
+/** 名字行左侧那个风图标：三条带圆头的横线（设计稿 #i-wind 的直线化近似）。 */
+static void fan_wind_draw_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if (obj == NULL || layer == NULL) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const int cx = (a.x1 + a.x2) / 2;
+    const int cy = (a.y1 + a.y2) / 2;
+    const bool on = detail_device_on(ha_client_find(s_detail_entity));
+    const lv_color_t c = on ? LIGHT_ICON_INK : LIGHT_ICON_OFF;
+    ac_dr_line(layer, cx - 8, cy - 4, cx + 5, cy - 4, 2, c);
+    ac_dr_line(layer, cx - 8, cy,     cx + 8, cy,     2, c);
+    ac_dr_line(layer, cx - 8, cy + 4, cx + 3, cy + 4, 2, c);
+}
+
+/** 大号百分比 + "%" 一起水平居中（和灯光页同一个做法）。 */
+static void fan_place_value(void)
+{
+    if (s_fan_pct == NULL || s_fan_unit == NULL) {
+        return;
+    }
+    lv_point_t nsz = {0, 0};
+    lv_point_t usz = {0, 0};
+    const char *ntxt = lv_label_get_text(s_fan_pct);
+    const char *utxt = lv_label_get_text(s_fan_unit);
+    if (ntxt != NULL && ntxt[0] != '\0') {
+        lv_text_get_size(&nsz, ntxt, lv_obj_get_style_text_font(s_fan_pct, 0), 0, 0,
+                     LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    if (utxt != NULL && utxt[0] != '\0') {
+        lv_text_get_size(&usz, utxt, &lv_font_montserrat_20, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    const int gap = (usz.x > 0) ? 3 : 0;
+    const int x0 = DETAIL_CX - (nsz.x + gap + usz.x) / 2;
+    if (s_fan_num_x != x0) {
+        s_fan_num_x = x0;
+        lv_obj_set_pos(s_fan_pct, x0, LIGHT_VALUE_Y);
+    }
+    const int ux = x0 + nsz.x + gap;
+    if (s_fan_unit_x != ux) {
+        s_fan_unit_x = ux;
+        lv_obj_set_pos(s_fan_unit, ux, LIGHT_VALUE_Y + LIGHT_UNIT_DY);
+    }
+}
+
+/* ---- 摆风（climate.swing_mode）：default ↔ full_swing ---- */
+static bool ac_swing_now(const ha_entity_t *e)
+{
+    const char *m = (e != NULL) ? e->swing_mode : "";
+    if (s_ac_swing_local_until > lv_tick_get()) {
+        if (e != NULL && strcmp(e->swing_mode, s_ac_swing_local) == 0) {
+            s_ac_swing_local_until = 0;        /* HA 已跟上 */
+        } else {
+            m = s_ac_swing_local;
+        }
+    }
+    return (m != NULL) && (strcmp(m, "full_swing") == 0);
+}
+
+/** 摆风胶囊：点一下在 default / full_swing 之间切（实体只支持默认时置灰不可点）。*/
+static void ac_swing_cb(lv_event_t *e)
+{
+    (void)e;
+    const ha_entity_t *ent = ha_client_find(s_detail_entity);
+    if (ent == NULL || s_cmd_q == NULL || s_detail_entity[0] == '\0') {
+        return;
+    }
+    const bool next = !ac_swing_now(ent);
+    snprintf(s_ac_swing_local, sizeof(s_ac_swing_local), "%s", next ? "full_swing" : "default");
+    s_ac_swing_local_until = lv_tick_get() + OVERRIDE_MS;
+    if (s_ac_swing_label != NULL) {
+        lv_label_set_text(s_ac_swing_label, next ? "摆风" : "固定");
+    }
+    if (s_ac_swing_btn != NULL) {
+        lv_obj_set_style_bg_color(s_ac_swing_btn, next ? s_ac_accent : lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(s_ac_swing_btn, next ? 38 : 12, 0);
+        lv_obj_set_style_border_color(s_ac_swing_btn, next ? s_ac_accent : lv_color_white(), 0);
+        lv_obj_set_style_border_opa(s_ac_swing_btn, next ? 102 : 18, 0);
+        if (s_ac_swing_label != NULL) {
+            lv_obj_set_style_text_color(s_ac_swing_label, next ? s_ac_accent : lv_color_hex(0xC2CBDB), 0);
+        }
+    }
+    cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    snprintf(cmd.entity, sizeof(cmd.entity), "%s", s_detail_entity);
+    snprintf(cmd.service, sizeof(cmd.service), "set_swing_mode");
+    snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"swing_mode\":\"%s\"}", s_ac_swing_local);
+    xQueueSend(s_cmd_q, &cmd, 0);
+    ESP_LOGI(TAG, "摆风 -> %s", s_ac_swing_local);
+}
+
 /** 中间的大号百分比（旋钮 / 拖动 / 轮询三条路径都走它）。 */
 static void fan_set_pct_text(int pct)
 {
@@ -3786,85 +4901,51 @@ static void fan_set_pct_text(int pct)
         pct = 100;
     }
     char buf[8];
-    snprintf(buf, sizeof(buf), "%d%%", pct);
+    snprintf(buf, sizeof(buf), "%d", pct);
     if (strcmp(buf, s_fan_pct_txt) != 0) {
         snprintf(s_fan_pct_txt, sizeof(s_fan_pct_txt), "%s", buf);
         lv_label_set_text(s_fan_pct, buf);
     }
-    detail_marker_update();          /* 焦点值点跟着风速环当前值走 */
+    if (s_fan_unit != NULL && strcmp("%", s_fan_unit_shown) != 0) {
+        snprintf(s_fan_unit_shown, sizeof(s_fan_unit_shown), "%s", "%");
+        lv_label_set_text(s_fan_unit, "%");
+    }
+    fan_place_value();
+    detail_marker_update();          /* 值点跟着风速环当前值走 */
 }
 
-/** 中间第二行：当前预设（原样中文，如「自然风」）；没有就 --。 */
-static void fan_set_preset_text(const char *preset)
+/** 胶囊行 / 电源键的外观：
+ *   预设胶囊 = 当前预设名（设计稿 #fPreset），关机时压暗；
+ *   摇头胶囊 = 永远按"不支持"置灰（没有 OSCILLATE，也没有 click 回调）；
+ *   电源键：开 = 预设色实心 + 深色图标，关 = 白 6% 底 + 浅灰图标（.p-btn）。 */
+static void fan_apply_chips(const ha_entity_t *e, const char *preset, bool on)
 {
-    if (s_fan_preset == NULL) {
-        return;
-    }
-    const char *txt = (preset != NULL && preset[0] != '\0') ? preset : "--";
-    if (strcmp(txt, s_fan_preset_txt) == 0) {
-        return;
-    }
-    snprintf(s_fan_preset_txt, sizeof(s_fan_preset_txt), "%.15s", txt);
-    lv_label_set_text(s_fan_preset, txt);
-}
-
-/** 预设键高亮：当前预设用该预设的颜色填充，其余保持深灰。
- *  实体 preset_modes 里没有的键先藏掉（还没拉到列表时先全显示，别让整行消失）。 */
-static void fan_refresh_chips(const ha_entity_t *e, const char *preset)
-{
-    for (int i = 0; i < FAN_MODE_COUNT; i++) {
-        lv_obj_t *btn = s_fan_mode_btn[i];
-        lv_obj_t *lbl = s_fan_mode_lbl[i];
-        if (btn == NULL) {
-            continue;
-        }
-        const bool active = (preset != NULL) && (preset[0] != '\0') &&
-                            (strcmp(preset, k_fan_presets[i].raw) == 0);
-        const lv_color_t fill = active ? detail_on_bg(lv_color_hex(k_fan_presets[i].rgb))
-                                       : lv_color_hex(0x24262B);
-        lv_obj_set_style_bg_color(btn, fill, 0);
-        lv_obj_set_style_bg_opa(btn, active ? LV_OPA_COVER : LV_OPA_80, 0);
-        if (lbl != NULL) {
-            lv_obj_set_style_text_color(lbl, active ? (detail_luma(fill) >= 140 ? lv_color_black()
-                                                                                : lv_color_white())
-                                                    : COLOR_TEXT, 0);
-        }
-        bool supported = (e == NULL) || (e->preset_mode_count == 0);
-        if (e != NULL) {
-            for (int k = 0; k < e->preset_mode_count && k < HA_FAN_PRESET_MAX; k++) {
-                if (strcmp(e->preset_modes[k], k_fan_presets[i].raw) == 0) {
-                    supported = true;
-                }
+    const int8_t st = (int8_t)((on ? 1 : 0) | ((preset != NULL && preset[0]) ? 2 : 0));
+    if (st != s_fan_chip_shown) {
+        s_fan_chip_shown = st;
+        if (s_fan_chip_preset_lbl != NULL) {
+            const char *txt = (preset != NULL && preset[0] != '\0') ? preset : "--";
+            if (strcmp(txt, s_fan_chip_txt) != 0) {
+                snprintf(s_fan_chip_txt, sizeof(s_fan_chip_txt), "%.15s", txt);
+                lv_label_set_text(s_fan_chip_preset_lbl, txt);
             }
         }
-        detail_set_hidden(btn, !supported);
-    }
-}
-
-/** 摇头键：反映实体 oscillating（含 6s 本地覆盖）。开 = 预设色填充，关 = 深灰。 */
-static void fan_refresh_osc(const ha_entity_t *e)
-{
-    if (s_fan_osc_btn == NULL) {
-        return;
-    }
-    bool osc = (e != NULL) && e->oscillating;
-    if (s_fan_osc_local_until > lv_tick_get()) {
-        if (e != NULL && e->oscillating == s_fan_osc_local) {
-            s_fan_osc_local_until = 0;            /* HA 已跟上 */
-        } else {
-            osc = s_fan_osc_local;
+        if (s_fan_chip_preset != NULL) {
+            lv_obj_set_style_opa(s_fan_chip_preset, on ? LV_OPA_COVER : 115, 0);
+        }
+        if (s_fan_chip_osc != NULL) {
+            /* 不支持摇头：整颗压到 40%，边框回到"中性"，永远不亮起来 */
+            lv_obj_set_style_opa(s_fan_chip_osc, FAN_CHIP_DISABLED_OPA, 0);
+            lv_obj_set_style_border_color(s_fan_chip_osc, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_fan_chip_osc, 18, 0);
         }
     }
-    const lv_color_t fill = osc ? s_fan_accent : lv_color_hex(0x24262B);
-    lv_obj_set_style_bg_color(s_fan_osc_btn, fill, 0);
-    lv_obj_set_style_bg_opa(s_fan_osc_btn, osc ? LV_OPA_COVER : LV_OPA_80, 0);
-    lv_obj_set_style_border_color(s_fan_osc_btn,
-                                  osc ? fill : lv_color_hex(0x3A3A3C), 0);
-    if (s_fan_osc_lbl != NULL) {
-        lv_obj_set_style_text_color(s_fan_osc_lbl,
-                                    osc ? (detail_luma(fill) >= 140 ? lv_color_black()
-                                                                    : lv_color_white())
-                                        : COLOR_TEXT, 0);
+    s_dial_pwr_on = on;
+    if (s_dial_power != NULL) {
+        lv_obj_set_style_bg_color(s_dial_power, on ? s_fan_accent : lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(s_dial_power, on ? LV_OPA_COVER : 15, 0);
+        lv_obj_set_style_border_opa(s_dial_power, on ? LV_OPA_TRANSP : 23, 0);
+        lv_obj_invalidate(s_dial_power);
     }
 }
 
@@ -3879,53 +4960,24 @@ static void fan_apply_entity(const ha_entity_t *e)
         lv_arc_set_value(s_fan_glow, pct);
     }
     fan_set_pct_text(pct);
-    fan_set_preset_text(fan_preset_now(e));
-    fan_refresh_osc(e);
+    fan_apply_chips(e, fan_preset_now(e), detail_device_on(e));
+    if (s_fan_name_icon != NULL) {
+        lv_obj_invalidate(s_fan_name_icon);      /* 开 / 关时图标颜色会变 */
+    }
     /* 环一直显示（关着只是压暗、不可点，刻度还在），和空调页一致。 */
 }
 
-/** 风扇那组控件全部显示 / 隐藏（切到灯 / 空调页时整组藏起来）。
- *  显示时不在这里放预设键：哪些键该显示由 fan_refresh_chips 按 preset_modes
- *  决定，否则每 500ms 会把不支持的键又放出来。 */
+/** 风扇那组控件全部显示 / 隐藏（切到灯 / 空调页时整组藏起来）。*/
 static void fan_hide_all(bool hide)
 {
     detail_set_hidden(s_fan_arc, hide);
     detail_set_hidden(s_fan_glow, hide);
-    detail_set_hidden(s_fan_icon, hide);
+    detail_set_hidden(s_fan_name_icon, hide);
     detail_set_hidden(s_fan_pct, hide);
-    detail_set_hidden(s_fan_preset, hide);
-    detail_set_hidden(s_fan_osc_btn, hide);
-    if (hide) {
-        for (int i = 0; i < FAN_MODE_COUNT; i++) {
-            detail_set_hidden(s_fan_mode_btn[i], true);
-        }
-    }
-}
-
-/** 圆盘中间那台风扇：轮毂 + 3 片扇叶（0° / 120° / 240°）+ 一道护网细弧。 */
-static void fan_icon_draw_cb(lv_event_t *e)
-{
-    lv_obj_t *obj = lv_event_get_target(e);
-    lv_layer_t *layer = lv_event_get_layer(e);
-    if (obj == NULL || layer == NULL) {
-        return;
-    }
-    lv_area_t a;
-    lv_obj_get_coords(obj, &a);
-    const int cx = (a.x1 + a.x2) / 2;
-    const int cy = (a.y1 + a.y2) / 2;
-    const lv_color_t c = s_fan_accent;
-
-    ac_dr_arc(layer, cx, cy, 10, 2, 0, 360, c);      /* 护网 */
-    for (int i = 0; i < 12; i += 4) {                /* 0° / 120° / 240°（每 30° 一格）*/
-        int x1, y1, x2, y2;
-        ac_dir_point(cx, cy, i, 1, &x1, &y1);
-        ac_dir_point(cx, cy, i, 7, &x2, &y2);
-        ac_dr_line(layer, x1, y1, x2, y2, 4, c);
-        /* 每片叶尖一小段弧，看起来是"弯"的，不像三根直棍 */
-        ac_dr_arc(layer, cx, cy, 7, 3, i * 30 - 25, i * 30 + 5, c);
-    }
-    ac_dr_dot(layer, cx, cy, 3, c);                  /* 轮毂 */
+    detail_set_hidden(s_fan_unit, hide);
+    detail_set_hidden(s_fan_label, hide);
+    detail_set_hidden(s_fan_chip_preset, hide);
+    detail_set_hidden(s_fan_chip_osc, hide);
 }
 
 /** 旋钮在风扇页上调风速：每格 5%（任务指定），值域 1..100。 */
@@ -3935,7 +4987,7 @@ static bool fan_knob_step(const ha_entity_t *e, int delta)
         return false;
     }
     if (!detail_device_on(e)) {
-        return false;                     /* 关着：旋钮什么也不做（电源只归开关） */
+        return false;                     /* 关着：旋钮什么也不做（电源只归电源键） */
     }
     const int cur = (int)lv_arc_get_value(s_fan_arc);
     int v = cur + delta * FAN_PCT_STEP;
@@ -3972,50 +5024,60 @@ static bool fan_knob_step(const ha_entity_t *e, int delta)
     return true;
 }
 
-/** 命令里必须是实体报上来的原样字符串（不是屏幕上的简称）：
- *  先按名字在实体的 preset_modes 里找同一个，找不到才退回静态表的写法。 */
-static const char *fan_preset_raw(const ha_entity_t *e, const fan_preset_def_t *def)
+/** 预设胶囊：点一下换到实体 preset_modes 里的下一个（命令发原样中文）。
+ *  设计稿 #fPreset 的交互就是"点一下换预设"，不再排 4 个键。 */
+static void fan_preset_cycle_cb(lv_event_t *ev)
 {
-    if (e != NULL) {
-        for (int i = 0; i < e->preset_mode_count && i < HA_FAN_PRESET_MAX; i++) {
-            if (strcmp(e->preset_modes[i], def->raw) == 0) {
-                return e->preset_modes[i];
-            }
-        }
-    }
-    return def->raw;
-}
-
-/** 点预设键：立刻本地高亮（环色 / 底色 / 图标跟着换），命令走队列。 */
-static void fan_preset_cb(lv_event_t *ev)
-{
-    const fan_preset_def_t *def = (const fan_preset_def_t *)lv_event_get_user_data(ev);
-    if (def == NULL || s_cmd_q == NULL || s_detail_entity[0] == '\0') {
+    (void)ev;
+    const ha_entity_t *ent = ha_client_find(s_detail_entity);
+    if (ent == NULL || s_cmd_q == NULL || s_detail_entity[0] == '\0') {
         return;
     }
-    const ha_entity_t *ent = ha_client_find(s_detail_entity);
-    snprintf(s_fan_preset_local, sizeof(s_fan_preset_local), "%s", def->raw);
+    char cur[16];
+    snprintf(cur, sizeof(cur), "%.15s", fan_preset_now(ent));
+    char next[16] = {0};
+    if (ent->preset_mode_count > 0) {
+        int idx = -1;
+        for (int i = 0; i < ent->preset_mode_count && i < HA_FAN_PRESET_MAX; i++) {
+            if (strcmp(ent->preset_modes[i], cur) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        idx = (idx + 1) % (int)ent->preset_mode_count;
+        snprintf(next, sizeof(next), "%.15s", ent->preset_modes[idx]);
+    } else {
+        int idx = -1;
+        for (int i = 0; i < FAN_MODE_COUNT; i++) {
+            if (strcmp(k_fan_presets[i].raw, cur) == 0) {
+                idx = i;
+            }
+        }
+        idx = (idx + 1) % FAN_MODE_COUNT;
+        snprintf(next, sizeof(next), "%.15s", k_fan_presets[idx].raw);
+    }
+    snprintf(s_fan_preset_local, sizeof(s_fan_preset_local), "%s", next);
     s_fan_preset_local_until = lv_tick_get() + OVERRIDE_MS;
     /* 选预设 = 想要这种风：开关也立刻跟着亮（HA 跟上后自动交还） */
     s_sw_override_on = true;
     s_sw_override_until = lv_tick_get() + OVERRIDE_MS;
     s_sw_on_shown = -1;
-    fan_refresh_chips(ent, def->raw);
-    if (strcmp(def->raw, s_fan_preset_shown) != 0) {
-        snprintf(s_fan_preset_shown, sizeof(s_fan_preset_shown), "%s", def->raw);
-        s_fan_accent = detail_on_bg(lv_color_hex(def->rgb));
+    /* 环色 / 底色 / 图标立刻跟着新预设走 */
+    if (strcmp(next, s_fan_preset_shown) != 0) {
+        snprintf(s_fan_preset_shown, sizeof(s_fan_preset_shown), "%s", next);
+        s_fan_accent = detail_on_bg(fan_preset_color(next));
         if (s_fan_arc) {
             lv_obj_set_style_arc_color(s_fan_arc, s_fan_accent, LV_PART_INDICATOR);
         }
         if (s_fan_glow) {
             lv_obj_set_style_arc_color(s_fan_glow, s_fan_accent, LV_PART_INDICATOR);
         }
-        if (s_fan_icon) {
-            lv_obj_invalidate(s_fan_icon);
+        if (s_fan_name_icon) {
+            lv_obj_invalidate(s_fan_name_icon);
         }
-        fan_refresh_osc(ent);                /* 摇头的开色跟着预设色走 */
     }
-    fan_set_preset_text(def->raw);
+    s_fan_chip_shown = -1;
+    fan_apply_chips(ent, next, true);
     s_detail_fg_dirty = true;                /* 底色要跟着预设换 */
     detail_update_ambience();
     detail_apply_focus();
@@ -4024,37 +5086,10 @@ static void fan_preset_cb(lv_event_t *ev)
     memset(&cmd, 0, sizeof(cmd));
     snprintf(cmd.entity, sizeof(cmd.entity), "%s", s_detail_entity);
     snprintf(cmd.service, sizeof(cmd.service), "set_preset_mode");
-    snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"preset_mode\":\"%s\"}", fan_preset_raw(ent, def));
+    snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"preset_mode\":\"%s\"}", next);
     xQueueSend(s_cmd_q, &cmd, 0);
+    ESP_LOGI(TAG, "预设 -> %s（这台风扇不支持摇头：supported_features=57 无 OSCILLATE）", next);
 }
-
-/** 摇头键：乐观翻转，命令走队列；HA 落定后由轮询 / WS 交还。 */
-static void fan_osc_cb(lv_event_t *ev)
-{
-    (void)ev;
-    if (s_cmd_q == NULL || s_detail_entity[0] == '\0') {
-        return;
-    }
-    const ha_entity_t *ent = ha_client_find(s_detail_entity);
-    bool cur = (ent != NULL) && ent->oscillating;
-    if (s_fan_osc_local_until > lv_tick_get()) {
-        cur = s_fan_osc_local;
-    }
-    const bool next = !cur;
-    s_fan_osc_local = next;
-    s_fan_osc_local_until = lv_tick_get() + OVERRIDE_MS;
-    fan_refresh_osc(ent);
-
-    cmd_t cmd;
-    memset(&cmd, 0, sizeof(cmd));
-    snprintf(cmd.entity, sizeof(cmd.entity), "%s", s_detail_entity);
-    snprintf(cmd.service, sizeof(cmd.service), "set_oscillating");
-    snprintf(cmd.attrs, sizeof(cmd.attrs), "{\"oscillating\":%s}", next ? "true" : "false");
-    xQueueSend(s_cmd_q, &cmd, 0);
-    ESP_LOGI(TAG, "摇头 -> %s", next ? "开" : "关");
-}
-
-/* ------------------------------------------------------------------------- */
 
 /* ------------------------------------------------------------------------- */
 /* 灯详情页：旋钮调亮度 / 色温                                                */
@@ -4249,7 +5284,16 @@ static bool detail_knob_queue_pending(void)
  */
 bool ui_home_detail_knob(int delta)
 {
-    if (delta == 0 || !s_detail_visible || s_detail == NULL) {
+    if (delta == 0) {
+        return false;
+    }
+    /* 天气页开着：旋钮只滚天气页内部（返回 true 让 main.c 不翻页、响一下触觉）。
+       这是"页面接管旋钮"的唯一一处：翻页被 ui_home_page_step 和这里同时挡住。 */
+    if (ui_home_weather_open()) {
+        wx_scroll_step(delta);
+        return true;
+    }
+    if (!s_detail_visible || s_detail == NULL) {
         return false;
     }
     if (s_press_on_slider) {
@@ -4447,38 +5491,20 @@ static void detail_focus_ct_cb(lv_event_t *e)
 }
 
 /**
- * 圆盘按"区域"切焦点，不用精确戳到那圈细线上：
- *   r <= DETAIL_REGION_R(82px)  环心那颗孔（图标/数字所在）→ 色温
- *   r >  DETAIL_REGION_R        环带 / 环外                      → 亮度
- * 只处理"什么都没打中"的按压：判据是事件 target 必须就是 s_detail 本身。
- * 开关 / 两个数字标签 / 环 / 空调的模式·风速键都有自己的回调或命中区，
- * 它们的事件 bubbling 上来时 target 是子对象 → 这里直接跳过，决不会抢走它们。
- * 空调只有一个环（永远是焦点）：中间随便点不改焦点、也不发任何值。
+ * 圆盘按"区域"切焦点（旧版：环心 = 色温、环带 = 亮度）。
+ *
+ * 灯光页现在照设计稿用分段控件选亮度 / 色温，所以中间区域不再切焦点：
+ * 点环心什么也不做，点环带 / 拖环仍然是"调当前那一档"（环自己的 PRESSED 回调）。
+ * 空调 / 风扇本来就只有一条环，中间区域同样不做任何事。
+ * 这个回调保留成"占位 + 注释"，因为 s_detail 的 PRESSED 事件还挂着它。
  */
 static void detail_region_pressed_cb(lv_event_t *e)
 {
     if (s_detail == NULL || lv_event_get_target(e) != s_detail) {
         return;                          /* 打中了子控件：让它自己处理（冒泡上来的事件）*/
     }
-    if (s_detail_ac || s_detail_fan) {
-        return;                          /* 空调 / 风扇：单环，中间区域不做任何事 */
-    }
-    lv_indev_t *indev = lv_indev_active();
-    if (indev == NULL) {
-        return;
-    }
-    lv_point_t p;
-    lv_indev_get_point(indev, &p);
-    const int dx = (int)p.x - DETAIL_CX;
-    const int dy = (int)p.y - DETAIL_CY;
-    const int r2 = dx * dx + dy * dy;    /* 比平方，省一个开方 */
-    const int target = (r2 <= DETAIL_REGION_R * DETAIL_REGION_R)
-                       ? DETAIL_KNOB_CT : DETAIL_KNOB_BR;
-    if (target == s_detail_knob_target) {
-        return;
-    }
-    s_detail_knob_target = target;
-    detail_apply_focus();
+    /* 灯 / 空调 / 风扇：档位由分段控件或本来就只有一档，中间区域不再切焦点 */
+    (void)e;
 }
 
 static void detail_dial_changed_cb(lv_event_t *e)
@@ -4689,6 +5715,10 @@ static lv_obj_t *detail_make_arc(lv_obj_t *parent, int radius, int width, bool h
     lv_obj_set_style_shadow_width(arc, 0, LV_PART_KNOB);
 
     lv_arc_set_bg_angles(arc, DETAIL_ANG_START, DETAIL_ANG_END);
+    /* 指示灯的角度也显式设成 270°（135°→45°，缺口朝下）。只设 bg_angles 时，
+       指示灯的默认角度是 0..360——一旦某条路径只改样式不调 lv_arc_set_value，
+       画出来就是一整圈；显式设一次把这条路堵死。 */
+    lv_arc_set_angles(arc, DETAIL_ANG_START, DETAIL_ANG_END);
     /* 点/拖一次到位：默认 720°/s 会让手指追上半天，点一下也跳不过去 */
     lv_arc_set_change_rate(arc, 3600);
     /* 命中区域只留这一圈（默认外扩 13px 会伸进隔壁环里抢手指）*/
@@ -4718,6 +5748,1047 @@ static int detail_count_objs(lv_obj_t *obj)
     return n;
 }
 
+/* ================= WEATHER PAGE (ui_home.c) ================= */
+
+/* ------------------------------------------------------------------------- */
+/* 天气页：实况 + 逐小时（6 条）+ 逐日（3 条），整页纵向滚动、旋钮接管          */
+/*                                                                           */
+/* 设计稿 .scr[data-scr="weather"] 是"现在 / 逐小时 / 逐日"三页、用旋钮翻页；   */
+/* 这里按任务要求合成一页长内容（旋钮在页内滚动），三段的排版逐条照设计稿：      */
+/*   实况   40x40 图标 y=40 / 天况 y=86 / 大号温度 y=136 / 体感 y=172 /         */
+/*          六格 y=204（2 列 × 3 行，见下面的说明）                            */
+/*   逐小时 标题 y=300，6 行 × 40（时间 52 / 图标 20 / 降水 46 / 温度右对齐）   */
+/*   逐日   标题 y=582，3 行 × 56（今天 / 明天 / 周X / 图标 / 天况 / 高低温）    */
+/* 可视区 = 屏幕 0..300：300..360 留给圆屏收边，滚到底时最后一行正好露出来。    */
+/* 设计稿这三页只有标题和分隔线、没有状态栏；本页是覆盖层，和灯 / 空调详情页    */
+/* 用同一套滑入滑出动画（s_detail 那套），不画状态栏和圆点。                    */
+/* ------------------------------------------------------------------------- */
+#define WX_VIEW_H          300
+#define WX_ROW_X            56
+#define WX_ROW_W           248
+#define WX_NOW_ICON_Y       40
+#define WX_NOW_COND_Y       80
+#define WX_NOW_BIG_Y       124     /* 64 号数字：墨迹 129..174，中心 151 */
+#define WX_NOW_FEEL_Y      178
+#define WX_GRID_Y          204
+#define WX_GRID_ROW_H       26
+#define WX_HOUR_HDR_Y      292
+#define WX_HOUR_Y          322
+#define WX_HOUR_H           40
+#define WX_DAY_HDR_Y       (WX_HOUR_Y + HA_WX_HOURLY * WX_HOUR_H + 20)   /* 582 */
+#define WX_DAY_Y           (WX_DAY_HDR_Y + 26)                           /* 608 */
+#define WX_DAY_H            56
+#define WX_CONTENT_H       (WX_DAY_Y + HA_WX_DAILY * WX_DAY_H + 60)      /* 836 */
+#define WX_SCROLL_STEP      40
+#define WX_CELL_MAX          6
+
+static lv_obj_t *s_wx_page;
+static lv_obj_t *s_wx_scroll;
+static lv_obj_t *s_wx_cond;
+static lv_obj_t *s_wx_big;
+static lv_obj_t *s_wx_unit;
+static lv_obj_t *s_wx_icon_big;
+static lv_obj_t *s_wx_feel;
+static lv_obj_t *s_wx_cell_lbl[WX_CELL_MAX];
+static lv_obj_t *s_wx_cell_val[WX_CELL_MAX];
+static lv_obj_t *s_wx_hour_row[HA_WX_HOURLY];
+static lv_obj_t *s_wx_hour_t[HA_WX_HOURLY];
+static lv_obj_t *s_wx_hour_ic[HA_WX_HOURLY];
+static lv_obj_t *s_wx_hour_p[HA_WX_HOURLY];
+static lv_obj_t *s_wx_hour_v[HA_WX_HOURLY];
+static lv_obj_t *s_wx_day_row[HA_WX_DAILY];
+static lv_obj_t *s_wx_day_d[HA_WX_DAILY];
+static lv_obj_t *s_wx_day_ic[HA_WX_DAILY];
+static lv_obj_t *s_wx_day_c[HA_WX_DAILY];
+static lv_obj_t *s_wx_day_r[HA_WX_DAILY];
+static int s_wx_big_x = -1;
+static int s_wx_unit_x = -1;
+static uint32_t s_wx_sum_shown;
+static bool s_wx_visible;
+static char s_wx_entity[96];
+
+static void wx_refresh_ui(void);
+static void wx_close(void);
+
+/** 天气图标配色（设计稿：太阳 #FFC24B / 云 #9FB0C9 / 雨 #7FB2FF / 雪 #BFD9FF / 其它灰）。*/
+static lv_color_t wx_kind_color(int kind)
+{
+    switch (kind) {
+    case HA_WX_SUNNY:
+    case HA_WX_CLEAR_NIGHT:
+        return lv_color_hex(0xFFC24B);
+    case HA_WX_PARTLY:
+    case HA_WX_CLOUDY:
+        return lv_color_hex(0x9FB0C9);
+    case HA_WX_RAIN:
+    case HA_WX_POURING:
+    case HA_WX_LIGHTNING:
+        return lv_color_hex(0x7FB2FF);
+    case HA_WX_SNOW:
+    case HA_WX_SNOWY_RAIN:
+        return lv_color_hex(0xBFD9FF);
+    default:
+        return lv_color_hex(0x8D97A8);
+    }
+}
+
+/** 逐日那行的中文（设计稿 .w-day .c 是"晴 / 小雨 / 多云"）。*/
+static const char *wx_kind_zh(int kind)
+{
+    switch (kind) {
+    case HA_WX_SUNNY:
+    case HA_WX_CLEAR_NIGHT:
+        return "晴";
+    case HA_WX_PARTLY:
+        return "多云";
+    case HA_WX_CLOUDY:
+        return "阴";
+    case HA_WX_RAIN:
+        return "小雨";
+    case HA_WX_POURING:
+        return "大雨";
+    case HA_WX_LIGHTNING:
+        return "雷阵雨";
+    case HA_WX_SNOW:
+        return "雪";
+    case HA_WX_SNOWY_RAIN:
+        return "雨夹雪";
+    case HA_WX_FOG:
+        return "雾";
+    case HA_WX_WINDY:
+        return "大风";
+    case HA_WX_HAIL:
+        return "冰雹";
+    default:
+        return "--";
+    }
+}
+
+/** 圆角实心横条（画云、雾、雨丝用）。 */
+static void wx_bar(lv_layer_t *l, int x1, int y1, int x2, int y2, int r, lv_color_t c)
+{
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_color = c;
+    d.bg_opa = LV_OPA_COVER;
+    d.radius = (lv_coord_t)r;
+    lv_area_t a = {(lv_coord_t)x1, (lv_coord_t)y1, (lv_coord_t)x2, (lv_coord_t)y2};
+    lv_draw_rect(l, &d, &a);
+}
+
+/** 云：三个圆 + 两条横条拼成（u = 画布边长，20px 行图标和 40px 大图标共用）。*/
+static void wx_draw_cloud(lv_layer_t *l, int cx, int cy, int u, lv_color_t c)
+{
+    ac_dr_dot(l, cx - u * 8 / 40, cy + u * 2 / 40, u * 7 / 40, c);
+    ac_dr_dot(l, cx,             cy - u * 1 / 40, u * 9 / 40, c);
+    ac_dr_dot(l, cx + u * 8 / 40, cy + u * 3 / 40, u * 7 / 40, c);
+    wx_bar(l, cx - u * 14 / 40, cy + u * 2 / 40, cx + u * 14 / 40, cy + u * 9 / 40, u * 3 / 40, c);
+}
+
+/** 天气图标（自绘，不新增字体/图片）：kind 存在对象的 user_data 里。 */
+static void wx_icon_draw_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if (obj == NULL || layer == NULL) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const int w = a.x2 - a.x1 + 1;
+    const int h = a.y2 - a.y1 + 1;
+    const int u = (w < h ? w : h);
+    const int cx = (a.x1 + a.x2) / 2;
+    const int cy = (a.y1 + a.y2) / 2;
+    const int kind = (int)(intptr_t)lv_obj_get_user_data(obj);
+    const lv_color_t c = wx_kind_color(kind);
+    const int lw = (u >= 36) ? 3 : 2;
+    static const int16_t dx8[8] = {1024, 724, 0, -724, -1024, -724, 0, 724};
+    static const int16_t dy8[8] = {0, 724, 1024, 724, 0, -724, -1024, -724};
+
+    switch (kind) {
+    case HA_WX_SUNNY:
+        ac_dr_dot(layer, cx, cy, u * 9 / 40, c);
+        for (int i = 0; i < 8; i++) {
+            const int x1 = cx + (int)((int32_t)dx8[i] * (u * 12 / 40) / 1024);
+            const int y1 = cy + (int)((int32_t)dy8[i] * (u * 12 / 40) / 1024);
+            const int x2 = cx + (int)((int32_t)dx8[i] * (u * 18 / 40) / 1024);
+            const int y2 = cy + (int)((int32_t)dy8[i] * (u * 18 / 40) / 1024);
+            ac_dr_line(layer, x1, y1, x2, y2, lw, c);
+        }
+        break;
+    case HA_WX_CLEAR_NIGHT:
+        /* 弯月：整圆 + 一个页面底色的圆挖掉右上角 */
+        ac_dr_dot(layer, cx, cy, u * 11 / 40, c);
+        ac_dr_dot(layer, cx + u * 6 / 40, cy - u * 4 / 40, u * 10 / 40, lv_color_hex(0x05070B));
+        break;
+    case HA_WX_PARTLY:
+        ac_dr_dot(layer, cx + u * 8 / 40, cy - u * 8 / 40, u * 6 / 40, wx_kind_color(HA_WX_SUNNY));
+        wx_draw_cloud(layer, cx - u * 2 / 40, cy + u * 3 / 40, u, c);
+        break;
+    case HA_WX_RAIN:
+    case HA_WX_POURING: {
+        wx_draw_cloud(layer, cx, cy - u * 4 / 40, u, c);
+        const int n = (kind == HA_WX_POURING) ? 3 : 2;
+        for (int i = 0; i < n; i++) {
+            const int x = cx + (i - (n - 1) / 2) * (u * 8 / 40);
+            ac_dr_line(layer, x, cy + u * 9 / 40, x, cy + u * 16 / 40, lw, c);
+        }
+        break;
+    }
+    case HA_WX_LIGHTNING:
+        wx_draw_cloud(layer, cx, cy - u * 5 / 40, u, c);
+        ac_dr_line(layer, cx + u * 3 / 40, cy + u * 5 / 40, cx - u * 3 / 40, cy + u * 11 / 40, lw, c);
+        ac_dr_line(layer, cx - u * 3 / 40, cy + u * 11 / 40, cx + u * 2 / 40, cy + u * 11 / 40, lw, c);
+        ac_dr_line(layer, cx + u * 2 / 40, cy + u * 11 / 40, cx - u * 2 / 40, cy + u * 17 / 40, lw, c);
+        break;
+    case HA_WX_SNOW:
+    case HA_WX_SNOWY_RAIN:
+        wx_draw_cloud(layer, cx, cy - u * 4 / 40, u, c);
+        for (int i = 0; i < 3; i++) {
+            ac_dr_dot(layer, cx + (i - 1) * (u * 8 / 40), cy + u * 14 / 40, u * 2 / 40 + 1, c);
+        }
+        break;
+    case HA_WX_FOG:
+        wx_bar(layer, cx - u * 14 / 40, cy - u * 6 / 40, cx + u * 14 / 40, cy - u * 6 / 40 + lw, lw / 2, c);
+        wx_bar(layer, cx - u * 10 / 40, cy,            cx + u * 10 / 40, cy + lw,            lw / 2, c);
+        wx_bar(layer, cx - u * 6 / 40,  cy + u * 6 / 40, cx + u * 6 / 40, cy + u * 6 / 40 + lw, lw / 2, c);
+        break;
+    case HA_WX_WINDY:
+        ac_dr_line(layer, cx - u * 10 / 40, cy - u * 5 / 40, cx + u * 10 / 40, cy - u * 5 / 40, lw, c);
+        ac_dr_line(layer, cx - u * 6 / 40,  cy,            cx + u * 6 / 40,  cy,            lw, c);
+        ac_dr_line(layer, cx - u * 10 / 40, cy + u * 5 / 40, cx + u * 4 / 40, cy + u * 5 / 40, lw, c);
+        break;
+    case HA_WX_HAIL:
+        wx_draw_cloud(layer, cx, cy - u * 4 / 40, u, c);
+        ac_dr_dot(layer, cx - u * 5 / 40, cy + u * 13 / 40, u * 3 / 40 + 1, c);
+        ac_dr_dot(layer, cx + u * 5 / 40, cy + u * 15 / 40, u * 3 / 40 + 1, c);
+        break;
+    default:
+        wx_draw_cloud(layer, cx, cy, u, c);
+        break;
+    }
+}
+
+/** 给天气图标换种类：kind 存 user_data，然后重画。 */
+static void wx_set_icon(lv_obj_t *obj, int kind)
+{
+    if (obj == NULL) {
+        return;
+    }
+    if ((int)(intptr_t)lv_obj_get_user_data(obj) == kind) {
+        return;
+    }
+    lv_obj_set_user_data(obj, (void *)(intptr_t)kind);
+    lv_obj_invalidate(obj);
+}
+
+/** 大号温度 + "°" 一起水平居中（和灯光页同一个做法）。 */
+static void wx_place_big(void)
+{
+    if (s_wx_big == NULL || s_wx_unit == NULL) {
+        return;
+    }
+    lv_point_t nsz = {0, 0};
+    lv_point_t usz = {0, 0};
+    const char *ntxt = lv_label_get_text(s_wx_big);
+    const char *utxt = lv_label_get_text(s_wx_unit);
+    if (ntxt != NULL && ntxt[0] != '\0') {
+        lv_text_get_size(&nsz, ntxt, lv_obj_get_style_text_font(s_wx_big, 0), 0, 0,
+                     LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    if (utxt != NULL && utxt[0] != '\0') {
+        lv_text_get_size(&usz, utxt, &lv_font_montserrat_20, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    const int x0 = DETAIL_CX - (nsz.x + 3 + usz.x) / 2;
+    if (s_wx_big_x != x0) {
+        s_wx_big_x = x0;
+        lv_obj_set_pos(s_wx_big, x0, WX_NOW_BIG_Y);
+    }
+    const int ux = x0 + nsz.x + 3;
+    if (s_wx_unit_x != ux) {
+        s_wx_unit_x = ux;
+        lv_obj_set_pos(s_wx_unit, ux, WX_NOW_BIG_Y + 14);
+    }
+}
+
+/** 建一条"时间 / 图标 / 降水 / 温度"的逐小时行。 */
+static void wx_make_hour_row(lv_obj_t *parent, int i)
+{
+    const int y = WX_HOUR_Y + i * WX_HOUR_H;
+    lv_obj_t *row = lv_obj_create(parent);
+    s_wx_hour_row[i] = row;
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, WX_ROW_W, WX_HOUR_H);
+    lv_obj_set_pos(row, WX_ROW_X, y);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_color(row, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(row, 13, 0);          /* rgba(255,255,255,.05) */
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_wx_hour_t[i] = lv_label_create(row);
+    lv_label_set_text(s_wx_hour_t[i], "--时");
+    lv_obj_set_style_text_font(s_wx_hour_t[i], &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_wx_hour_t[i], lv_color_hex(0x8D97A8), 0);
+    lv_obj_set_pos(s_wx_hour_t[i], 0, 10);
+
+    s_wx_hour_ic[i] = lv_obj_create(row);
+    lv_obj_remove_style_all(s_wx_hour_ic[i]);
+    lv_obj_set_size(s_wx_hour_ic[i], 20, 20);
+    lv_obj_set_pos(s_wx_hour_ic[i], 56, 10);
+    lv_obj_set_user_data(s_wx_hour_ic[i], (void *)(intptr_t)HA_WX_CLOUDY);
+    lv_obj_remove_flag(s_wx_hour_ic[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_wx_hour_ic[i], wx_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    s_wx_hour_p[i] = lv_label_create(row);
+    lv_label_set_text(s_wx_hour_p[i], "--");
+    lv_obj_set_style_text_font(s_wx_hour_p[i], &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_wx_hour_p[i], lv_color_hex(0x6F8FB8), 0);
+    lv_obj_set_style_text_align(s_wx_hour_p[i], LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(s_wx_hour_p[i], 46);
+    lv_obj_set_pos(s_wx_hour_p[i], 100, 11);
+
+    s_wx_hour_v[i] = lv_label_create(row);
+    lv_label_set_text(s_wx_hour_v[i], "--°");
+    lv_obj_set_style_text_font(s_wx_hour_v[i], &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_wx_hour_v[i], lv_color_hex(0xE8EEF8), 0);
+    lv_obj_set_style_text_align(s_wx_hour_v[i], LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(s_wx_hour_v[i], 88);
+    lv_obj_set_pos(s_wx_hour_v[i], 160, 8);
+}
+
+/** 建一条"今天 / 图标 / 天况 / 高低温"的逐日行。 */
+static void wx_make_day_row(lv_obj_t *parent, int i)
+{
+    const int y = WX_DAY_Y + i * WX_DAY_H;
+    lv_obj_t *row = lv_obj_create(parent);
+    s_wx_day_row[i] = row;
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, WX_ROW_W, WX_DAY_H);
+    lv_obj_set_pos(row, WX_ROW_X, y);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_color(row, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(row, 13, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_wx_day_d[i] = lv_label_create(row);
+    lv_label_set_text(s_wx_day_d[i], "--");
+    lv_obj_set_style_text_font(s_wx_day_d[i], &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_wx_day_d[i], lv_color_hex(0x9AA4B5), 0);
+    lv_obj_set_pos(s_wx_day_d[i], 0, 18);
+
+    s_wx_day_ic[i] = lv_obj_create(row);
+    lv_obj_remove_style_all(s_wx_day_ic[i]);
+    lv_obj_set_size(s_wx_day_ic[i], 20, 20);
+    lv_obj_set_pos(s_wx_day_ic[i], 56, 18);
+    lv_obj_set_user_data(s_wx_day_ic[i], (void *)(intptr_t)HA_WX_CLOUDY);
+    lv_obj_remove_flag(s_wx_day_ic[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_wx_day_ic[i], wx_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    s_wx_day_c[i] = lv_label_create(row);
+    lv_label_set_text(s_wx_day_c[i], "--");
+    lv_obj_set_style_text_font(s_wx_day_c[i], &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_wx_day_c[i], lv_color_hex(0x8D97A8), 0);
+    lv_obj_set_pos(s_wx_day_c[i], 82, 18);
+
+    s_wx_day_r[i] = lv_label_create(row);
+    lv_label_set_text(s_wx_day_r[i], "--° / --°");
+    lv_obj_set_style_text_font(s_wx_day_r[i], &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_wx_day_r[i], lv_color_hex(0xE8EEF8), 0);
+    lv_obj_set_style_text_align(s_wx_day_r[i], LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(s_wx_day_r[i], 96);
+    lv_obj_set_pos(s_wx_day_r[i], 152, 16);
+}
+
+/** 六个实况格子的标题（顺序照设计稿 .w-grid）。 */
+static const char *const k_wx_cells[WX_CELL_MAX] = {
+    "湿度", "云量", "风", "气压", "能见度", "露点",
+};
+
+static void build_weather_page(lv_obj_t *scr)
+{
+    s_wx_page = lv_obj_create(scr);
+    if (s_wx_page == NULL) {
+        return;
+    }
+    lv_obj_remove_style_all(s_wx_page);
+    lv_obj_set_size(s_wx_page, 360, 360);
+    lv_obj_set_pos(s_wx_page, 0, 0);
+    lv_obj_set_style_bg_color(s_wx_page, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_wx_page, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_wx_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_wx_page, LV_OBJ_FLAG_HIDDEN);
+
+    /* .w-sky：顶部一层蓝色氛围光（设计稿的径向渐变近似，同灯页做法）*/
+    lv_obj_t *sky = detail_make_glow_disc(s_wx_page, 150, 12, DETAIL_CX, 62);
+    if (sky != NULL) {
+        lv_obj_set_style_bg_color(sky, lv_color_hex(0x4C8DFF), 0);
+    }
+
+    s_wx_scroll = lv_obj_create(s_wx_page);
+    lv_obj_remove_style_all(s_wx_scroll);
+    lv_obj_set_size(s_wx_scroll, 360, WX_VIEW_H);
+    lv_obj_set_pos(s_wx_scroll, 0, 0);
+    lv_obj_set_style_bg_opa(s_wx_scroll, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(s_wx_scroll, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_wx_scroll, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_wx_scroll, LV_SCROLLBAR_MODE_ACTIVE);
+    lv_obj_set_style_width(s_wx_scroll, 3, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_color(s_wx_scroll, lv_color_white(), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(s_wx_scroll, 46, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(s_wx_scroll, 2, LV_PART_SCROLLBAR);
+    lv_obj_set_style_pad_all(s_wx_scroll, 0, 0);
+
+    lv_obj_t *c = s_wx_scroll;
+
+    /* ---- 现在 ---- */
+    s_wx_icon_big = lv_obj_create(c);
+    lv_obj_remove_style_all(s_wx_icon_big);
+    lv_obj_set_size(s_wx_icon_big, 40, 40);
+    lv_obj_set_pos(s_wx_icon_big, DETAIL_CX - 20, WX_NOW_ICON_Y);
+    lv_obj_set_user_data(s_wx_icon_big, (void *)(intptr_t)HA_WX_SUNNY);
+    lv_obj_remove_flag(s_wx_icon_big, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_wx_icon_big, wx_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    s_wx_cond = lv_label_create(c);
+    lv_label_set_text(s_wx_cond, "--");
+    lv_obj_set_style_text_font(s_wx_cond, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_wx_cond, lv_color_hex(0xB9C4D6), 0);
+    lv_obj_set_style_text_letter_space(s_wx_cond, 2, 0);
+    lv_obj_set_style_text_align(s_wx_cond, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_wx_cond, 240);
+    lv_obj_set_pos(s_wx_cond, DETAIL_CX - 120, WX_NOW_COND_Y);
+
+    s_wx_big = lv_label_create(c);
+    lv_label_set_text(s_wx_big, "--");
+    lv_obj_set_style_text_font(s_wx_big, BIG_NUM_FONT, 0);
+    lv_obj_set_style_text_color(s_wx_big, lv_color_white(), 0);
+    lv_obj_set_pos(s_wx_big, 0, WX_NOW_BIG_Y);
+
+    s_wx_unit = lv_label_create(c);
+    lv_label_set_text(s_wx_unit, "°");
+    lv_obj_set_style_text_font(s_wx_unit, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_wx_unit, lv_color_white(), 0);
+    lv_obj_set_style_text_opa(s_wx_unit, 140, 0);      /* 设计稿 opacity .55 */
+    lv_obj_set_pos(s_wx_unit, 0, WX_NOW_BIG_Y + 6);
+
+    s_wx_feel = lv_label_create(c);
+    lv_label_set_text(s_wx_feel, "体感 --");
+    lv_obj_set_style_text_font(s_wx_feel, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_wx_feel, lv_color_hex(0x7E899D), 0);
+    lv_obj_set_style_text_align(s_wx_feel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_wx_feel, 240);
+    lv_obj_set_pos(s_wx_feel, DETAIL_CX - 120, WX_NOW_FEEL_Y);
+
+    /* 六格：设计稿 3 列 × 2 行、12px 标签 + 16px 数值；固件只有 cjk16 一种中文，
+       3 列放不下"能见度 11km"，改成 2 列 × 3 行（字号、配色不变）。*/
+    for (int i = 0; i < WX_CELL_MAX; i++) {
+        const int col = i % 2;
+        const int row = i / 2;
+        const int x = DETAIL_CX - 120 + col * 122;
+        const int y = WX_GRID_Y + row * WX_GRID_ROW_H;
+        s_wx_cell_lbl[i] = lv_label_create(c);
+        lv_label_set_text(s_wx_cell_lbl[i], k_wx_cells[i]);
+        lv_obj_set_style_text_font(s_wx_cell_lbl[i], &lv_font_cjk16, 0);
+        lv_obj_set_style_text_color(s_wx_cell_lbl[i], lv_color_hex(0x66718A), 0);
+        lv_obj_set_width(s_wx_cell_lbl[i], 54);          /* 标签列固定 54，"能见度"正好放下 */
+        lv_obj_set_pos(s_wx_cell_lbl[i], x, y);
+
+        s_wx_cell_val[i] = lv_label_create(c);
+        lv_label_set_text(s_wx_cell_val[i], "--");
+        lv_obj_set_style_text_font(s_wx_cell_val[i],
+                                   (i == 2) ? &lv_font_cjk16 : &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(s_wx_cell_val[i], lv_color_hex(0xCDD6E4), 0);
+        lv_obj_set_width(s_wx_cell_val[i], 64);          /* 54 + 8 间距 + 64 = 126 ≈ 单元格宽 */
+        lv_obj_set_pos(s_wx_cell_val[i], x + 56, y);
+    }
+
+    /* ---- 逐小时 ---- */
+    lv_obj_t *hh = lv_label_create(c);
+    lv_label_set_text(hh, "逐小时");
+    lv_obj_set_style_text_font(hh, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(hh, lv_color_hex(0xDBE3EF), 0);
+    lv_obj_set_style_text_letter_space(hh, 2, 0);
+    lv_obj_set_style_text_align(hh, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(hh, 240);
+    lv_obj_set_pos(hh, DETAIL_CX - 120, WX_HOUR_HDR_Y);
+
+    for (int i = 0; i < HA_WX_HOURLY; i++) {
+        wx_make_hour_row(c, i);
+    }
+
+    /* ---- 逐日 ---- */
+    lv_obj_t *dh = lv_label_create(c);
+    lv_label_set_text(dh, "逐日");
+    lv_obj_set_style_text_font(dh, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(dh, lv_color_hex(0xDBE3EF), 0);
+    lv_obj_set_style_text_letter_space(dh, 2, 0);
+    lv_obj_set_style_text_align(dh, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(dh, 240);
+    lv_obj_set_pos(dh, DETAIL_CX - 120, WX_DAY_HDR_Y);
+
+    for (int i = 0; i < HA_WX_DAILY; i++) {
+        wx_make_day_row(c, i);
+    }
+
+    /* 内容高度：滚动到底时最后一行能滚进可视区（多给 60px 余量）*/
+    lv_obj_t *pad = lv_obj_create(c);
+    lv_obj_remove_style_all(pad);
+    lv_obj_set_size(pad, 1, 1);
+    lv_obj_set_pos(pad, 0, WX_CONTENT_H);
+    lv_obj_remove_flag(pad, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    ESP_LOGI(TAG, "天气页建好：3 段 / 可视 %d / 内容 %d（旋钮滚动，每格 %d px）",
+             WX_VIEW_H, WX_CONTENT_H, WX_SCROLL_STEP);
+}
+
+/** 十进制的 0.1 单位四舍五入成整数（-1.5 → -2）。*/
+static int wx_r10(int v10)
+{
+    return (v10 >= 0) ? ((v10 + 5) / 10) : ((v10 - 5) / 10);
+}
+
+/** 把实况 + 预报刷到天气页上（轮询 500ms 调一次；内容没变就直接返回）。*/
+static void wx_refresh_ui(void)
+{
+    if (!s_wx_visible || s_wx_page == NULL) {
+        return;
+    }
+    const ha_entity_t *e = ha_client_find(s_wx_entity);
+    ha_wx_forecast_t fc;
+    const bool have_fc = ha_client_weather_forecast_copy(&fc);
+
+    /* 便宜的变化检测：实况的数字 + 预报时间戳，一样就不重排任何标签 */
+    uint32_t sum = 0;
+    if (e != NULL) {
+        sum = (uint32_t)(e->wx_temp10 + 100) * 31u + (uint32_t)(e->wx_feel10 + 100) * 17u
+            + (uint32_t)e->wx_humidity * 7u + (uint32_t)e->wx_cloud * 5u
+            + (uint32_t)(e->wx_press + 2000) * 3u + (uint32_t)(e->wx_dew10 + 100)
+            + (uint32_t)e->wx_vis_km + (uint32_t)e->wx_wind_kmh * 11u
+            + (uint32_t)e->wx_kind * 13u + (uint32_t)e->wx_valid * 999u;
+        for (const char *p = e->wx_wind_bearing; *p != '\0'; p++) {
+            sum = sum * 33u + (uint8_t)*p;
+        }
+        for (const char *p = e->state; *p != '\0'; p++) {
+            sum = sum * 33u + (uint8_t)*p;
+        }
+    }
+    sum = sum * 131u + fc.stamp_s + (uint32_t)fc.hour_n * 977u + (uint32_t)fc.day_n * 389u
+        + (uint32_t)have_fc * 7919u;
+    if (sum == s_wx_sum_shown) {
+        return;
+    }
+    s_wx_sum_shown = sum;
+
+    char buf[48];
+    if (e == NULL || !e->wx_valid) {
+        lv_label_set_text(s_wx_cond, "--");
+        lv_label_set_text(s_wx_big, "--");
+        lv_label_set_text(s_wx_unit, "");
+        lv_label_set_text(s_wx_feel, "体感 --");
+        for (int i = 0; i < WX_CELL_MAX; i++) {
+            lv_label_set_text(s_wx_cell_val[i], "--");
+        }
+        wx_set_icon(s_wx_icon_big, HA_WX_CLOUDY);
+    } else {
+        lv_label_set_text(s_wx_cond, weather_state_zh(e->entity_id, e->state));
+        wx_set_icon(s_wx_icon_big, (int)ha_wx_kind_of(e->state));
+        snprintf(buf, sizeof(buf), "%d", wx_r10(e->wx_temp10));
+        lv_label_set_text(s_wx_big, buf);
+        lv_label_set_text(s_wx_unit, "°");
+        snprintf(buf, sizeof(buf), "体感 %d°", wx_r10(e->wx_feel10));
+        lv_label_set_text(s_wx_feel, buf);
+        /* 六格：湿度 / 云量 / 风 / 气压 / 能见度 / 露点 */
+        snprintf(buf, sizeof(buf), "%d%%", e->wx_humidity);
+        lv_label_set_text(s_wx_cell_val[0], buf);
+        snprintf(buf, sizeof(buf), "%d%%", e->wx_cloud);
+        lv_label_set_text(s_wx_cell_val[1], buf);
+        /* 风向：HA 给的是"东北风"，格子里去掉尾字"风"（设计稿写"东北 14"）*/
+        char bearing[16];
+        snprintf(bearing, sizeof(bearing), "%.15s", e->wx_wind_bearing);
+        size_t bl = strlen(bearing);
+        if (bl >= 3 && strcmp(bearing + bl - 3, "风") == 0) {
+            bearing[bl - 3] = '\0';
+        }
+        if (bearing[0] != '\0') {
+            snprintf(buf, sizeof(buf), "%s %d", bearing, (int)e->wx_wind_kmh);
+        } else {
+            snprintf(buf, sizeof(buf), "%d", (int)e->wx_wind_kmh);
+        }
+        lv_label_set_text(s_wx_cell_val[2], buf);
+        snprintf(buf, sizeof(buf), "%d", (int)e->wx_press);
+        lv_label_set_text(s_wx_cell_val[3], buf);
+        snprintf(buf, sizeof(buf), "%dkm", (int)e->wx_vis_km);
+        lv_label_set_text(s_wx_cell_val[4], buf);
+        snprintf(buf, sizeof(buf), "%d°", wx_r10(e->wx_dew10));
+        lv_label_set_text(s_wx_cell_val[5], buf);
+    }
+    wx_place_big();
+
+    /* 逐小时：不够 6 条就把多出来的行整行藏掉 */
+    for (int i = 0; i < HA_WX_HOURLY; i++) {
+        const bool show = have_fc && i < fc.hour_n;
+        detail_set_hidden(s_wx_hour_row[i], !show);
+        if (!show) {
+            continue;
+        }
+        snprintf(buf, sizeof(buf), "%d时", (int)fc.hour[i].hour);
+        lv_label_set_text(s_wx_hour_t[i], buf);
+        wx_set_icon(s_wx_hour_ic[i], (int)fc.hour[i].kind);
+        snprintf(buf, sizeof(buf), "%d%%", (int)fc.hour[i].pop);
+        lv_label_set_text(s_wx_hour_p[i], buf);
+        snprintf(buf, sizeof(buf), "%d°", (int)fc.hour[i].temp);
+        lv_label_set_text(s_wx_hour_v[i], buf);
+    }
+
+    /* 逐日：今天 / 明天 / 周X（day_off >= 2 时按星期几写）*/
+    static const char *const k_week[7] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
+    for (int i = 0; i < HA_WX_DAILY; i++) {
+        const bool show = have_fc && i < fc.day_n;
+        detail_set_hidden(s_wx_day_row[i], !show);
+        if (!show) {
+            continue;
+        }
+        const char *day = (fc.day[i].day_off == 0) ? "今天"
+                          : (fc.day[i].day_off == 1) ? "明天"
+                                                     : k_week[fc.day[i].weekday % 7];
+        lv_label_set_text(s_wx_day_d[i], day);
+        wx_set_icon(s_wx_day_ic[i], (int)fc.day[i].kind);
+        lv_label_set_text(s_wx_day_c[i], wx_kind_zh(fc.day[i].kind));
+        snprintf(buf, sizeof(buf), "%d° / %d°", (int)fc.day[i].tmax, (int)fc.day[i].tmin);
+        lv_label_set_text(s_wx_day_r[i], buf);
+    }
+}
+
+/** 旋钮在天气页里滚动（正转 = 往下看），每格 40px（正好一行逐小时）。 */
+static void wx_scroll_step(int delta)
+{
+    if (s_wx_scroll == NULL) {
+        return;
+    }
+    lv_obj_scroll_by_bounded(s_wx_scroll, 0, -delta * WX_SCROLL_STEP, LV_ANIM_ON);
+}
+
+/** 打开天气页：滑入 + 藏掉下面的页面 / 标题 / 圆点（和详情页同一套）。*/
+static void wx_open(const char *entity_id)
+{
+    if (s_wx_page == NULL || entity_id == NULL) {
+        return;
+    }
+    snprintf(s_wx_entity, sizeof(s_wx_entity), "%s", entity_id);
+    ESP_LOGI(TAG, "打开天气页: %s", entity_id);
+    s_wx_visible = true;
+    s_wx_sum_shown = 0;
+    s_wx_big_x = -1;
+    s_wx_unit_x = -1;
+    if (s_wx_scroll != NULL) {
+        lv_obj_scroll_to_y(s_wx_scroll, 0, LV_ANIM_OFF);
+    }
+    wx_refresh_ui();
+
+    if (s_page >= 0 && s_page < s_page_count && s_pages[s_page]) {
+        lv_obj_add_flag(s_pages[s_page], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_title) {
+        lv_obj_add_flag(s_title, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < s_page_count; i++) {
+        if (s_dots[i]) {
+            lv_obj_add_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    lv_obj_remove_flag(s_wx_page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_wx_page, 0, 0);
+    lv_obj_set_style_translate_x(s_wx_page, 360, 0);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_wx_page);
+    lv_anim_set_values(&a, 360, 0);
+    lv_anim_set_time(&a, 220);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, anim_translate_cb);
+    lv_anim_start(&a);
+    s_animating = true;
+}
+
+static void wx_close_done_cb(lv_anim_t *a)
+{
+    (void)a;
+    if (s_wx_page != NULL) {
+        lv_obj_add_flag(s_wx_page, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_translate_x(s_wx_page, 0, 0);
+        lv_obj_set_pos(s_wx_page, 0, 0);
+    }
+    if (s_page >= 0 && s_page < s_page_count && s_pages[s_page]) {
+        lv_obj_remove_flag(s_pages[s_page], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_title) {
+        lv_obj_remove_flag(s_title, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < s_page_count; i++) {
+        if (s_dots[i]) {
+            lv_obj_remove_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
+            dot_style(s_page, i);
+        }
+    }
+    s_animating = false;
+}
+
+/** 关闭天气页（左边缘右滑 / MQTT 都可以调）。*/
+static void wx_close(void)
+{
+    if (s_wx_page == NULL || !s_wx_visible) {
+        return;
+    }
+    s_wx_visible = false;
+    s_animating = true;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_wx_page);
+    lv_anim_set_values(&a, 0, 360);
+    lv_anim_set_time(&a, 200);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+    lv_anim_set_exec_cb(&a, anim_translate_cb);
+    lv_anim_set_completed_cb(&a, wx_close_done_cb);
+    lv_anim_start(&a);
+}
+
+bool ui_home_weather_open(void)
+{
+    return s_wx_visible;
+}
+
+void ui_home_weather_show(const char *entity_id)
+{
+    wx_open(entity_id);
+}
+
+void ui_home_weather_hide(void)
+{
+    wx_close();
+}
+
+/* ------------------------------------------------------------------------- */
+/* 传感器详情页（设计稿"屏幕 8 · 传感器详情 / 数值型"，已按设计变更去掉历史曲线）*/
+/*                                                                           */
+/* 设计稿里这一页原本是三段：.s-head2（名字）、.s-value（大号数值 + 单位）、     */
+/* .s-range / .s-stats（"近 3 小时 · N 次采样" + 最小/平均/最大）。             */
+/* 设计把"历史曲线"整套取消后，后两段的数据源（历史采样）已经不存在，所以本页    */
+/* 只保留**非历史**的部分：                                                    */
+/*   .s-head2   top 74，居中（图标 16 + gap 6 + 名字），16px #D7DEE9、字距 .04em */
+/*   .s-value   大号数值 + 单位（单位 montserrat_20、opacity .6）               */
+/* 数值块放在 y=128（字墨中心 151 = 圆屏光学中心）：原设计下半屏是统计块，       */
+/* 去掉统计后若仍从 106 起，整块会明显偏上。文字型传感器（state 不是数字）用     */
+/* 同一套位置显示状态文字（cjk16）。                                          */
+/* 本页是覆盖层（和灯 / 空调 / 天气同一套滑入滑出），没有拨盘、不接管旋钮：       */
+/* 旋钮仍然翻页（main.c 的 ui_home_page_step 照常走），左缘右滑关闭。            */
+/* 本页不取任何历史数据（不调用 ha_client_history）。                           */
+/* ------------------------------------------------------------------------- */
+#define SENS_NAME_Y       74
+#define SENS_VALUE_Y     128     /* 64 号数字：字墨 129..174，中心 151（圆屏光学中心）*/
+#define SENS_UNIT_DY      14
+#define SENS_ICON         16
+
+static lv_obj_t *s_sens_page;
+static lv_obj_t *s_sens_icon;
+static lv_obj_t *s_sens_name_row;      /* 图标 + 名字的 flex 容器 */
+static lv_obj_t *s_sens_name;
+static lv_obj_t *s_sens_value;
+static lv_obj_t *s_sens_unit;
+static bool s_sens_visible;
+static char s_sens_entity[96];
+static uint8_t s_sens_icon_kind;         /* 0=温度计 1=水滴 2=功率 3=通用 */
+static char s_sens_num_shown[24];
+static char s_sens_unit_shown[12];
+static int s_sens_num_x = -1;
+static int s_sens_unit_x = -1;
+
+static void sensor_open(const char *entity_id);
+static void sensor_close(void);
+static void sensor_refresh(void);
+
+/** 传感器图标（16x16，自绘）：按单位选温度计 / 水滴 / 功率 / 通用。 */
+static void sensor_icon_draw_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    if (obj == NULL || layer == NULL) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const int cx = (a.x1 + a.x2) / 2;
+    const int cy = (a.y1 + a.y2) / 2;
+    const lv_color_t c = lv_color_hex(0x8D97A8);      /* 设计稿 .s-head2 .ic */
+    switch (s_sens_icon_kind) {
+    case 1:                                           /* 湿度：水滴 */
+        ac_dr_dot(layer, cx, cy + 2, 3, c);
+        ac_dr_line(layer, cx, cy - 7, cx - 3, cy + 1, 2, c);
+        ac_dr_line(layer, cx, cy - 7, cx + 3, cy + 1, 2, c);
+        break;
+    case 2:                                           /* 功率：闪电 */
+        ac_dr_line(layer, cx + 1, cy - 7, cx - 3, cy, 2, c);
+        ac_dr_line(layer, cx - 3, cy, cx + 2, cy, 2, c);
+        ac_dr_line(layer, cx + 2, cy, cx - 2, cy + 7, 2, c);
+        break;
+    case 0:                                           /* 温度：温度计 */
+        ac_dr_line(layer, cx, cy - 7, cx, cy + 1, 2, c);
+        ac_dr_dot(layer, cx, cy + 3, 3, c);
+        break;
+    default:                                          /* 通用：小圆 + 十字 */
+        ac_dr_arc(layer, cx, cy, 5, 2, 0, 360, c);
+        ac_dr_dot(layer, cx, cy, 1, c);
+        break;
+    }
+}
+
+/** 大号数值 + 单位一起居中（数字用 num64，文字型退回 cjk16）。 */
+static void sensor_place_value(void)
+{
+    if (s_sens_value == NULL || s_sens_unit == NULL) {
+        return;
+    }
+    lv_point_t nsz = {0, 0};
+    lv_point_t usz = {0, 0};
+    const char *ntxt = lv_label_get_text(s_sens_value);
+    const char *utxt = lv_label_get_text(s_sens_unit);
+    if (ntxt != NULL && ntxt[0] != '\0') {
+        lv_text_get_size(&nsz, ntxt, lv_obj_get_style_text_font(s_sens_value, 0), 0, 0,
+                         LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    }
+    if (utxt != NULL && utxt[0] != '\0') {
+        lv_text_get_size(&usz, utxt, &lv_font_montserrat_20, 0, 0, LV_COORD_MAX,
+                         LV_TEXT_FLAG_NONE);
+    }
+    const int gap = (usz.x > 0) ? 3 : 0;
+    const int x0 = 180 - (nsz.x + gap + usz.x) / 2;
+    if (s_sens_num_x != x0) {
+        s_sens_num_x = x0;
+        lv_obj_set_pos(s_sens_value, x0, SENS_VALUE_Y);
+    }
+    const int ux = x0 + nsz.x + gap;
+    if (s_sens_unit_x != ux) {
+        s_sens_unit_x = ux;
+        lv_obj_set_pos(s_sens_unit, ux, SENS_VALUE_Y + SENS_UNIT_DY);
+    }
+}
+
+/** 数字格式化：整数且 |v| >= 100 不带小数，否则一位小数。 */
+static void sensor_fmt(char *buf, size_t n, float v)
+{
+    const float av = (v < 0) ? -v : v;
+    if (av >= 100.0f || (float)(int)v == v) {
+        snprintf(buf, n, "%d", (int)(v + ((v >= 0) ? 0.5f : -0.5f)));
+    } else {
+        snprintf(buf, n, "%.1f", (double)v);
+    }
+}
+
+/** 按单位挑图标类型。 */
+static void sensor_pick_icon(const char *unit)
+{
+    s_sens_icon_kind = 3;
+    if (unit == NULL) {
+        return;
+    }
+    if (strcmp(unit, "%") == 0) {
+        s_sens_icon_kind = 1;
+    } else if (strstr(unit, "°") != NULL || strcasecmp(unit, "C") == 0) {
+        s_sens_icon_kind = 0;
+    } else if (strcasecmp(unit, "W") == 0 || strcasecmp(unit, "kW") == 0 ||
+               strcasecmp(unit, "kWh") == 0) {
+        s_sens_icon_kind = 2;
+    }
+}
+
+/** 把当前值刷到页面上（500ms 轮询 + 打开时各一次）。 */
+static void sensor_refresh(void)
+{
+    if (!s_sens_visible || s_sens_page == NULL || s_sens_value == NULL) {
+        return;
+    }
+    const ha_entity_t *e = ha_client_find(s_sens_entity);
+    char num[24] = "--";
+    char unit[12] = "";
+    const lv_font_t *font = BIG_NUM_FONT;
+
+    if (e != NULL && e->fresh && strcmp(e->state, "unavailable") != 0 &&
+        strcmp(e->state, "unknown") != 0) {
+        char *end = NULL;
+        const double d = strtod(e->state, &end);
+        const bool numeric = (end != NULL && end != e->state && *end == '\0');
+        if (numeric) {
+            sensor_fmt(num, sizeof(num), (float)d);
+            snprintf(unit, sizeof(unit), "%s", e->unit);
+            font = BIG_NUM_FONT;
+        } else {
+            /* 文字型（开 / 关 / 制水中…）：同一套布局，数值换成状态文字 */
+            snprintf(num, sizeof(num), "%s", e->state);
+            font = &lv_font_cjk16;
+        }
+    }
+    if (strcmp(num, s_sens_num_shown) != 0) {
+        snprintf(s_sens_num_shown, sizeof(s_sens_num_shown), "%s", num);
+        lv_label_set_text(s_sens_value, num);
+        lv_obj_set_style_text_font(s_sens_value, font, 0);
+    }
+    if (strcmp(unit, s_sens_unit_shown) != 0) {
+        snprintf(s_sens_unit_shown, sizeof(s_sens_unit_shown), "%s", unit);
+        lv_label_set_text(s_sens_unit, unit);
+    }
+    sensor_place_value();
+}
+
+static void sensor_open(const char *entity_id)
+{
+    if (s_sens_page == NULL || entity_id == NULL) {
+        return;
+    }
+    snprintf(s_sens_entity, sizeof(s_sens_entity), "%s", entity_id);
+    const ha_entity_t *e = ha_client_find(entity_id);
+    ESP_LOGI(TAG, "打开传感器页: %s", entity_id);
+    s_sens_visible = true;
+    s_sens_num_shown[0] = '\x01';
+    s_sens_unit_shown[0] = '\x01';
+    s_sens_num_x = -1;
+    s_sens_unit_x = -1;
+    s_sens_icon_kind = 3;
+
+    lv_label_set_text(s_sens_name, (e != NULL && e->name[0]) ? e->name : entity_id);
+    sensor_pick_icon((e != NULL) ? e->unit : NULL);
+    if (s_sens_icon != NULL) {
+        lv_obj_invalidate(s_sens_icon);
+    }
+    sensor_refresh();
+
+    if (s_page >= 0 && s_page < s_page_count && s_pages[s_page]) {
+        lv_obj_add_flag(s_pages[s_page], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_title) {
+        lv_obj_add_flag(s_title, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < s_page_count; i++) {
+        if (s_dots[i]) {
+            lv_obj_add_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    lv_obj_remove_flag(s_sens_page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_sens_page, 0, 0);
+    lv_obj_set_style_translate_x(s_sens_page, 360, 0);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_sens_page);
+    lv_anim_set_values(&a, 360, 0);
+    lv_anim_set_time(&a, 220);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, anim_translate_cb);
+    lv_anim_start(&a);
+    s_animating = true;
+}
+
+static void sensor_close_done_cb(lv_anim_t *a)
+{
+    (void)a;
+    if (s_sens_page != NULL) {
+        lv_obj_add_flag(s_sens_page, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_translate_x(s_sens_page, 0, 0);
+        lv_obj_set_pos(s_sens_page, 0, 0);
+    }
+    if (s_page >= 0 && s_page < s_page_count && s_pages[s_page]) {
+        lv_obj_remove_flag(s_pages[s_page], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_title) {
+        lv_obj_remove_flag(s_title, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < s_page_count; i++) {
+        if (s_dots[i]) {
+            lv_obj_remove_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
+            dot_style(s_page, i);
+        }
+    }
+    s_animating = false;
+}
+
+static void sensor_close(void)
+{
+    if (s_sens_page == NULL || !s_sens_visible) {
+        return;
+    }
+    s_sens_visible = false;
+    s_animating = true;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_sens_page);
+    lv_anim_set_values(&a, 0, 360);
+    lv_anim_set_time(&a, 200);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+    lv_anim_set_exec_cb(&a, anim_translate_cb);
+    lv_anim_set_completed_cb(&a, sensor_close_done_cb);
+    lv_anim_start(&a);
+}
+
+static void build_sensor_page(lv_obj_t *scr)
+{
+    s_sens_page = lv_obj_create(scr);
+    if (s_sens_page == NULL) {
+        return;
+    }
+    lv_obj_remove_style_all(s_sens_page);
+    lv_obj_set_size(s_sens_page, 360, 360);
+    lv_obj_set_pos(s_sens_page, 0, 0);
+    lv_obj_set_style_bg_color(s_sens_page, lv_color_hex(0x05070B), 0);
+    lv_obj_set_style_bg_opa(s_sens_page, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_sens_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_sens_page, LV_OBJ_FLAG_HIDDEN);
+
+    /* 名字行：和详情页同样的 flex 居中（x=60..300），图标 + 名字自动居中 */
+    s_sens_name_row = lv_obj_create(s_sens_page);
+    lv_obj_remove_style_all(s_sens_name_row);
+    lv_obj_set_size(s_sens_name_row, 240, 20);
+    lv_obj_set_pos(s_sens_name_row, 60, SENS_NAME_Y);
+    lv_obj_set_flex_flow(s_sens_name_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_sens_name_row, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_sens_name_row, 6, 0);
+    lv_obj_set_style_pad_all(s_sens_name_row, 0, 0);
+    lv_obj_remove_flag(s_sens_name_row, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    s_sens_icon = lv_obj_create(s_sens_name_row);
+    lv_obj_remove_style_all(s_sens_icon);
+    lv_obj_set_size(s_sens_icon, SENS_ICON, SENS_ICON);
+    lv_obj_remove_flag(s_sens_icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_sens_icon, sensor_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    s_sens_name = lv_label_create(s_sens_name_row);
+    lv_label_set_text(s_sens_name, "");
+    lv_obj_set_style_text_font(s_sens_name, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_sens_name, lv_color_hex(0xD7DEE9), 0);
+    lv_obj_set_style_text_letter_space(s_sens_name, 1, 0);
+    lv_label_set_long_mode(s_sens_name, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_sens_name, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(s_sens_name, 200, 0);
+
+    s_sens_value = lv_label_create(s_sens_page);
+    lv_label_set_text(s_sens_value, "--");
+    lv_obj_set_style_text_font(s_sens_value, BIG_NUM_FONT, 0);
+    lv_obj_set_style_text_color(s_sens_value, lv_color_white(), 0);
+    lv_obj_set_pos(s_sens_value, 120, SENS_VALUE_Y);
+
+    s_sens_unit = lv_label_create(s_sens_page);
+    lv_label_set_text(s_sens_unit, "");
+    lv_obj_set_style_text_font(s_sens_unit, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_sens_unit, lv_color_hex(0xE8EEF8), 0);
+    lv_obj_set_style_text_opa(s_sens_unit, 153, 0);             /* 设计稿 opacity .6 */
+    lv_obj_set_pos(s_sens_unit, 200, SENS_VALUE_Y + SENS_UNIT_DY);
+
+    ESP_LOGI(TAG, "传感器页建好：名字 y=%d / 数值 y=%d（无历史曲线）", SENS_NAME_Y, SENS_VALUE_Y);
+}
+
 static void build_detail_view(lv_obj_t *scr)
 {
     s_detail = lv_obj_create(scr);
@@ -4729,29 +6800,37 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_remove_flag(s_detail, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
 
-    /* 区域点击：环心（r<=72）= 色温、环带/环外 = 亮度；
-       子控件自己的事件冒泡上来时 target 不是容器，会被这个回调忽略。 */
+    /* 区域点击：旧版是"环心 = 色温 / 环带 = 亮度"，灯光页现在用分段控件，
+       这个回调只剩占位（见函数注释）。 */
     lv_obj_add_event_cb(s_detail, detail_region_pressed_cb, LV_EVENT_PRESSED, NULL);
 
-    /* ---- 圆盘：先光晕（在下面），再圆环（在上面）---- */
-    s_detail_br_glow = detail_make_arc(s_detail, DETAIL_BR_GLOW_R, DETAIL_BR_GLOW_W, true);
+    /* ---- 灯光页的氛围光三层圆盘（设计稿 .light-bg 的径向渐变近似）----
+       必须在环之前建：它们在底层，环压在上面；透明度/颜色由 detail_apply_glow 刷。 */
+    for (int i = 0; i < GLOW_DISC_N; i++) {
+        s_glow_disc[i] = detail_make_glow_disc(s_detail, k_glow_r[i], 0, DETAIL_CX, 151);
+    }
+
+    /* ---- 圆盘：先光晕（在下面），再圆环（在上面）----
+       灯光页按设计稿是"单环 r=156 / 10px"：亮度和色温共用同一个半径，
+       哪个档位生效就显示哪一条（detail_apply_focus 负责藏另一条）。 */
+    s_detail_br_glow = detail_make_arc(s_detail, LIGHT_GLOW_R, LIGHT_GLOW_W, true);
     lv_arc_set_range(s_detail_br_glow, 1, 100);
     lv_arc_set_value(s_detail_br_glow, 1);
 
-    s_detail_ct_glow = detail_make_arc(s_detail, DETAIL_CT_GLOW_R, DETAIL_CT_GLOW_W, true);
+    s_detail_ct_glow = detail_make_arc(s_detail, LIGHT_GLOW_R, LIGHT_GLOW_W, true);
     lv_arc_set_range(s_detail_ct_glow, 2000, 6500);
     lv_arc_set_value(s_detail_ct_glow, 4000);
 
-    /* 外环 = 亮度：1..100%（0% 会被 HA 当成关灯，电源只归开关管）*/
-    s_detail_br_arc = detail_make_arc(s_detail, DETAIL_BR_R, DETAIL_BR_W, false);
+    /* 亮度环 = 1..100%（0% 会被 HA 当成关灯，电源只归电源键）*/
+    s_detail_br_arc = detail_make_arc(s_detail, LIGHT_R, LIGHT_W, false);
     lv_arc_set_range(s_detail_br_arc, 1, 100);
     lv_arc_set_value(s_detail_br_arc, 1);
     lv_obj_add_event_cb(s_detail_br_arc, detail_dial_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_detail_br_arc, detail_dial_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_detail_br_arc, detail_dial_changed_cb, LV_EVENT_RELEASED, NULL);
 
-    /* 内环 = 色温：范围在 detail_apply_entity 里按实体刷新 */
-    s_detail_ct_arc = detail_make_arc(s_detail, DETAIL_CT_R, DETAIL_CT_W, false);
+    /* 色温环：同一个半径，范围在 detail_apply_entity 里按实体刷新 */
+    s_detail_ct_arc = detail_make_arc(s_detail, LIGHT_R, LIGHT_W, false);
     lv_arc_set_range(s_detail_ct_arc, 2000, 6500);
     lv_arc_set_value(s_detail_ct_arc, 4000);
     /* 原生指示灯永不绘制：这一段是自绘的暖→冷渐变 */
@@ -4761,56 +6840,84 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_add_event_cb(s_detail_ct_arc, detail_dial_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_detail_ct_arc, detail_dial_changed_cb, LV_EVENT_RELEASED, NULL);
 
+    /* 灯的环 / 光晕以屏幕中心 (180,180) 为心（detail_make_arc 默认按 180,196）*/
+    light_recenter(s_detail_br_glow, LIGHT_GLOW_R);
+    light_recenter(s_detail_ct_glow, LIGHT_GLOW_R);
+    light_recenter(s_detail_br_arc, LIGHT_R);
+    light_recenter(s_detail_ct_arc, LIGHT_R);
+
     /* 顶上那个 36x36 返回键已经删掉：退出详情页走"从左边缘右滑"（swipe_cb 的
        边缘返回手势），所以顶部带里只剩状态栏。 */
 
-    /* ---- 中间堆栈：实体名 / 灯泡 / 大号百分比 / 色温文字 ----
-       名字建在圆环之后：聚焦时的光晕不会盖住它；它同时也是原来 y=58 那个标题，
-       现在整行搬进环心最上面（顶部带不再画任何东西）。 */
-    s_detail_name = lv_label_create(s_detail);
+    /* ---- 中间堆栈：实体名 / 灯泡 / 大号数值 + 单位 / 档位文字 ----
+       名字建在圆环之后：光晕不会盖住它。整行是一个 240x20 的 flex 容器（x=60..300），
+       图标 + 文字由 flex 自动居中，不再手动量宽度（那套会被遗留的 align 样式覆盖）。 */
+    /* 名字行：一个 240x20 的 flex 行（x=60..300，正好是文字安全圆的宽度），
+       图标和名字都是它的子对象，由 flex **自动居中**——不再"量文字宽度再摆位置"。
+       旧实现用手动测量 + lv_obj_set_pos，但标签身上还留着 build 时的
+       LV_STYLE_ALIGN(TOP_MID)，下一次 layout 又把它按对齐样式摆回去，
+       于是名字跑到屏幕右上角还被圆屏切掉。flex 布局不会出现这个问题。 */
+    s_detail_name_row = lv_obj_create(s_detail);
+    lv_obj_remove_style_all(s_detail_name_row);
+    lv_obj_set_size(s_detail_name_row, 240, 20);
+    lv_obj_set_pos(s_detail_name_row, 60, LIGHT_NAME_Y);
+    lv_obj_set_flex_flow(s_detail_name_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_detail_name_row, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_detail_name_row, 6, 0);
+    lv_obj_set_style_pad_all(s_detail_name_row, 0, 0);
+    lv_obj_set_style_bg_opa(s_detail_name_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_detail_name_row, 0, 0);
+    lv_obj_remove_flag(s_detail_name_row, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_detail_name_row, LV_OBJ_FLAG_HIDDEN);       /* 还没拿到名字：整行不画 */
+
+    s_detail_icon = lv_obj_create(s_detail_name_row);
+    lv_obj_remove_style_all(s_detail_icon);
+    lv_obj_set_size(s_detail_icon, LIGHT_ICON, LIGHT_ICON);
+    lv_obj_remove_flag(s_detail_icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_detail_icon, detail_bulb_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    s_detail_name = lv_label_create(s_detail_name_row);
     lv_label_set_text(s_detail_name, "");
     lv_obj_set_style_text_font(s_detail_name, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_detail_name, COLOR_MUTED, 0);   /* 0x8E8E93 */
-    lv_label_set_long_mode(s_detail_name, LV_LABEL_LONG_DOT);     /* 再长也"…"，压不到环上 */
-    lv_obj_set_style_text_align(s_detail_name, LV_TEXT_ALIGN_CENTER, 0);  /* 定宽 + 居中 */
-    lv_obj_set_width(s_detail_name, DETAIL_NAME_W);
-    lv_obj_align(s_detail_name, LV_ALIGN_TOP_MID, 0, DETAIL_NAME_Y);
+    lv_obj_set_style_text_color(s_detail_name, LIGHT_INK, 0);
+    lv_label_set_long_mode(s_detail_name, LV_LABEL_LONG_DOT);     /* 再长也"…" */
+    lv_obj_set_style_text_align(s_detail_name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_detail_name, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(s_detail_name, 200, 0);            /* 余下 16+6 给图标 */
     lv_obj_add_flag(s_detail_name, LV_OBJ_FLAG_HIDDEN);           /* 还没拿到名字：整行不画 */
-
-    s_detail_icon = lv_obj_create(s_detail);
-    lv_obj_remove_style_all(s_detail_icon);
-    lv_obj_set_size(s_detail_icon, 24, 24);
-    lv_obj_set_pos(s_detail_icon, DETAIL_CX - 12, 170);
-    lv_obj_remove_flag(s_detail_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_detail_icon, detail_bulb_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
 
     s_detail_br_value = lv_label_create(s_detail);
     lv_label_set_text(s_detail_br_value, "--");
     /* 项目里已经编进来的最大号字（montserrat_28），不新增字体 */
-    lv_obj_set_style_text_font(s_detail_br_value, DETAIL_PCT_FONT, 0);
+    lv_obj_set_style_text_font(s_detail_br_value, BIG_NUM_FONT, 0);
     lv_obj_set_style_text_color(s_detail_br_value, COLOR_TEXT, 0);
-    lv_obj_align(s_detail_br_value, LV_ALIGN_TOP_MID, 0, 196);
+    lv_obj_set_pos(s_detail_br_value, 160, LIGHT_VALUE_Y);
     lv_obj_add_flag(s_detail_br_value, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_detail_br_value, detail_focus_br_cb, LV_EVENT_CLICKED, NULL);
 
+    /* 单位（% / K）：设计稿里比数字小一号、低 8px；位置由 light_place_value 算 */
     s_detail_ct_value = lv_label_create(s_detail);
-    lv_label_set_text(s_detail_ct_value, "--");
-    lv_obj_set_style_text_font(s_detail_ct_value, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_detail_ct_value, COLOR_TEXT, 0);
-    lv_obj_align(s_detail_ct_value, LV_ALIGN_TOP_MID, 0, 226);   /* 给下面的焦点提示让 2px */
+    lv_label_set_text(s_detail_ct_value, "%");
+    lv_obj_set_style_text_font(s_detail_ct_value, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_detail_ct_value, lv_color_white(), 0);
+    lv_obj_set_style_text_opa(s_detail_ct_value, 184, 0);
+    lv_obj_set_pos(s_detail_ct_value, 200, LIGHT_VALUE_Y + LIGHT_UNIT_DY);
     lv_obj_add_flag(s_detail_ct_value, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_detail_ct_value, detail_focus_ct_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 关灯：整组圆盘藏起来，只留这一行提示 */
+    /* 档位文字「亮度 / 色温 / 已关闭」（设计稿 .l-label，16px + 字距 .24em）*/
     s_detail_off_hint = lv_label_create(s_detail);
-    lv_label_set_text(s_detail_off_hint, "已关闭");
+    lv_label_set_text(s_detail_off_hint, "亮度");
     lv_obj_set_style_text_font(s_detail_off_hint, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_detail_off_hint, COLOR_MUTED, 0);
-    lv_obj_align(s_detail_off_hint, LV_ALIGN_TOP_MID, 0, 190);
+    lv_obj_set_style_text_color(s_detail_off_hint, LIGHT_INK_MUTED, 0);
+    lv_obj_set_style_text_letter_space(s_detail_off_hint, 4, 0);
+    lv_obj_align(s_detail_off_hint, LV_ALIGN_TOP_MID, 0, LIGHT_LABEL_Y);
 
     /* ---------------- 空调那一组（同一个容器，默认全藏） ----------------
-       几何见文件头的 AC_* 宏：环 114/22 + 光晕；中间堆栈（实体名 / 图标 /
-       大号温度 / 室内温度 / 风速钮）都在内孔里；底部三行按"越往下越宽的缺口楔形"排。 */
+       设计稿 dial 帧，和灯 / 风扇同一骨架：环 r=156/10（外径 161，环心 180,180）+ 光晕；
+       名字行（名字行走共用 flex 行，图标是当前模式的小图标）；数值 y=100；
+       副标题 y=160；胶囊行 y=186（风速 + 摆风 + 44x44 电源键）；5 个 40x40 模式键 y=226。 */
     s_ac_glow = detail_make_arc(s_detail, AC_TEMP_GLOW_R, AC_TEMP_GLOW_W, true);
     lv_arc_set_range(s_ac_glow, AC_UNIT * 16, AC_UNIT * 30);
     lv_arc_set_value(s_ac_glow, AC_UNIT * 25);
@@ -4822,71 +6929,123 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_add_event_cb(s_ac_arc, detail_dial_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_ac_arc, detail_dial_changed_cb, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(s_ac_arc, detail_dial_changed_cb, LV_EVENT_PRESS_LOST, NULL);
+    light_recenter(s_ac_glow, AC_TEMP_GLOW_R);
+    light_recenter(s_ac_arc, AC_TEMP_R);
 
-    /* 中间：模式图标（自绘，颜色/形状由 s_ac_accent + s_ac_mode_shown 决定）*/
-    s_ac_icon = lv_obj_create(s_detail);
-    lv_obj_remove_style_all(s_ac_icon);
-    lv_obj_set_size(s_ac_icon, AC_ICON_SIZE, AC_ICON_SIZE);
-    lv_obj_set_pos(s_ac_icon, DETAIL_CX - AC_ICON_SIZE / 2, AC_ICON_Y);
-    lv_obj_remove_flag(s_ac_icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(s_ac_icon, ac_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    /* 名字行左侧：当前模式的 16px 图标（灯是灯泡 / 风扇是风图标，空调是模式图标）*/
+    s_ac_name_icon = lv_obj_create(s_detail_name_row);
+    lv_obj_remove_style_all(s_ac_name_icon);
+    lv_obj_set_size(s_ac_name_icon, LIGHT_ICON, LIGHT_ICON);
+    lv_obj_remove_flag(s_ac_name_icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_ac_name_icon, ac_name_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    lv_obj_add_flag(s_ac_name_icon, LV_OBJ_FLAG_HIDDEN);      /* 灯 / 风扇页不显示 */
 
-    /* 中间：大号目标温度（step<1 时带一位小数）*/
+    /* 大号目标温度（num64）+ °（montserrat_20、模式色、字墨中心对齐）*/
     s_ac_temp_value = lv_label_create(s_detail);
     lv_label_set_text(s_ac_temp_value, "--");
-    lv_obj_set_style_text_font(s_ac_temp_value, DETAIL_PCT_FONT, 0);
+    lv_obj_set_style_text_font(s_ac_temp_value, BIG_NUM_FONT, 0);
     lv_obj_set_style_text_color(s_ac_temp_value, COLOR_TEXT, 0);
-    lv_obj_align(s_ac_temp_value, LV_ALIGN_TOP_MID, 0, AC_TEMP_Y);
+    lv_obj_set_pos(s_ac_temp_value, 120, AC_VALUE_Y);
 
-    /* 中间：室内温度 */
+    s_ac_unit = lv_label_create(s_detail);
+    lv_label_set_text(s_ac_unit, "°");
+    lv_obj_set_style_text_font(s_ac_unit, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_ac_unit, lv_color_white(), 0);
+    lv_obj_set_pos(s_ac_unit, 200, AC_VALUE_Y + AC_UNIT_DY);
+
+    /* 副标题「制冷 · 室内 26.4°C」（设计稿 .d-unit）*/
     s_ac_room = lv_label_create(s_detail);
     lv_label_set_text(s_ac_room, "室内 --");
     lv_obj_set_style_text_font(s_ac_room, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_ac_room, COLOR_MUTED, 0);
-    lv_obj_align(s_ac_room, LV_ALIGN_TOP_MID, 0, AC_ROOM_Y);
+    lv_obj_set_style_text_color(s_ac_room, lv_color_hex(0x9AA4B5), 0);
+    lv_obj_set_style_text_align(s_ac_room, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_ac_room, 260);
+    lv_obj_set_pos(s_ac_room, 50, AC_ROOM_Y);
 
-    /* 风速：点一下切到下一档（中文标签，值来自实体的 fan_modes）*/
-    s_ac_fan_btn = lv_button_create(s_detail);
-    lv_obj_set_size(s_ac_fan_btn, AC_FAN_W, AC_FAN_H);
-    lv_obj_align(s_ac_fan_btn, LV_ALIGN_TOP_MID, 0, AC_FAN_Y);
-    lv_obj_set_style_radius(s_ac_fan_btn, AC_FAN_H / 2, 0);
-    lv_obj_set_style_bg_color(s_ac_fan_btn, lv_color_hex(0x24262B), 0);
-    lv_obj_set_style_bg_opa(s_ac_fan_btn, LV_OPA_80, 0);
-    lv_obj_set_style_border_width(s_ac_fan_btn, 1, 0);
-    lv_obj_set_style_border_color(s_ac_fan_btn, lv_color_hex(0x3A3A3C), 0);
-    lv_obj_set_style_pad_all(s_ac_fan_btn, 0, 0);
-    lv_obj_add_event_cb(s_ac_fan_btn, ac_fan_cb, LV_EVENT_CLICKED, NULL);
-    s_ac_fan_label = lv_label_create(s_ac_fan_btn);
-    lv_label_set_text(s_ac_fan_label, "风速 --");
-    lv_obj_set_style_text_font(s_ac_fan_label, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_ac_fan_label, COLOR_TEXT, 0);
-    lv_obj_center(s_ac_fan_label);
+    /* 胶囊行：风速 100 + 8 + 摆风 88 + 10 + 电源 44 = 250 → x 55..305 */
+    {
+        const int row_w = AC_FAN_W + AC_CHIP_GAP + AC_SWING_W + AC_POWER_GAP + AC_POWER;
+        const int x0 = DETAIL_CX - row_w / 2;                 /* 55 */
 
-    /* 5 个模式按钮：固定顺序 auto/cool/heat/dry/fan_only，只显示实体支持的 */
+        s_ac_fan_btn = lv_obj_create(s_detail);
+        if (s_ac_fan_btn != NULL) {
+            lv_obj_remove_style_all(s_ac_fan_btn);
+            lv_obj_set_size(s_ac_fan_btn, AC_FAN_W, AC_CHIP_H);
+            lv_obj_set_pos(s_ac_fan_btn, x0, AC_CHIP_Y);
+            lv_obj_set_style_radius(s_ac_fan_btn, AC_CHIP_H / 2, 0);
+            lv_obj_set_style_bg_color(s_ac_fan_btn, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_ac_fan_btn, 12, 0);              /* 4.5% */
+            lv_obj_set_style_border_width(s_ac_fan_btn, 1, 0);
+            lv_obj_set_style_border_color(s_ac_fan_btn, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_ac_fan_btn, 18, 0);          /* 7% */
+            lv_obj_remove_flag(s_ac_fan_btn, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(s_ac_fan_btn, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(s_ac_fan_btn, ac_fan_cb, LV_EVENT_CLICKED, NULL);
+            s_ac_fan_label = lv_label_create(s_ac_fan_btn);
+            lv_label_set_text(s_ac_fan_label, "风速 --");
+            lv_obj_set_style_text_font(s_ac_fan_label, &lv_font_cjk16, 0);
+            lv_obj_set_style_text_color(s_ac_fan_label, lv_color_hex(0xC2CBDB), 0);
+            lv_obj_center(s_ac_fan_label);
+        }
+
+        s_ac_swing_btn = lv_obj_create(s_detail);
+        if (s_ac_swing_btn != NULL) {
+            lv_obj_remove_style_all(s_ac_swing_btn);
+            lv_obj_set_size(s_ac_swing_btn, AC_SWING_W, AC_CHIP_H);
+            lv_obj_set_pos(s_ac_swing_btn, x0 + AC_FAN_W + AC_CHIP_GAP, AC_CHIP_Y);
+            lv_obj_set_style_radius(s_ac_swing_btn, AC_CHIP_H / 2, 0);
+            lv_obj_set_style_bg_color(s_ac_swing_btn, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_ac_swing_btn, 12, 0);
+            lv_obj_set_style_border_width(s_ac_swing_btn, 1, 0);
+            lv_obj_set_style_border_color(s_ac_swing_btn, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_ac_swing_btn, 18, 0);
+            lv_obj_remove_flag(s_ac_swing_btn, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(s_ac_swing_btn, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(s_ac_swing_btn, ac_swing_cb, LV_EVENT_CLICKED, NULL);
+            s_ac_swing_label = lv_label_create(s_ac_swing_btn);
+            lv_label_set_text(s_ac_swing_label, "摆风");
+            lv_obj_set_style_text_font(s_ac_swing_label, &lv_font_cjk16, 0);
+            lv_obj_set_style_text_color(s_ac_swing_label, lv_color_hex(0xC2CBDB), 0);
+            lv_obj_center(s_ac_swing_label);
+        }
+    }
+
+    /* 5 个模式键：固定顺序 auto/cool/heat/dry/fan_only，只显示实体支持的；
+       键里只有图标（设计稿 .m-row 就是图标键），当前模式名在副标题里 */
     for (int i = 0; i < AC_MODE_COUNT; i++) {
         const int x = DETAIL_CX - (AC_MODE_COUNT * AC_MODE_W + (AC_MODE_COUNT - 1) * AC_MODE_GAP) / 2
                       + i * (AC_MODE_W + AC_MODE_GAP);
-        lv_obj_t *btn = lv_button_create(s_detail);
+        lv_obj_t *btn = lv_obj_create(s_detail);
         s_ac_mode_btn[i] = btn;
+        lv_obj_remove_style_all(btn);
         lv_obj_set_size(btn, AC_MODE_W, AC_MODE_H);
         lv_obj_set_pos(btn, x, AC_MODE_Y);
-        lv_obj_set_style_radius(btn, AC_MODE_H / 2, 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x24262B), 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_80, 0);
-        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_set_style_radius(btn, 13, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(btn, 10, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_border_color(btn, lv_color_white(), 0);
+        lv_obj_set_style_border_opa(btn, 14, 0);
+        lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(btn, ac_mode_cb, LV_EVENT_CLICKED, (void *)&k_ac_modes[i]);
 
-        lv_obj_t *lbl = lv_label_create(btn);
-        s_ac_mode_lbl[i] = lbl;
-        lv_label_set_text(lbl, k_ac_modes[i].label);
-        lv_obj_set_style_text_font(lbl, &lv_font_cjk16, 0);
-        lv_obj_set_style_text_color(lbl, COLOR_TEXT, 0);
-        lv_obj_center(lbl);
+        s_ac_key_col[i] = lv_color_hex(0x6F798C);
+        lv_obj_t *ic = lv_obj_create(btn);
+        s_ac_mode_icon[i] = ic;
+        lv_obj_remove_style_all(ic);
+        lv_obj_set_size(ic, 20, 20);
+        lv_obj_center(ic);
+        lv_obj_remove_flag(ic, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(ic, ac_key_icon_draw_cb, LV_EVENT_DRAW_MAIN, (void *)(intptr_t)i);
     }
 
     /* ---------------- 风扇那一组（同一个容器，默认全藏） ----------------
-       几何见文件头的 FAN_* 宏：环 118/22 + 光晕；中间（实体名 / 风扇图标 /
-       大号百分比 / 当前预设）都在内孔里；底部是 4 个预设键 + 摇头 + 电源开关。 */
+       布局照设计稿 .scr[data-scr="fan"]，和灯光页同一个骨架：
+       环 r=156/10（外径 161，环心 180,180）+ 光晕；名字行（风图标 + 实体名）
+       y=66；大号百分比 + "%" y=136；「风速」y=196；
+       胶囊行 y=226：预设（点一下换下一个）+ 摇头（置灰：不支持）+ 40x40 电源键。
+       电源键是灯光页建的那颗（两页不会同时出现），x 位置由 detail_place_power 摆。 */
     s_fan_glow = detail_make_arc(s_detail, FAN_GLOW_R, FAN_GLOW_W, true);
     lv_arc_set_range(s_fan_glow, 1, 100);
     lv_arc_set_value(s_fan_glow, 60);
@@ -4898,67 +7057,89 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_add_event_cb(s_fan_arc, detail_dial_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_fan_arc, detail_dial_changed_cb, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(s_fan_arc, detail_dial_changed_cb, LV_EVENT_PRESS_LOST, NULL);
+    light_recenter(s_fan_glow, FAN_GLOW_R);
+    light_recenter(s_fan_arc, FAN_R);
 
-    /* 中间：风扇图标（自绘，颜色跟预设走；形状固定，不跑定时器）*/
-    s_fan_icon = lv_obj_create(s_detail);
-    lv_obj_remove_style_all(s_fan_icon);
-    lv_obj_set_size(s_fan_icon, FAN_ICON_SIZE, FAN_ICON_SIZE);
-    lv_obj_set_pos(s_fan_icon, DETAIL_CX - FAN_ICON_SIZE / 2, FAN_ICON_Y);
-    lv_obj_remove_flag(s_fan_icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(s_fan_icon, fan_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    /* 名字行左侧的风图标（设计稿 #i-wind）：位置由名字行整体居中算出来，
+       这里先给个占位，进页面后 fan 那一路会把它和名字一起摆好。 */
+    s_fan_name_icon = lv_obj_create(s_detail_name_row);
+    lv_obj_remove_style_all(s_fan_name_icon);
+    lv_obj_set_size(s_fan_name_icon, LIGHT_ICON, LIGHT_ICON);
+    lv_obj_remove_flag(s_fan_name_icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_fan_name_icon, fan_wind_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    lv_obj_add_flag(s_fan_name_icon, LV_OBJ_FLAG_HIDDEN);          /* 灯 / 空调页不显示风图标 */
 
-    /* 中间：大号百分比 */
+    /* 大号百分比 + "%"（单位比数字小一号、低 8px，位置由 fan_place_value 算）*/
     s_fan_pct = lv_label_create(s_detail);
     lv_label_set_text(s_fan_pct, "--");
-    lv_obj_set_style_text_font(s_fan_pct, DETAIL_PCT_FONT, 0);
+    lv_obj_set_style_text_font(s_fan_pct, BIG_NUM_FONT, 0);
     lv_obj_set_style_text_color(s_fan_pct, COLOR_TEXT, 0);
-    lv_obj_align(s_fan_pct, LV_ALIGN_TOP_MID, 0, FAN_PCT_Y);
+    lv_obj_set_pos(s_fan_pct, 150, LIGHT_VALUE_Y);
 
-    /* 中间：当前预设（次要文字，弱化色）*/
-    s_fan_preset = lv_label_create(s_detail);
-    lv_label_set_text(s_fan_preset, "--");
-    lv_obj_set_style_text_font(s_fan_preset, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_fan_preset, COLOR_MUTED, 0);
-    lv_obj_align(s_fan_preset, LV_ALIGN_TOP_MID, 0, FAN_PRESET_Y);
+    s_fan_unit = lv_label_create(s_detail);
+    lv_label_set_text(s_fan_unit, "%");
+    lv_obj_set_style_text_font(s_fan_unit, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_fan_unit, lv_color_white(), 0);
+    lv_obj_set_style_text_opa(s_fan_unit, 184, 0);
+    lv_obj_set_pos(s_fan_unit, 200, LIGHT_VALUE_Y + LIGHT_UNIT_DY);
 
-    /* 4 个预设键：固定顺序 直吹 / 自然 / 循环 / 睡眠，命令发原样中文 */
-    for (int i = 0; i < FAN_MODE_COUNT; i++) {
-        const int fx = DETAIL_CX - (FAN_MODE_COUNT * FAN_MODE_W + (FAN_MODE_COUNT - 1) * FAN_MODE_GAP) / 2
-                       + i * (FAN_MODE_W + FAN_MODE_GAP);
-        lv_obj_t *btn = lv_button_create(s_detail);
-        s_fan_mode_btn[i] = btn;
-        lv_obj_set_size(btn, FAN_MODE_W, FAN_MODE_H);
-        lv_obj_set_pos(btn, fx, FAN_MODE_Y);
-        lv_obj_set_style_radius(btn, FAN_MODE_H / 2, 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x24262B), 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_80, 0);
-        lv_obj_set_style_pad_all(btn, 0, 0);
-        lv_obj_add_event_cb(btn, fan_preset_cb, LV_EVENT_CLICKED, (void *)&k_fan_presets[i]);
+    /* 「风速」（设计稿 .l-label：16px + 字距 .24em）*/
+    s_fan_label = lv_label_create(s_detail);
+    lv_label_set_text(s_fan_label, "风速");
+    lv_obj_set_style_text_font(s_fan_label, &lv_font_cjk16, 0);
+    lv_obj_set_style_text_color(s_fan_label, LIGHT_INK_MUTED, 0);
+    lv_obj_set_style_text_letter_space(s_fan_label, 4, 0);
+    lv_obj_align(s_fan_label, LV_ALIGN_TOP_MID, 0, LIGHT_LABEL_Y);
 
-        lv_obj_t *lbl = lv_label_create(btn);
-        s_fan_mode_lbl[i] = lbl;
-        lv_label_set_text(lbl, k_fan_presets[i].label);
-        lv_obj_set_style_text_font(lbl, &lv_font_cjk16, 0);
-        lv_obj_set_style_text_color(lbl, COLOR_TEXT, 0);
-        lv_obj_center(lbl);
+    /* 胶囊行：预设 94 + 间距 6 + 摇头 78 + 间距 6 + 电源键 40 = 224，x 68..292 */
+    {
+        const int row_w = FAN_CHIP_PRESET_W + FAN_CHIP_GAP + FAN_CHIP_OSC_W
+                          + FAN_CHIP_GAP + LIGHT_POWER;
+        const int x0 = DETAIL_CX - row_w / 2;              /* 68 */
+
+        s_fan_chip_preset = lv_obj_create(s_detail);
+        if (s_fan_chip_preset != NULL) {
+            lv_obj_remove_style_all(s_fan_chip_preset);
+            lv_obj_set_size(s_fan_chip_preset, FAN_CHIP_PRESET_W, FAN_CHIP_H);
+            lv_obj_set_pos(s_fan_chip_preset, x0, FAN_CHIP_ROW_Y);
+            lv_obj_set_style_radius(s_fan_chip_preset, FAN_CHIP_H / 2, 0);
+            lv_obj_set_style_bg_color(s_fan_chip_preset, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_fan_chip_preset, 12, 0);          /* 4.5% */
+            lv_obj_set_style_border_width(s_fan_chip_preset, 1, 0);
+            lv_obj_set_style_border_color(s_fan_chip_preset, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_fan_chip_preset, 18, 0);      /* 7% */
+            lv_obj_remove_flag(s_fan_chip_preset, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(s_fan_chip_preset, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(s_fan_chip_preset, fan_preset_cycle_cb, LV_EVENT_CLICKED, NULL);
+            s_fan_chip_preset_lbl = lv_label_create(s_fan_chip_preset);
+            lv_label_set_text(s_fan_chip_preset_lbl, "自然风");
+            lv_obj_set_style_text_font(s_fan_chip_preset_lbl, &lv_font_cjk16, 0);
+            lv_obj_set_style_text_color(s_fan_chip_preset_lbl, lv_color_hex(0xC2CBDB), 0);
+            lv_obj_center(s_fan_chip_preset_lbl);
+        }
+
+        /* 摇头：这台风扇没有 OSCILLATE 能力 → 保留位置、整颗置灰、不可点 */
+        s_fan_chip_osc = lv_obj_create(s_detail);
+        if (s_fan_chip_osc != NULL) {
+            lv_obj_remove_style_all(s_fan_chip_osc);
+            lv_obj_set_size(s_fan_chip_osc, FAN_CHIP_OSC_W, FAN_CHIP_H);
+            lv_obj_set_pos(s_fan_chip_osc, x0 + FAN_CHIP_PRESET_W + FAN_CHIP_GAP, FAN_CHIP_ROW_Y);
+            lv_obj_set_style_radius(s_fan_chip_osc, FAN_CHIP_H / 2, 0);
+            lv_obj_set_style_bg_color(s_fan_chip_osc, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_fan_chip_osc, 12, 0);
+            lv_obj_set_style_border_width(s_fan_chip_osc, 1, 0);
+            lv_obj_set_style_border_color(s_fan_chip_osc, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_fan_chip_osc, 18, 0);
+            lv_obj_set_style_opa(s_fan_chip_osc, FAN_CHIP_DISABLED_OPA, 0);   /* 40% */
+            lv_obj_remove_flag(s_fan_chip_osc, LV_OBJ_FLAG_SCROLLABLE);       /* 不可点 */
+            s_fan_chip_osc_lbl = lv_label_create(s_fan_chip_osc);
+            lv_label_set_text(s_fan_chip_osc_lbl, "摇头");
+            lv_obj_set_style_text_font(s_fan_chip_osc_lbl, &lv_font_cjk16, 0);
+            lv_obj_set_style_text_color(s_fan_chip_osc_lbl, lv_color_hex(0xC2CBDB), 0);
+            lv_obj_center(s_fan_chip_osc_lbl);
+        }
+        ESP_LOGI(TAG, "风扇页：摇头控件置灰（supported_features=57 无 OSCILLATE）");
     }
-
-    /* 摇头：小圆角键，开 = 预设色填充（和预设键同一套"亮起来"的语言）*/
-    s_fan_osc_btn = lv_button_create(s_detail);
-    lv_obj_set_size(s_fan_osc_btn, FAN_OSC_W, FAN_OSC_H);
-    lv_obj_align(s_fan_osc_btn, LV_ALIGN_TOP_MID, FAN_OSC_DX, FAN_OSC_Y);
-    lv_obj_set_style_radius(s_fan_osc_btn, FAN_OSC_H / 2, 0);
-    lv_obj_set_style_bg_color(s_fan_osc_btn, lv_color_hex(0x24262B), 0);
-    lv_obj_set_style_bg_opa(s_fan_osc_btn, LV_OPA_80, 0);
-    lv_obj_set_style_border_width(s_fan_osc_btn, 1, 0);
-    lv_obj_set_style_border_color(s_fan_osc_btn, lv_color_hex(0x3A3A3C), 0);
-    lv_obj_set_style_pad_all(s_fan_osc_btn, 0, 0);
-    lv_obj_add_event_cb(s_fan_osc_btn, fan_osc_cb, LV_EVENT_CLICKED, NULL);
-    s_fan_osc_lbl = lv_label_create(s_fan_osc_btn);
-    lv_label_set_text(s_fan_osc_lbl, "摇头");
-    lv_obj_set_style_text_font(s_fan_osc_lbl, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_fan_osc_lbl, COLOR_TEXT, 0);
-    lv_obj_center(s_fan_osc_lbl);
 
     /* 焦点提示两件套：环上"当前值"小圆点 + 环心下面一行小字。
        建在所有环之后 → 小圆点压在环的描边上（不然会被环自己盖住）。
@@ -4978,7 +7159,8 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_set_style_text_font(s_detail_hint, &lv_font_cjk16, 0);
     lv_obj_set_style_text_color(s_detail_hint, COLOR_MUTED, 0);
     lv_obj_set_style_text_align(s_detail_hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(s_detail_hint, 100);
+    lv_obj_set_style_text_letter_space(s_detail_hint, 2, 0);
+    lv_obj_set_width(s_detail_hint, 240);
     lv_obj_align(s_detail_hint, LV_ALIGN_TOP_MID, 0, DETAIL_HINT_Y);
     lv_obj_add_flag(s_detail_hint, LV_OBJ_FLAG_HIDDEN);
 
@@ -5011,6 +7193,67 @@ static void build_detail_view(lv_obj_t *scr)
     lv_obj_set_style_shadow_width(s_detail_power_sw, 0, LV_PART_KNOB);
     lv_obj_add_event_cb(s_detail_power_sw, detail_power_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+    /* ---- 灯光页控件行（设计稿 .l-ctl，top 230、居中、gap 10）----
+       分段控件「亮度 | 色温」134x36（白 4.5% 底 + 白 7% 边、圆角 18、
+       选中项白 13% 底 + 近白字）+ 40x40 圆形电源键。
+       电源键和风扇页共用（两页不会同时出现），横向位置由 detail_place_power 摆。 */
+    {
+        const int row_w = LIGHT_SEG_W + LIGHT_CTL_GAP + LIGHT_POWER;
+        const int x0 = DETAIL_CX - row_w / 2;              /* 88 */
+        s_light_seg = lv_obj_create(s_detail);
+        if (s_light_seg != NULL) {
+            lv_obj_remove_style_all(s_light_seg);
+            lv_obj_set_size(s_light_seg, LIGHT_SEG_W, LIGHT_SEG_H);
+            lv_obj_set_pos(s_light_seg, x0, LIGHT_SEG_Y);
+            lv_obj_set_style_radius(s_light_seg, LIGHT_SEG_H / 2, 0);
+            lv_obj_set_style_bg_color(s_light_seg, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_light_seg, 12, 0);              /* 4.5% */
+            lv_obj_set_style_border_width(s_light_seg, 1, 0);
+            lv_obj_set_style_border_color(s_light_seg, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_light_seg, 18, 0);           /* 7% */
+            lv_obj_remove_flag(s_light_seg, LV_OBJ_FLAG_SCROLLABLE);
+            for (int i = 0; i < 2; i++) {
+                lv_obj_t *btn = lv_obj_create(s_light_seg);
+                s_light_seg_btn[i] = btn;
+                lv_obj_remove_style_all(btn);
+                lv_obj_set_size(btn, LIGHT_BTN_W, LIGHT_BTN_H);
+                lv_obj_set_pos(btn, LIGHT_SEG_PAD + i * (LIGHT_BTN_W + LIGHT_SEG_GAP),
+                               LIGHT_SEG_PAD);
+                lv_obj_set_style_radius(btn, LIGHT_BTN_H / 2, 0);
+                lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+                lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_add_event_cb(btn, light_tab_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+                if (btn == NULL) {
+                    continue;
+                }
+                lv_obj_t *lbl = lv_label_create(btn);
+                s_light_seg_lbl[i] = lbl;
+                lv_label_set_text(lbl, i == 0 ? "亮度" : "色温");
+                lv_obj_set_style_text_font(lbl, &lv_font_cjk16, 0);
+                lv_obj_set_style_text_color(lbl, LIGHT_SEG_TXT, 0);
+                lv_obj_center(lbl);
+            }
+        }
+        s_dial_power = lv_obj_create(s_detail);
+        if (s_dial_power != NULL) {
+            lv_obj_remove_style_all(s_dial_power);
+            lv_obj_set_size(s_dial_power, LIGHT_POWER, LIGHT_POWER);
+            lv_obj_set_pos(s_dial_power, x0 + LIGHT_SEG_W + LIGHT_CTL_GAP,
+                           LIGHT_SEG_Y + (LIGHT_SEG_H - LIGHT_POWER) / 2);
+            lv_obj_set_style_radius(s_dial_power, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_color(s_dial_power, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(s_dial_power, 15, 0);              /* 6% */
+            lv_obj_set_style_border_width(s_dial_power, 1, 0);
+            lv_obj_set_style_border_color(s_dial_power, lv_color_white(), 0);
+            lv_obj_set_style_border_opa(s_dial_power, 23, 0);          /* 9% */
+            lv_obj_remove_flag(s_dial_power, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(s_dial_power, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(s_dial_power, light_power_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_event_cb(s_dial_power, light_power_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+        }
+    }
+
     /* 新容器：默认按"灯页"显示，空调那组先整组藏起来（要先置脏，
        否则 detail_update_ambience 会以为底色没变，新容器上还是空样式）*/
     s_detail_ac = false;
@@ -5027,18 +7270,35 @@ static void build_detail_view(lv_obj_t *scr)
     s_detail_name_shown[0] = '\0';   /* 新容器上的名字行还是空的：清掉缓存才会真的写进去 */
     s_detail_hint_shown[0] = '\0';   /* 提示行的文字缓存同理 */
     s_fan_preset_shown[0] = '\x01';  /* 不可能是任何预设：进页面后强制刷一遍颜色 */
-    s_fan_preset_txt[0] = '\0';
+    s_fan_chip_txt[0] = '\0';
+    s_fan_chip_shown = -1;
+    s_fan_num_x = -1;
+    s_fan_unit_x = -1;
     s_fan_pct_txt[0] = '\0';
     s_fan_accent = lv_color_hex(0x2DD4BF);
+    /* 灯光页的缓存 / 电源键位置：新容器上全部作废，第一帧才会真的写进去 */
+    s_light_num_x = -1;
+    s_light_unit_x = -1;
+    s_light_chip_shown = -1;
+    s_pwr_x_shown = -1;
+    s_hint_y_shown = -1;
+    s_light_num_shown[0] = '\x01';
+    s_light_unit_shown[0] = '\x01';
+    s_light_label_shown[0] = '\x01';
+    s_ac_num_x = -1;
+    s_ac_unit_x = -1;
+    s_pwr_size_shown = -1;
+    s_pwr_y_shown = -1;
+    detail_place_power(LIGHT_POWER, 232, LIGHT_SEG_Y + (LIGHT_SEG_H - LIGHT_POWER) / 2);
     ac_hide_all(true);
     fan_hide_all(true);
     detail_apply_focus();
     detail_update_ambience();       /* 底色 / 环色 / 自绘图标都先落到一个确定状态 */
 
-    ESP_LOGI(TAG, "详情页建好：%d 个对象（灯：2 环 + 2 光晕 + 灯泡 + 百分比 + 色温 + 已关闭；"
-                  "空调：温度环 + 光晕 + 模式图标 + 大号温度 + 室内 + 风速 + 5 模式键；"
-                  "风扇：风速环 + 光晕 + 风扇图标 + 大号百分比 + 预设 + 4 预设键 + 摇头；"
-                  "共用：开关 + 环心实体名 + 焦点值点/提示；无返回键，退出靠左边缘右滑）",
+    ESP_LOGI(TAG, "详情页建好：%d 个对象（灯：单环 + 光晕 + 灯泡 + 大号数值/单位 + 档位文字 + "
+                  "分段控件 + 圆形电源键；空调：温度环 + 光晕 + 模式图标 + 大号温度 + 室内 + 风速 + "
+                  "5 模式键；风扇：风速环 + 光晕 + 大号百分比 + 预设胶囊 + 摇头胶囊（置灰）；"
+                  "共用：环心实体名 + 值点/提示；无返回键，退出靠左边缘右滑）",
              detail_count_objs(s_detail));
 }
 
@@ -5071,12 +7331,27 @@ void ui_home_open_detail(const char *entity_id)
     s_ac_room_txt[0] = '\0';
     s_ac_fan_txt[0] = '\0';
     s_fan_preset_local_until = 0;
-    s_fan_osc_local_until = 0;
+    s_fan_chip_shown = -1;
     s_fan_pct_override_until = 0;
     s_fan_preset_shown[0] = '\x01';     /* 换实体：颜色/预设键必须重刷一遍 */
-    s_fan_preset_txt[0] = '\0';
+    s_fan_chip_txt[0] = '\0';
+    s_fan_chip_shown = -1;
+    s_fan_num_x = -1;
+    s_fan_unit_x = -1;
     s_fan_pct_txt[0] = '\0';
     s_detail_fg_dirty = true;
+    /* 灯光页的文字 / 外观缓存：换实体后必须重写一遍标签 */
+    s_light_num_x = -1;
+    s_light_unit_x = -1;
+    s_light_chip_shown = -1;
+    s_pwr_x_shown = -1;
+    s_hint_y_shown = -1;
+    s_light_num_shown[0] = '\x01';
+    s_light_unit_shown[0] = '\x01';
+    s_light_label_shown[0] = '\x01';
+    s_ac_num_x = -1;
+    s_ac_unit_x = -1;
+    s_ac_room_txt[0] = '\0';
     detail_apply_entity();
     s_detail_visible = true;
 
@@ -5144,7 +7419,7 @@ static void detail_close_done_cb(lv_anim_t *a)
     for (int i = 0; i < s_page_count; i++) {
         if (s_dots[i]) {
             lv_obj_remove_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_bg_color(s_dots[i], dot_color(s_page, i), 0);
+            dot_style(s_page, i);
         }
     }
     s_animating = false;
@@ -5198,210 +7473,32 @@ bool ui_home_detail_open(void)
     return s_detail_visible;
 }
 
-/* ---------------- 传感器折线图 ---------------- */
-
-static void chart_back_cb(lv_event_t *e)
-{
-    (void)e;
-    ui_home_close_chart();
-}
-
-/** 自己画折线：没有内部状态、不分配内存，内存紧张时也稳。 */
-static void chart_draw_cb(lv_event_t *e)
-{
-    lv_obj_t *obj = lv_event_get_target(e);
-    lv_layer_t *layer = lv_event_get_layer(e);
-    if (s_chart_pts_n < 2 || layer == NULL) {
-        return;
-    }
-    lv_area_t a;
-    lv_obj_get_coords(obj, &a);
-    const int32_t w = lv_area_get_width(&a);
-    const int32_t h = lv_area_get_height(&a);
-    if (w < 2 || h < 2) {
-        return;
-    }
-
-    lv_draw_line_dsc_t d;
-    lv_draw_line_dsc_init(&d);
-    d.color = lv_color_hex(0x5AC8FA);
-    d.width = 3;
-    d.round_start = true;
-    d.round_end = true;
-
-    const float span = (s_chart_hi - s_chart_lo) > 0.0001f ? (s_chart_hi - s_chart_lo) : 1.0f;
-    int32_t prev_x = 0, prev_y = 0;
-    for (int i = 0; i < s_chart_pts_n; i++) {
-        float t = (s_chart_pts[i] - s_chart_lo) / span;
-        if (t < 0.0f) t = 0.0f;
-        if (t > 1.0f) t = 1.0f;
-        const int32_t x = a.x1 + (int32_t)((int64_t)(w - 1) * i / (s_chart_pts_n - 1));
-        const int32_t y = a.y2 - (int32_t)(t * (h - 1));
-        if (i > 0) {
-            d.p1.x = prev_x;
-            d.p1.y = prev_y;
-            d.p2.x = x;
-            d.p2.y = y;
-            lv_draw_line(layer, &d);
-        }
-        prev_x = x;
-        prev_y = y;
-    }
-}
-
-static void build_chart_view(lv_obj_t *scr)
-{
-    s_chart_page = lv_obj_create(scr);
-    lv_obj_remove_style_all(s_chart_page);
-    lv_obj_set_size(s_chart_page, 360, 360);
-    lv_obj_set_pos(s_chart_page, 0, 0);
-    lv_obj_set_style_bg_color(s_chart_page, lv_color_hex(0x0B0B0D), 0);
-    lv_obj_set_style_bg_opa(s_chart_page, LV_OPA_COVER, 0);
-    lv_obj_remove_flag(s_chart_page, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_chart_page, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t *back = lv_button_create(s_chart_page);
-    lv_obj_set_size(back, 36, 36);
-    lv_obj_align(back, LV_ALIGN_TOP_MID, 0, 10);
-    lv_obj_set_style_bg_opa(back, LV_OPA_20, 0);
-    lv_obj_set_style_radius(back, LV_RADIUS_CIRCLE, 0);
-    lv_obj_add_event_cb(back, chart_back_cb, LV_EVENT_CLICKED, NULL);
-    s_chart_back_label = lv_label_create(back);
-    lv_label_set_text(s_chart_back_label, LV_SYMBOL_LEFT);
-    lv_obj_center(s_chart_back_label);
-
-    s_chart_title = lv_label_create(s_chart_page);
-    lv_label_set_text(s_chart_title, "--");
-    lv_obj_set_style_text_font(s_chart_title, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_chart_title, COLOR_TEXT, 0);
-    lv_obj_align(s_chart_title, LV_ALIGN_TOP_MID, 0, 58);
-
-    s_chart_span = lv_label_create(s_chart_page);
-    lv_label_set_text(s_chart_span, "近 3 小时");
-    lv_obj_set_style_text_font(s_chart_span, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_chart_span, COLOR_MUTED, 0);
-    lv_obj_align(s_chart_span, LV_ALIGN_TOP_MID, 0, 76);
-
-    s_chart = lv_obj_create(s_chart_page);
-    lv_obj_remove_style_all(s_chart);
-    lv_obj_set_size(s_chart, 288, 150);
-    lv_obj_align(s_chart, LV_ALIGN_TOP_MID, 0, 100);
-    lv_obj_remove_flag(s_chart, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_chart, chart_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
-
-    s_chart_min = lv_label_create(s_chart_page);
-    lv_label_set_text(s_chart_min, "");
-    lv_obj_set_style_text_font(s_chart_min, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_chart_min, COLOR_MUTED, 0);
-    lv_obj_align(s_chart_min, LV_ALIGN_TOP_MID, -100, 268);
-
-    s_chart_avg = lv_label_create(s_chart_page);
-    lv_label_set_text(s_chart_avg, "");
-    lv_obj_set_style_text_font(s_chart_avg, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_chart_avg, COLOR_TEXT, 0);
-    lv_obj_align(s_chart_avg, LV_ALIGN_TOP_MID, 0, 268);
-
-    s_chart_max = lv_label_create(s_chart_page);
-    lv_label_set_text(s_chart_max, "");
-    lv_obj_set_style_text_font(s_chart_max, &lv_font_cjk16, 0);
-    lv_obj_set_style_text_color(s_chart_max, COLOR_MUTED, 0);
-    lv_obj_align(s_chart_max, LV_ALIGN_TOP_MID, 100, 268);
-}
-
+/* ---------------- 历史折线图：设计稿已移除，只留 ABI 桩 ---------------- */
+/* 设计稿把"历史曲线"整套取消了：这里不再建页、不再取历史。
+   main.c 的 MQTT 调试命令 ui_home_show_chart(...) 和 screenshot.c 还引用这三个符号，
+   所以保留同名空实现（否则 main.c 链接不过，而 main.c 不归本任务改）。
+   现在没有任何页面、卡片或手势能打开历史视图，也没有任何代码路径会拉历史数据。 */
 void ui_home_show_chart(const char *entity_id, const float *vals, int n,
                         float vmin, float vmax, float vavg)
 {
-    if (s_chart_page == NULL || vals == NULL || n <= 0) {
-        return;
-    }
-    if (!isfinite(vmin) || !isfinite(vmax) || !isfinite(vavg) ||
-        fabsf(vmin) > 1.0e5f || fabsf(vmax) > 1.0e5f) {
-        ESP_LOGW(TAG, "图表数值异常，忽略 (%f %f %f)", vmin, vmax, vavg);
-        return;
-    }
-    snprintf(s_chart_entity, sizeof(s_chart_entity), "%s", entity_id ? entity_id : "");
-    const ha_entity_t *e = ha_client_find(s_chart_entity);
-    lv_label_set_text(s_chart_title, e ? e->name : s_chart_entity);
-
-    /* 数值按 10 倍整数化（lv_chart 只收整数），纵向留 10% 余量避免贴边 */
-    float lo = vmin, hi = vmax;
-    if (hi - lo < 0.01f) {
-        lo -= 1.0f;
-        hi += 1.0f;
-    }
-    const float pad = (hi - lo) * 0.1f;
-    s_chart_lo = lo - pad;
-    s_chart_hi = hi + pad;
-
-    const int keep = (n > 32) ? 32 : n;
-    memcpy(s_chart_pts, vals, sizeof(float) * (size_t)keep);
-    s_chart_pts_n = keep;
-    lv_obj_invalidate(s_chart);
-
-    /* 记下这次结果，60 秒内复用 */
-    snprintf(s_chart_cache_entity, sizeof(s_chart_cache_entity), "%s", s_chart_entity);
-    memcpy(s_chart_cache_vals, vals, sizeof(float) * (size_t)keep);
-    s_chart_cache_n = keep;
-    s_chart_cache_min = vmin;
-    s_chart_cache_max = vmax;
-    s_chart_cache_avg = vavg;
-    s_chart_cache_at = lv_tick_get();
-
-    lv_label_set_text(s_chart_span, "近 3 小时");
-    const char *unit = (e != NULL) ? e->unit : "";
-    char buf[40];
-    snprintf(buf, sizeof(buf), "最低 %.1f%s", vmin, unit);
-    lv_label_set_text(s_chart_min, buf);
-    snprintf(buf, sizeof(buf), "平均 %.1f%s", vavg, unit);
-    lv_label_set_text(s_chart_avg, buf);
-    snprintf(buf, sizeof(buf), "最高 %.1f%s", vmax, unit);
-    lv_label_set_text(s_chart_max, buf);
-
-    const bool already_open = s_chart_visible;
-    s_chart_visible = true;
-    lv_obj_remove_flag(s_chart_page, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(s_chart_page, 0, 0);
-    if (!already_open) {
-        /* 只有第一次出现才滑入；数据晚到时不要再演一遍动画 */
-        lv_obj_set_style_translate_x(s_chart_page, 360, 0);
-        lv_anim_t a;
-        lv_anim_init(&a);
-        lv_anim_set_var(&a, s_chart_page);
-        lv_anim_set_values(&a, 360, 0);
-        lv_anim_set_time(&a, 220);
-        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-        lv_anim_set_exec_cb(&a, anim_translate_cb);
-        lv_anim_start(&a);
-    } else {
-        lv_obj_set_style_translate_x(s_chart_page, 0, 0);
-    }
-    ESP_LOGI(TAG, "显示折线图: %s (%d 点)%s", s_chart_entity, n, already_open ? " (更新)" : "");
+    (void)vals;
+    (void)n;
+    (void)vmin;
+    (void)vmax;
+    (void)vavg;
+    ESP_LOGW(TAG, "历史曲线已取消（设计稿移除），忽略 ui_home_show_chart(%s)",
+             entity_id ? entity_id : "(null)");
 }
 
 void ui_home_close_chart(void)
 {
-    if (s_chart_page == NULL || !s_chart_visible) {
-        return;
-    }
-    s_chart_visible = false;
-    s_chart_wanted = false;
-    s_chart_gen++;          /* 在途的请求全部作废，返回后不会再自己弹出来 */
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_chart_page);
-    lv_anim_set_values(&a, 0, 360);
-    lv_anim_set_time(&a, 200);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
-    lv_anim_set_exec_cb(&a, anim_translate_cb);
-    lv_anim_start(&a);
-    lv_obj_add_flag(s_chart_page, LV_OBJ_FLAG_HIDDEN);
+    /* 没有历史页可关：保留空实现给 screenshot.c / assistant_ui.c 调用 */
 }
 
 bool ui_home_chart_open(void)
 {
-    return s_chart_visible;
+    return false;      /* 永远没有历史页 */
 }
-
 /* ---------------- 空调：走和灯同一个详情页 ---------------- */
 
 /* 空调不再单独一页：它就是 s_detail 的另一种形态（几何见文件头的 AC_* 宏）。
@@ -5484,24 +7581,31 @@ static void build_ui(void)
     s_ota_bar = NULL;
     s_ota_status = NULL;
 
-    /* 标题：状态栏下面一行，y=30（状态栏图标在 y=8..28） */
+    /* 标题：设计稿 .h-title —— top 56、16px/600、字距 .1em、#F4F7FC。
+       cjk16 行高 20，所以盒子放 y=48（字墨约 50..70）。设置页自己的内容从 y=64 起，
+       那边仍用 y=30（title_place() 按页选）。 */
     s_title = lv_label_create(scr);
     const char *first_title = page_title(0);
     lv_label_set_text(s_title, first_title);
-    lv_obj_set_style_text_color(s_title, COLOR_TEXT, 0);
+    lv_obj_set_style_text_color(s_title, lv_color_hex(0xF4F7FC), 0);
     lv_obj_set_style_text_font(s_title, title_font_for(first_title), 0);
-    lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_text_letter_space(s_title, 2, 0);
+    lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 48);
 
-    /* ---- 手机式状态栏：蓝牙 / WiFi / HA 三个图标一行，整组居中（y=8..28） ---- */
+    /* ---- 状态栏：图标贴在 r=152 的圆上（设计稿 .h-status，角度 -120/-90/-60）----
+       设计稿是"四个独立图标按极坐标摆"，不是一条弧形色带，所以 LVGL 里不需要裁剪 /
+       遮罩：算出圆心坐标再按图标自身尺寸居中即可。三个图标（蓝牙 / HA / WiFi）
+       在弧上等距；设计稿第 4 个是电量，固件没有标定过的电量百分比（只有 ADC 原值），
+       所以这里不放电量图标，避免画一个永远"未知"的电量。 */
+
     s_wifi_color = COLOR_MUTED;
     s_wifi_icon = lv_obj_create(scr);
     if (s_wifi_icon != NULL) {
         lv_obj_remove_style_all(s_wifi_icon);
         lv_obj_set_size(s_wifi_icon, 22, 18);
-        /* 居中的那个：x = 180 - 11；两侧图标用 TOP_MID 偏移夹住它 */
-        lv_obj_set_pos(s_wifi_icon, 169, 8);
         lv_obj_remove_flag(s_wifi_icon, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(s_wifi_icon, wifi_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+        place_on_arc(s_wifi_icon, 300);          /* 右上（-60°）*/
     }
 
     /* 蓝牙：灰 = 未启用/关闭，蓝 = 扫描中/已连接（颜色由 refresh_bt_icon 刷） */
@@ -5510,16 +7614,26 @@ static void build_ui(void)
         lv_label_set_text(s_bt_icon, LV_SYMBOL_BLUETOOTH);
         lv_obj_set_style_text_font(s_bt_icon, &lv_font_montserrat_20, 0);
         lv_obj_set_style_text_color(s_bt_icon, COLOR_MUTED, 0);
-        lv_obj_align(s_bt_icon, LV_ALIGN_TOP_MID, -34, 8);
+        place_on_arc(s_bt_icon, 240);            /* 左上（-120°）*/
     }
 
-    /* Home Assistant：房子图标（LV_SYMBOL_HOME），在线 HA 蓝、离线灰，不再用「HA」文字 */
+    /* 电量：自绘图标（设计稿 #sbBatt），这块板没有校准 → 永远画"未知"态（空壳 + 斜杠）*/
+    s_batt_icon = lv_obj_create(scr);
+    if (s_batt_icon != NULL) {
+        lv_obj_remove_style_all(s_batt_icon);
+        lv_obj_set_size(s_batt_icon, 22, 22);
+        lv_obj_remove_flag(s_batt_icon, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(s_batt_icon, battery_icon_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+        place_on_arc(s_batt_icon, 260);          /* 左上偏中（-100°）*/
+    }
+
+    /* Home Assistant：房子图标（LV_SYMBOL_HOME），在线 HA 蓝、离线灰 */
     s_ha_icon = lv_label_create(scr);
     if (s_ha_icon != NULL) {
         lv_label_set_text(s_ha_icon, LV_SYMBOL_HOME);
         lv_obj_set_style_text_font(s_ha_icon, &lv_font_montserrat_20, 0);
         lv_obj_set_style_text_color(s_ha_icon, COLOR_MUTED, 0);
-        lv_obj_align(s_ha_icon, LV_ALIGN_TOP_MID, 34, 8);
+        place_on_arc(s_ha_icon, 280);            /* 右上偏中（-80°）*/
     }
 
     /* JSON 页 */
@@ -5536,11 +7650,13 @@ static void build_ui(void)
         const int n = s_layout.pages[p].tile_count;
         s_page_tiles[p] = n;
 
-        /* 卡片放进一个可纵向滚动的容器：超过 4 个时上下滑 */
+        /* 卡片放进一个可纵向滚动的容器（设计稿 .grid2：左上 (34,88)、2 列 140、间距 12）。
+           4 张卡刚好两行；布局给 5 张以上时下面几行靠上下滑动看（滚动条隐藏，
+           和设计稿一样不露滚动条）。 */
         lv_obj_t *grid = lv_obj_create(page);
         lv_obj_remove_style_all(grid);
-        lv_obj_set_size(grid, 336, 244);            /* 84 .. 328 */
-        lv_obj_set_pos(grid, 12, GRID_TOP);
+        lv_obj_set_size(grid, CARD_W * 2 + CARD_GAP, 202);   /* 34..326 / 88..290 */
+        lv_obj_set_pos(grid, GRID_LEFT, GRID_TOP);
         lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
         lv_obj_add_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_scroll_dir(grid, LV_DIR_VER);
@@ -5561,23 +7677,23 @@ static void build_ui(void)
     }
 #endif
 
-    /* 翻页圆点 */
+    /* 翻页圆点（设计稿 .h-dots：top 294、间距 7；当前页 14x5 胶囊）*/
     if (s_page_count > 1) {
         for (int i = 0; i < s_page_count; i++) {
-            int cx = 180 + (int)((i * 2 - (s_page_count - 1)) * 11); /* 间距 22 */
+            int cx = 180 + (int)((i * 2 - (s_page_count - 1)) * 8); /* 间距 16 */
             lv_obj_t *hit = lv_obj_create(scr);
-            lv_obj_set_size(hit, 24, 24);
+            lv_obj_set_size(hit, 20, 20);
             lv_obj_set_style_bg_opa(hit, LV_OPA_TRANSP, 0);
             lv_obj_set_style_border_width(hit, 0, 0);
-            lv_obj_set_pos(hit, cx - 12, 318);
+            lv_obj_set_pos(hit, cx - 10, 284);          /* 命中框 284..304，点居中在 294 */
             lv_obj_add_flag(hit, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(hit, dot_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
             lv_obj_t *dot = lv_obj_create(hit);
-            lv_obj_set_size(dot, 8, 8);
+            lv_obj_set_size(dot, 5, 5);
             lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-            lv_obj_set_style_bg_color(dot, lv_color_hex(0x3A3A3C), 0);
-            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(dot, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(dot, 46, 0);
             lv_obj_set_style_border_width(dot, 0, 0);
             lv_obj_center(dot);
             s_dots[i] = dot;
@@ -5648,8 +7764,8 @@ static void build_ui(void)
     s_detail_ac = false;
     s_detail_fan = false;
     s_detail_entity[0] = '\0';   /* 重建后旧实体作废：不要把上一轮的旋钮目标带进来 */
-    build_chart_view(scr);
-    s_chart_visible = false;
+    build_weather_page(scr);     /* 天气页（覆盖层，旋钮用它自己滚列表）*/
+    build_sensor_page(scr);      /* 传感器详情页（覆盖层，旋钮不接管）*/
 
     ui_enable_gesture_bubble(scr);   /* 左右滑动翻页 */
 }

@@ -8,6 +8,7 @@
  */
 
 #include <string.h>
+#include <strings.h>    /* strncasecmp：预报 condition 的大小写不敏感匹配 */
 #include <time.h>
 #include <math.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 #include "esp_heap_caps.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "sdkconfig.h"
 
 #include "cJSON.h"
@@ -625,6 +627,11 @@ static void apply_attributes(ha_entity_t *e, const char *obj_start, const char *
             e->max_temp = e->min_temp + 1.0f; /* 脏数据兜底：至少留一格 */
         }
         json_str_in(obj_start, obj_end, "fan_mode", e->fan_mode, sizeof(e->fan_mode));
+        json_str_in(obj_start, obj_end, "swing_mode", e->swing_mode, sizeof(e->swing_mode));
+        /* 支持列表里有没有 full_swing：决定空调页显不显示"摆风"胶囊 */
+        if (range_contains(obj_start, obj_end, "\"full_swing\"")) {
+            e->has_full_swing = true;
+        }
         const int nh = json_str_list_in(obj_start, obj_end, "hvac_modes",
                                         e->hvac_modes, HA_MODE_MAX);
         if (nh > 0) {
@@ -673,6 +680,41 @@ static void apply_attributes(ha_entity_t *e, const char *obj_start, const char *
         if (np > 0) {
             e->preset_mode_count = (uint8_t)np;
         }
+    }
+
+    /* 天气：实况属性（预报不在这里，见 ha_client_weather_forecast）。
+       温度类存 ×10 整数，湿度/云量/风速/能见度按整数存，浮点只在这里出现一次。 */
+    if (strncmp(e->entity_id, "weather.", 8) == 0) {
+        float fv = 0;
+        if (json_float_in(obj_start, obj_end, "temperature", &fv)) {
+            e->wx_temp10 = (int16_t)lroundf(fv * 10.0f);
+            e->wx_valid = 1;
+        }
+        if (json_float_in(obj_start, obj_end, "apparent_temperature", &fv)) {
+            e->wx_feel10 = (int16_t)lroundf(fv * 10.0f);
+        }
+        if (json_float_in(obj_start, obj_end, "dew_point", &fv)) {
+            e->wx_dew10 = (int16_t)lroundf(fv * 10.0f);
+        }
+        if (json_float_in(obj_start, obj_end, "humidity", &fv)) {
+            e->wx_humidity = (uint8_t)(fv < 0 ? 0 : (fv > 100 ? 100 : (int)lroundf(fv)));
+        }
+        if (json_float_in(obj_start, obj_end, "cloud_coverage", &fv)) {
+            e->wx_cloud = (uint8_t)(fv < 0 ? 0 : (fv > 100 ? 100 : (int)lroundf(fv)));
+        }
+        if (json_float_in(obj_start, obj_end, "pressure", &fv)) {
+            e->wx_press = (int16_t)lroundf(fv);
+        }
+        if (json_float_in(obj_start, obj_end, "wind_speed", &fv)) {
+            e->wx_wind_kmh = (uint8_t)(fv < 0 ? 0 : (fv > 255 ? 255 : (int)lroundf(fv)));
+        }
+        if (json_float_in(obj_start, obj_end, "visibility", &fv)) {
+            e->wx_vis_km = (uint8_t)(fv < 0 ? 0 : (fv > 255 ? 255 : (int)lroundf(fv)));
+        }
+        json_str_in(obj_start, obj_end, "wind_bearing", e->wx_wind_bearing,
+                    sizeof(e->wx_wind_bearing));
+        /* 实况的 condition 就是 state（weather 实体的 state 本身是机器码），
+           界面用 ha_wx_kind_of(e->state) 取图标，不在这里重复存一份。 */
     }
 }
 
@@ -1043,6 +1085,301 @@ esp_err_t ha_client_history(const char *entity_id, int hours, float *values, int
     return r;
 }
 
+/* ------------------------------------------------------------------------- */
+/* 天气预报                                                                    */
+/* ------------------------------------------------------------------------- */
+
+/* 预报响应体：24 条逐小时约 4~5 KB，放 PSRAM（内部 RAM 还要留给 TLS / LVGL）。 */
+#define WX_FORECAST_BUF        (8 * 1024)
+#define WX_FORECAST_REFRESH_S  (30 * 60)
+#define WX_FORECAST_RETRY_S    (5 * 60)
+
+static ha_wx_forecast_t s_wx_fc;         /* 预报缓存（表锁保护）*/
+static int64_t s_wx_next_us;             /* 下次抓取时刻（esp_timer）*/
+
+ha_wx_kind_t ha_wx_kind_of(const char *condition)
+{
+    static const struct {
+        const char *ha;
+        ha_wx_kind_t kind;
+    } map[] = {
+        {"sunny",            HA_WX_SUNNY},
+        {"clear-night",      HA_WX_CLEAR_NIGHT},
+        {"partlycloudy",     HA_WX_PARTLY},
+        {"cloudy",           HA_WX_CLOUDY},
+        {"rainy",            HA_WX_RAIN},
+        {"pouring",          HA_WX_POURING},
+        {"lightning",        HA_WX_LIGHTNING},
+        {"lightning-rainy",  HA_WX_LIGHTNING},
+        {"snowy",            HA_WX_SNOW},
+        {"snowy-rainy",      HA_WX_SNOWY_RAIN},
+        {"fog",              HA_WX_FOG},
+        {"windy",            HA_WX_WINDY},
+        {"windy-variant",    HA_WX_WINDY},
+        {"hail",             HA_WX_HAIL},
+        {"exceptional",      HA_WX_CLOUDY},
+    };
+    if (condition == NULL) {
+        return HA_WX_CLOUDY;
+    }
+    while (*condition == ' ' || *condition == '\t') {
+        condition++;
+    }
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        const size_t n = strlen(map[i].ha);
+        if (strncasecmp(condition, map[i].ha, n) == 0 &&
+            (condition[n] == '\0' || condition[n] == '"' || condition[n] == ' ')) {
+            return map[i].kind;
+        }
+    }
+    return HA_WX_CLOUDY;
+}
+
+/** 找 "forecast": [ 里那个 '['，返回 '[' 后面的第一个字符。 */
+static const char *wx_forecast_array(const char *buf)
+{
+    if (buf == NULL) {
+        return NULL;
+    }
+    const char *p = strstr(buf, "\"forecast\"");
+    if (p == NULL) {
+        return NULL;
+    }
+    p = strchr(p, '[');
+    return (p != NULL) ? p + 1 : NULL;
+}
+
+/** 从 "2026-11-15T21:00:00+08:00" 里取小时；失败返回 -1。 */
+static int wx_hour_of(const char *iso)
+{
+    if (iso == NULL) {
+        return -1;
+    }
+    const char *t = strchr(iso, 'T');
+    if (t == NULL || t[1] < '0' || t[1] > '9' || t[2] < '0' || t[2] > '9') {
+        return -1;
+    }
+    return (t[1] - '0') * 10 + (t[2] - '0');
+}
+
+/** 公历 → 距 1970-01-01 的天数（Howard Hinnant 的 days_from_civil，纯整数）。*/
+static int32_t wx_days_from_civil(int y, int m, int d)
+{
+    y -= (m <= 2);
+    const int32_t era = (y >= 0 ? y : y - 399) / 400;
+    const uint32_t yoe = (uint32_t)(y - era * 400);
+    const uint32_t doy = (uint32_t)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
+    const uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int32_t)doe - 719468;
+}
+
+/** 解析一条逐小时预报（start..end 是这个对象的范围）。*/
+static void wx_parse_hour(const char *start, const char *end, ha_wx_hour_t *out)
+{
+    char iso[40] = {0};
+    json_str_in(start, end, "datetime", iso, sizeof(iso));
+    const int h = wx_hour_of(iso);
+    out->hour = (uint8_t)(h < 0 ? 0 : h);
+    float fv = 0;
+    out->temp = json_float_in(start, end, "temperature", &fv) ? (int8_t)lroundf(fv) : 0;
+    out->pop = json_float_in(start, end, "precipitation_probability", &fv)
+               ? (uint8_t)(fv < 0 ? 0 : (fv > 100 ? 100 : (int)lroundf(fv))) : 0;
+    char cond[24] = {0};
+    json_str_in(start, end, "condition", cond, sizeof(cond));
+    out->kind = (uint8_t)ha_wx_kind_of(cond);
+}
+
+/** 解析一条逐日预报：datetime → 距今天几天 + 星期几，高低温 + condition。*/
+static void wx_parse_day(const char *start, const char *end, ha_wx_day_t *out)
+{
+    char iso[40] = {0};
+    json_str_in(start, end, "datetime", iso, sizeof(iso));
+    int y = 0, m = 0, d = 0;
+    if (sscanf(iso, "%4d-%2d-%2d", &y, &m, &d) == 3) {
+        const time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        const int32_t today = wx_days_from_civil(tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+        const int32_t that = wx_days_from_civil(y, m, d);
+        int32_t off = that - today;
+        if (off < 0) {
+            off = 0;
+        }
+        if (off > 9) {
+            off = 9;
+        }
+        out->day_off = (uint8_t)off;
+        int32_t wd = (that + 4) % 7;         /* 1970-01-01 是周四 → 4（0=周日）*/
+        if (wd < 0) {
+            wd += 7;
+        }
+        out->weekday = (uint8_t)wd;
+    } else {
+        out->day_off = 0;
+        out->weekday = 0;
+    }
+    float fv = 0;
+    out->tmax = json_float_in(start, end, "temperature", &fv) ? (int8_t)lroundf(fv) : 0;
+    out->tmin = json_float_in(start, end, "templow", &fv) ? (int8_t)lroundf(fv) : 0;
+    char cond[24] = {0};
+    json_str_in(start, end, "condition", cond, sizeof(cond));
+    out->kind = (uint8_t)ha_wx_kind_of(cond);
+}
+
+/** 从数组起点按顺序取最多 max_n 个顶层对象，逐个交给 parse。 */
+static int wx_walk_array(const char *arr, int max_n, bool daily, ha_wx_forecast_t *out)
+{
+    const char *p = arr;
+    int n = 0;
+    while (p != NULL && *p != '\0' && n < max_n) {
+        const char *open = strchr(p, '{');
+        if (open == NULL) {
+            break;
+        }
+        const char *close = strchr(open, '}');
+        if (close == NULL) {
+            break;
+        }
+        if (daily) {
+            wx_parse_day(open, close, &out->day[n]);
+        } else {
+            wx_parse_hour(open, close, &out->hour[n]);
+        }
+        n++;
+        p = close + 1;
+        if (*p == ']') {
+            break;
+        }
+    }
+    return n;
+}
+
+/** 一条 get_forecasts POST：响应写进 PSRAM 缓冲（复用常驻 TLS 连接）。 */
+static esp_err_t wx_post_forecast(const char *entity_id, const char *type, char *buf, size_t cap)
+{
+    char url[APP_HA_URL_MAX + 96];
+    snprintf(url, sizeof(url), "%s/api/services/weather/get_forecasts?return_response=true", s_base);
+    char body[160];
+    snprintf(body, sizeof(body), "{\"entity_id\":\"%.95s\",\"type\":\"%s\"}", entity_id, type);
+
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(8000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (client_create() != ESP_OK) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    set_auth_header();
+    esp_http_client_set_header(s_client, "Content-Type", "application/json");
+    esp_http_client_set_method(s_client, HTTP_METHOD_POST);
+    esp_http_client_set_url(s_client, url);
+    esp_http_client_set_post_field(s_client, body, (int)strlen(body));
+    s_sink = buf;
+    s_sink_len = 0;
+    s_sink_cap = cap - 1;
+    buf[0] = '\0';
+    const esp_err_t err = esp_http_client_perform(s_client);
+    const int status = esp_http_client_get_status_code(s_client);
+    s_sink = NULL;
+    if (err != ESP_OK) {
+        esp_http_client_close(s_client);       /* 长连接坏了：关掉，下次重新握手 */
+    }
+    xSemaphoreGive(s_lock);
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGW(TAG, "预报 %s (%s) -> %s, HTTP %d", entity_id, type, esp_err_to_name(err), status);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t ha_client_weather_forecast(const char *entity_id)
+{
+    if (entity_id == NULL || s_base[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+    char *buf = heap_caps_malloc(WX_FORECAST_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ha_wx_forecast_t fc;
+    memset(&fc, 0, sizeof(fc));
+
+    esp_err_t r = wx_post_forecast(entity_id, "hourly", buf, WX_FORECAST_BUF);
+    if (r == ESP_OK) {
+        fc.hour_n = wx_walk_array(wx_forecast_array(buf), HA_WX_HOURLY, false, &fc);
+    }
+    r = wx_post_forecast(entity_id, "daily", buf, WX_FORECAST_BUF);
+    if (r == ESP_OK) {
+        fc.day_n = wx_walk_array(wx_forecast_array(buf), HA_WX_DAILY, true, &fc);
+    }
+    free(buf);
+
+    if (fc.hour_n <= 0 && fc.day_n <= 0) {
+        ESP_LOGW(TAG, "预报解析失败（%s）", entity_id);
+        return ESP_FAIL;
+    }
+    fc.ok = true;
+    fc.stamp_s = (uint32_t)time(NULL);
+
+    if (s_table_lock) {
+        xSemaphoreTake(s_table_lock, portMAX_DELAY);
+    }
+    s_wx_fc = fc;
+    if (s_table_lock) {
+        xSemaphoreGive(s_table_lock);
+    }
+    ESP_LOGI(TAG, "预报已更新：%d 条逐小时 / %d 条逐日（%s）", fc.hour_n, fc.day_n, entity_id);
+    return ESP_OK;
+}
+
+bool ha_client_weather_forecast_copy(ha_wx_forecast_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    if (s_table_lock == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_table_lock, portMAX_DELAY);
+    *out = s_wx_fc;
+    xSemaphoreGive(s_table_lock);
+    return out->ok;
+}
+
+/** 轮询任务里每圈调一次：成功 30 分钟一次，失败 5 分钟重试；WS 接管时也不耽误。 */
+static void wx_forecast_tick(void)
+{
+    const int64_t now = esp_timer_get_time();
+    if (now < s_wx_next_us) {
+        return;
+    }
+    const char *eid = NULL;
+    for (int i = 0; i < s_count; i++) {
+        if (strncmp(s_entities[i].entity_id, "weather.", 8) == 0) {
+            eid = s_entities[i].entity_id;
+            break;
+        }
+    }
+    if (eid == NULL) {
+        s_wx_next_us = now + 15LL * 1000000;     /* 布局里还没注册天气实体：15 秒后再看 */
+        return;
+    }
+    /* wss 接管时只剩一条 TLS，内部 RAM 不够就别抢（和折线图同一条规矩）*/
+    if (s_poll_mode == HA_POLL_PAUSED &&
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 50 * 1024) {
+        s_wx_next_us = now + 60LL * 1000000;
+        return;
+    }
+    const esp_err_t r = ha_client_weather_forecast(eid);
+    s_wx_next_us = now +
+                   (int64_t)((r == ESP_OK ? WX_FORECAST_REFRESH_S : WX_FORECAST_RETRY_S)) * 1000000;
+    if (s_poll_mode == HA_POLL_PAUSED) {
+        ha_client_release_http();                /* 用完立刻把 TLS 内存还回去 */
+    }
+}
+
 bool ha_client_online(void)
 {
     return s_online;
@@ -1117,7 +1454,10 @@ static void poll_task(void *arg)
     while (true) {
         const ha_client_poll_mode_t mode = s_poll_mode;
         if (mode == HA_POLL_PAUSED) {
-            /* WS 事件已经负责状态刷新：这里只等模式变化，不再发 HTTP。 */
+            /* WS 事件已经负责状态刷新：这里只等模式变化，不再发 HTTP。
+               天气预报是 30 分钟一次的独立请求，WS 接管时也照常刷（内部 RAM
+               不够就自己跳过，见 wx_forecast_tick）。 */
+            wx_forecast_tick();
             poll_delay(HA_POLL_SLOW_INTERVAL_S * 1000);
             continue;
         }
@@ -1128,6 +1468,7 @@ static void poll_task(void *arg)
             int st = http_get(url);
             ESP_LOGI(TAG, "HA probe -> %d (internal heap %d KB)", st,
                      (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+            wx_forecast_tick();          /* 布局里没有关注列表时也不会抓到东西，自己会跳过 */
             poll_delay(30000);
             continue;
         }
@@ -1139,6 +1480,7 @@ static void poll_task(void *arg)
             }
             refresh_one(i);
         }
+        wx_forecast_tick();              /* 30 分钟一次的预报（和实况同一个任务）*/
         poll_delay((mode == HA_POLL_SLOW ? HA_POLL_SLOW_INTERVAL_S
                                          : CONFIG_APP_POLL_INTERVAL_S) * 1000);
     }
